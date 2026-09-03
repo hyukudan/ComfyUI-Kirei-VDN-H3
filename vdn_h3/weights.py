@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -14,9 +13,12 @@ import torch.nn as nn
 from .auxiliary import create_auxiliary_patcher, unload_auxiliary
 
 
-_LOG = logging.getLogger("comfy.vdn_h3")
-FP32_BRANCH_KEYS = frozenset({"alpha.A_log", "alpha.dt_bias"})
+FP32_BRANCH_KEYS = frozenset(
+    {"alpha.A_log", "alpha.dt_bias", "to_out_linear.weight_scale"}
+)
+PRESERVE_DTYPE_KEYS = frozenset({"to_out_linear.weight_fp8"})
 STREAMED_PROJECTION_KEY = "to_out_linear.weight"
+FP8_STREAMED_PROJECTION_KEY = "to_out_linear.weight_fp8"
 BRANCH_MODES = ("resident", "hybrid", "stream")
 PIN_STRATEGIES = ("auto", "comfy", "all", "none")
 
@@ -45,8 +47,6 @@ class _WeightBlock(nn.Module):
 
 
 class BranchWeightsModel(nn.Module):
-    """Storage-only module so ComfyUI can account, load and offload VDN tensors."""
-
     def __init__(self, weights: Sequence[Mapping[str, torch.Tensor]]):
         super().__init__()
         if not weights:
@@ -66,14 +66,8 @@ class BranchWeightsModel(nn.Module):
 class _WeightContainer(nn.Module):
     def __init__(self, resident: BranchWeightsModel | None, streamed: BranchWeightsModel | None):
         super().__init__()
-        if resident is not None:
-            self.resident = resident
-        else:
-            self.resident = None
-        if streamed is not None:
-            self.streamed = streamed
-        else:
-            self.streamed = None
+        self.resident = resident
+        self.streamed = streamed
         self.device = torch.device("cpu")
 
     def forward(self, *args, **kwargs):
@@ -96,28 +90,19 @@ class _StreamContext:
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
         with torch.cuda.device(device):
-            slots = []
-            for _ in range(2):
-                slots.append(
-                    _StreamSlot(
-                        {},
-                        ready=torch.cuda.Event(blocking=False),
-                        consumed=torch.cuda.Event(blocking=False),
-                    )
+            self.slots = [
+                _StreamSlot(
+                    {},
+                    ready=torch.cuda.Event(blocking=False),
+                    consumed=torch.cuda.Event(blocking=False),
                 )
-        self.slots = slots
+                for _ in range(2)
+            ]
         self.block_to_slot: dict[int, int] = {}
 
 
 class ManagedBranchWeights(nn.Module):
-    """Own VDN branch weights with Comfy-aware placement and safe async prefetch.
-
-    ``resident`` keeps every branch tensor in the auxiliary GPU model.
-    ``stream`` keeps CPU masters and double-buffers every requested tensor.
-    ``hybrid`` keeps the small recurrent/gate/conv tensors resident while streaming only
-    the dominant ``to_out_linear.weight`` projection. The latter is roughly 90% of the
-    released branch storage and is therefore the useful domestic/24-GB compromise.
-    """
+    """Own branch tensors with safe resident, stream and hybrid placement."""
 
     def __init__(
         self,
@@ -138,8 +123,7 @@ class ManagedBranchWeights(nn.Module):
         if mode == "hybrid" and not self.streamed_keys:
             raise ValueError("hybrid branch mode needs at least one streamed key")
 
-        resident_maps: list[dict[str, torch.Tensor]] | None = None
-        streamed_maps: list[dict[str, torch.Tensor]] | None = None
+        resident_maps = streamed_maps = None
         if mode == "resident":
             resident_maps = [dict(block) for block in weights]
         elif mode == "stream":
@@ -151,7 +135,9 @@ class ManagedBranchWeights(nn.Module):
                 resident = {k: v for k, v in block.items() if k not in self.streamed_keys}
                 missing = self.streamed_keys - set(streamed)
                 if missing:
-                    raise KeyError(f"VDN block {index} is missing hybrid streamed keys {sorted(missing)}")
+                    raise KeyError(
+                        f"VDN block {index} is missing hybrid streamed keys {sorted(missing)}"
+                    )
                 resident_maps.append(resident)
                 streamed_maps.append(streamed)
 
@@ -206,9 +192,6 @@ class ManagedBranchWeights(nn.Module):
                     pinned = bool(model_management.pin_memory(param.data))
                 except Exception:
                     pinned = False
-            # Respect ComfyUI's pinned-memory budget unless the user explicitly chooses
-            # the aggressive strategy. This avoids silently pinning several GiB after
-            # Comfy has intentionally refused the allocation.
             if not pinned and self.pin_strategy == "all" and torch.cuda.is_available():
                 try:
                     param.data = param.data.pin_memory()
@@ -219,7 +202,6 @@ class ManagedBranchWeights(nn.Module):
                 self._pinned_bytes += param.numel() * param.element_size()
 
     def attach_to(self, base_patcher: Any, key: str = "vdn_h3_branch"):
-        """Register resident/CPU storage as nested ModelPatchers for accounting."""
         try:
             if self.model.resident is not None and "resident" not in self._patchers:
                 self._patchers["resident"] = create_auxiliary_patcher(
@@ -247,8 +229,16 @@ class ManagedBranchWeights(nn.Module):
         return tuple(self._patchers.values())
 
     @staticmethod
-    def _target_dtype(key: str, compute_dtype: torch.dtype) -> torch.dtype:
-        return torch.float32 if key in FP32_BRANCH_KEYS else compute_dtype
+    def _target_dtype(
+        key: str,
+        compute_dtype: torch.dtype,
+        source_dtype: torch.dtype | None = None,
+    ) -> torch.dtype:
+        if key in FP32_BRANCH_KEYS:
+            return torch.float32
+        if key in PRESERVE_DTYPE_KEYS and source_dtype is not None:
+            return source_dtype
+        return compute_dtype
 
     @staticmethod
     def _source_from(
@@ -275,7 +265,9 @@ class ManagedBranchWeights(nn.Module):
         wanted = self._all_keys(block_index) if keys is None else set(keys)
         missing = wanted - self._all_keys(block_index)
         if missing:
-            raise KeyError(f"VDN-H3 branch block {block_index} is missing requested weights {sorted(missing)}")
+            raise KeyError(
+                f"VDN-H3 branch block {block_index} is missing requested weights {sorted(missing)}"
+            )
         resident_keys = set()
         streamed_keys = set()
         if self.model.resident is not None:
@@ -320,7 +312,7 @@ class ManagedBranchWeights(nn.Module):
             ctx.block_to_slot[block_index] = slot_index
         with torch.cuda.stream(ctx.stream):
             for key, tensor in source.items():
-                target_dtype = self._target_dtype(key, compute_dtype)
+                target_dtype = self._target_dtype(key, compute_dtype, tensor.dtype)
                 target = slot.tensors.get(key)
                 if (
                     target is None
@@ -348,7 +340,6 @@ class ManagedBranchWeights(nn.Module):
         dtype: torch.dtype,
         keys: Collection[str] | None = None,
     ) -> None:
-        """Schedule streamed tensors without waiting for them on the compute stream."""
         if self._closed or self.model.streamed is None:
             return
         device = torch.device(device)
@@ -386,9 +377,8 @@ class ManagedBranchWeights(nn.Module):
         if slot.ready_recorded:
             torch.cuda.current_stream(device).wait_event(slot.ready)
             self._stats["ready_wait_events"] += 1
-        result = {key: slot.tensors[key] for key in keys}
         self._stats["served_stream_requests"] += 1
-        return result
+        return {key: slot.tensors[key] for key in keys}
 
     def _resident_weights(
         self,
@@ -398,16 +388,21 @@ class ManagedBranchWeights(nn.Module):
         keys: Collection[str],
     ) -> dict[str, torch.Tensor]:
         source = self._source_from(self.model.resident, block_index, keys)
-        return {
-            key: tensor
-            if tensor.device == device and tensor.dtype == self._target_dtype(key, dtype)
-            else tensor.to(
-                device=device,
-                dtype=self._target_dtype(key, dtype),
-                non_blocking=(device.type == "cuda" and tensor.device.type == "cpu" and tensor.is_pinned()),
+        result = {}
+        for key, tensor in source.items():
+            target_dtype = self._target_dtype(key, dtype, tensor.dtype)
+            result[key] = (
+                tensor
+                if tensor.device == device and tensor.dtype == target_dtype
+                else tensor.to(
+                    device=device,
+                    dtype=target_dtype,
+                    non_blocking=(
+                        device.type == "cuda" and tensor.device.type == "cpu" and tensor.is_pinned()
+                    ),
+                )
             )
-            for key, tensor in source.items()
-        }
+        return result
 
     def weights_on(
         self,
@@ -428,17 +423,10 @@ class ManagedBranchWeights(nn.Module):
                 result.update(self._stream_weights(block_index, device, dtype, streamed_keys))
             else:
                 source = self._source_from(self.model.streamed, block_index, streamed_keys)
-                result.update(
-                    {
-                        key: tensor
-                        if tensor.dtype == self._target_dtype(key, dtype)
-                        else tensor.to(dtype=self._target_dtype(key, dtype))
-                        for key, tensor in source.items()
-                    }
-                )
+                for key, tensor in source.items():
+                    target_dtype = self._target_dtype(key, dtype, tensor.dtype)
+                    result[key] = tensor if tensor.dtype == target_dtype else tensor.to(dtype=target_dtype)
 
-        # Full requests indicate the linear path. Keep the next block's streamed part in
-        # flight while this block computes, including block 49 -> block 0 for the next NFE.
         if keys is None and self.model.streamed is not None and len(self) > 1 and device.type == "cuda":
             self.prefetch((block_index + 1) % len(self), device, dtype, None)
         return result
@@ -489,14 +477,10 @@ class ManagedBranchWeights(nn.Module):
             except Exception:
                 pass
         self._contexts.clear()
-        resident_patcher = self._patchers.get("resident")
         if self.model.resident is not None:
-            unload_auxiliary(resident_patcher, self.model.resident)
-        # The streamed model should already be CPU-only, but use the same lifecycle
-        # helper in case an external ModelPatcher changed its placement.
-        streamed_patcher = self._patchers.get("streamed")
+            unload_auxiliary(self._patchers.get("resident"), self.model.resident)
         if self.model.streamed is not None:
-            unload_auxiliary(streamed_patcher, self.model.streamed)
+            unload_auxiliary(self._patchers.get("streamed"), self.model.streamed)
         return self
 
     def close(self) -> None:
@@ -517,7 +501,9 @@ __all__ = [
     "BRANCH_MODES",
     "BranchWeightsModel",
     "FP32_BRANCH_KEYS",
+    "FP8_STREAMED_PROJECTION_KEY",
     "ManagedBranchWeights",
     "PIN_STRATEGIES",
+    "PRESERVE_DTYPE_KEYS",
     "STREAMED_PROJECTION_KEY",
 ]

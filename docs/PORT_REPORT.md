@@ -1,7 +1,7 @@
 # Private feasibility report: VideoDeltaNet → ComfyUI
 
 Date: 2026-09-03  
-Status: feasible, implementation not yet weight-validated  
+Status: private alpha; real checkpoint and short generation smoke validated
 Target machine: RTX PRO 6000 Blackwell 96 GB + RTX 4090 24 GB, Windows
 
 ## Executive conclusion
@@ -17,7 +17,8 @@ quantized loaders, and existing workflows. The port should reuse all of that and
 only VDN's local-softmax branch, linear branch, gates, checkpoint loader, and optional
 kernel backends.
 
-The work is blocked from final visual validation by licensing, not hardware. The
+The published VDN-H3 weights were downloaded for the user-requested local engineering
+test after the territorial restriction was surfaced. The
 published VDN-H3 weights inherit the MiniMax H3 community license, whose model card
 states that the applicable territory excludes the European Union. The source code is
 Apache-2.0, but downloading/using the weights in Spain needs authorization from
@@ -230,7 +231,7 @@ LoRA B rows for `ff.net.0.proj`.
 Acceptance: full-cover teacher parity within BF16 tolerance; all branch tensors load
 exactly once; no mutation leaks into the unpatched base.
 
-### Phase 2 — real weights, after license authorization
+### Phase 2 — real weights
 
 - Download only `stage-dmd-step-250` (5.46 GB), not the duplicate H3 base.
 - Verify artifact hashes/spec and inventory every tensor without allocating the full
@@ -353,8 +354,8 @@ design and adds:
 ## Private alpha implementation snapshot
 
 An independent implementation now exists under
-`code/ComfyUI-Kirei-VDN-H3/`. It is deliberately not installed into the active
-ComfyUI checkout.
+`code/ComfyUI-Kirei-VDN-H3/`. A private clone is installed under ComfyUI custom nodes
+for integration testing; ComfyUI core remains unmodified.
 
 Implemented:
 
@@ -363,20 +364,27 @@ Implemented:
 - grouped SDPA and FlexAttention window paths with full-cover gate correction;
 - VDN/Sana rules, bidirectional scans, short convolution, bridge/gates/text state;
 - strict safetensors/spec inventory and realpath containment;
-- correct token-refiner mapping and compact Q/K/V FP32 deltas with row offsets;
+- correct token-refiner mapping and factorized native LoRA patches with Q/K/V row offsets;
+- runtime curve-AdaLN injection for pruned H3 without materializing full-width deltas;
 - per-model resident/stream branch-weight ownership and explicit release node;
 - bounded per-model caches keyed by full CUDA device; no global GPU tensor caches.
 
 Verification performed on 2026-09-03:
 
-- complete synthetic suite after post-push review: **50 passed**;
+- complete synthetic suite after post-push review: **55 passed**;
 - Python compile/import: passed;
 - real plugin entrypoint import against the installed ComfyUI tree: passed;
 - nodes exposed: `KireiApplyVDNH3Alpha`, `KireiReleaseVDNH3Weights`;
 - RTX PRO 6000 Flex versus grouped CUDA smoke test: BF16 max absolute error
   `0.00390625`, `allclose=True`;
 - cache lifecycle probe: one entry before release, zero after release.
+- released `stage-dmd-step-250` inventory and strict safetensors loading: passed;
+- real H3 INT8 application: 520 low-rank terms over 208 weight targets, 51 curve
+  targets, and 50 branch blocks;
+- CUDA materialization probe of a quantized fused QKV with stacked offset LoRAs: passed;
+- complete 4-step 608×352, 22-frame generation with video and audio decode: passed in
+  37 seconds on the RTX PRO 6000 launcher path.
 
-Remaining gate: official-module/checkpoint end-to-end parity and visual generation
-cannot be claimed until authorized VDN weights are available. The project remains an
-alpha and contains no supported live-install procedure.
+Remaining gates: direct numerical/visual parity against the official implementation,
+longer-resolution stress tests, determinism, memory profiling, and output-quality
+evaluation. The project remains an unsupported alpha.

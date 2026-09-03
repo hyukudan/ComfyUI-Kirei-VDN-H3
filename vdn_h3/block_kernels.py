@@ -120,7 +120,6 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
             x.dtype,
             tuple(x.shape),
             tuple(indices.shape),
-            int(block_index),
         )
 
         with state.diagnostics.scope("block.pre_attn", x.device):
@@ -154,8 +153,6 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                 (x, block.norm2.weight, float(block.norm2.eps), scale_mlp, shift_mlp, indices),
                 (*base_key, "mlp", scale_mlp.dtype),
             )
-        # Keep ComfyUI's MLP implementation: on TensorWiseINT8 it already fuses SwiGLU
-        # into the dynamic activation quantizer before fc2.
         mlp_out = block.mlp(h)
         with state.diagnostics.scope("block.post_mlp", x.device):
             x = _compiled_or_eager(
@@ -167,9 +164,11 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
             )
         return x
 
-    forward._vdn_h3_fast_block = True
-    forward._vdn_h3_original = original_forward
-    return forward
+    vdn_forward = forward
+    vdn_forward._vdn_h3_fast_block = True
+    vdn_forward._vdn_h3_block_index = int(block_index)
+    vdn_forward._vdn_h3_original = original_forward
+    return vdn_forward
 
 
 def install_block_fusions(model_patcher: Any, state: Any, blocks) -> int:

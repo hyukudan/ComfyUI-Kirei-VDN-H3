@@ -6,9 +6,10 @@ of the inference design from VDN — Video DeltaNet.
 VDN — Video DeltaNet
 Copyright 2026 the VDN authors.
 The upstream VDN-H3 training and inference code is licensed under the Apache License,
-Version 2.0. The upstream inference scan/preallocation strategy, five-tap Triton
-temporal-convolution algorithm, and Blackwell decomposed-attention design are adapted
-in this repository. See THIRD_PARTY.md and LICENSE.
+Version 2.0. The upstream bidirectional inference scan/preallocation strategy, five-tap
+Triton temporal-convolution algorithm, decomposed varlen attention plan and opt-in FP8
+projection/quantization approach are adapted from or informed by that implementation.
+See THIRD_PARTY.md and LICENSE.
 
 MiniMax H3 is Copyright © 2026 MiniMax. Model weights are not distributed by this
 repository. MiniMax H3 and VDN-H3 model weights are governed by their respective model

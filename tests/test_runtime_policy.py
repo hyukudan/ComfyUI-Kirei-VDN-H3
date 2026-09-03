@@ -144,7 +144,7 @@ def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatc
     assert fp8["inference"]
 
 
-def test_auto_int8_resident_keeps_adapter_bypass_quality_first(monkeypatch):
+def test_auto_int8_resident_is_quality_first_until_quantized_projection_wins(monkeypatch):
     monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
     monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
     monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
@@ -154,10 +154,10 @@ def test_auto_int8_resident_keeps_adapter_bypass_quality_first(monkeypatch):
     assert runtime["base_precision"] == "int8"
     assert runtime["branch_mode"] == "resident"
     assert runtime["branch_execution"] == "serial"
-    # Do not requantize the small released adapter updates by default. max_speed is the
-    # explicit merge/requant path and must pass its own quality gate.
     assert runtime["lora_mode"] == "bypass"
-    assert runtime["projection_precision"] == "int8"
+    # Current workstation evidence did not show an INT8 VDN projection win, so resident
+    # auto stays BF16. INT8/FP8 remain explicit benchmark/max-speed candidates.
+    assert runtime["projection_precision"] == "bf16"
     assert runtime["compile_policy"] == "shared"
     assert runtime["tile_frames"] == 0
     assert runtime["block_fusion"]
@@ -174,7 +174,7 @@ def test_workstation_fp8_can_opt_into_parallel_and_merge(monkeypatch):
     assert runtime["compile_policy"] == "shared"
 
 
-def test_auto_quantized_nonresident_keeps_factorized_lora(monkeypatch):
+def test_auto_quantized_nonresident_can_reduce_projection_transfer(monkeypatch):
     monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
     monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "hybrid")
     monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")

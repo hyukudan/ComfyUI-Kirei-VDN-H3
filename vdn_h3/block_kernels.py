@@ -60,9 +60,6 @@ class BlockPointwiseCache:
         return ids
 
     def indices(self, segments, rows: int, device: torch.device):
-        # Scalar-row layouts are stable and cheap to cache. Per-token row tensors are
-        # accepted too, but are rebuilt without host reads so a GPU tensor never causes
-        # .item()/CPU synchronization merely to form a cache key.
         scalar = all(not isinstance(row, torch.Tensor) for _, _, row in segments)
         if not scalar:
             return self._fill_indices(segments, rows, device)
@@ -138,6 +135,10 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
         ):
             return fallback(x, t_emb, mod_segments, rope_freqs, transformer_options)
 
+        # The compiled spelling never mutates this residual. Keep its reference so a
+        # late failure (e.g. post-attn or pre-MLP compile) can restart the *whole* native
+        # block rather than feeding an already-updated residual through it twice.
+        original_x = x
         cache = getattr(state, "block_pointwise_cache", None)
         if cache is None:
             cache = BlockPointwiseCache()
@@ -145,8 +146,6 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
         try:
             indices = cache.indices(mod_segments, x.shape[0], x.device)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaln_proj(t_emb)
-            # No block index: all 50 transformer layers reuse the same compiled bodies
-            # for one static sequence geometry.
             base_key = (
                 x.device.type,
                 x.device.index,
@@ -186,8 +185,6 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     (x, block.norm2.weight, float(block.norm2.eps), scale_mlp, shift_mlp, indices),
                     (*base_key, "mlp", scale_mlp.dtype),
                 )
-            # Keep Comfy's native MLP; TensorWiseINT8 already fuses SwiGLU into the
-            # dynamic activation quantizer consumed by fc2.
             mlp_out = block.mlp(h)
             with state.diagnostics.scope("block.post_mlp", x.device):
                 return _compiled(
@@ -198,11 +195,9 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     (*base_key, "mlp", gate_mlp.dtype),
                 )
         except _BlockFusionUnavailable as exc:
-            # Permanent latch for this patched state. A failed optimization may cost one
-            # duplicated block on first encounter, never every block/every step.
             state.block_fusion = False
             state.block_fusion_error = str(exc)
-            return fallback(x, t_emb, mod_segments, rope_freqs, transformer_options)
+            return fallback(original_x, t_emb, mod_segments, rope_freqs, transformer_options)
 
     forward._vdn_h3_fast_block = True
     forward._vdn_h3_block_index = int(block_index)

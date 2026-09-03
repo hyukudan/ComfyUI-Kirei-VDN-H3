@@ -102,7 +102,13 @@ class _StreamContext:
 
 
 class ManagedBranchWeights(nn.Module):
-    """Own branch tensors with safe resident, stream and hybrid placement."""
+    """Own branch tensors with safe resident, stream and hybrid placement.
+
+    Hybrid placement accepts a *set of streamable keys* rather than requiring the same
+    key in every block. This is useful for precision-aware execution: end blocks may
+    keep their projection in BF16 while interior blocks store the equivalent projection
+    as FP8, and each block streams exactly the representation it actually owns.
+    """
 
     def __init__(
         self,
@@ -121,7 +127,7 @@ class ManagedBranchWeights(nn.Module):
         self.pin_strategy = pin_strategy
         self.streamed_keys = frozenset(str(key) for key in streamed_keys)
         if mode == "hybrid" and not self.streamed_keys:
-            raise ValueError("hybrid branch mode needs at least one streamed key")
+            raise ValueError("hybrid branch mode needs at least one streamable key")
 
         resident_maps = streamed_maps = None
         if mode == "resident":
@@ -133,10 +139,10 @@ class ManagedBranchWeights(nn.Module):
             for index, block in enumerate(weights):
                 streamed = {k: v for k, v in block.items() if k in self.streamed_keys}
                 resident = {k: v for k, v in block.items() if k not in self.streamed_keys}
-                missing = self.streamed_keys - set(streamed)
-                if missing:
+                if not streamed:
                     raise KeyError(
-                        f"VDN block {index} is missing hybrid streamed keys {sorted(missing)}"
+                        f"VDN block {index} contains none of the configured hybrid stream keys "
+                        f"{sorted(self.streamed_keys)}"
                     )
                 resident_maps.append(resident)
                 streamed_maps.append(streamed)
@@ -262,8 +268,9 @@ class ManagedBranchWeights(nn.Module):
         return keys
 
     def _partition_keys(self, block_index: int, keys: Collection[str] | None):
-        wanted = self._all_keys(block_index) if keys is None else set(keys)
-        missing = wanted - self._all_keys(block_index)
+        all_keys = self._all_keys(block_index)
+        wanted = all_keys if keys is None else set(keys)
+        missing = wanted - all_keys
         if missing:
             raise KeyError(
                 f"VDN-H3 branch block {block_index} is missing requested weights {sorted(missing)}"
@@ -350,9 +357,7 @@ class ManagedBranchWeights(nn.Module):
             return
         ctx = self._context(device, dtype)
         slot_index = ctx.block_to_slot.get(block_index, block_index & 1)
-        self._schedule(
-            ctx, slot_index, block_index, dtype, streamed_keys, prefetch=True
-        )
+        self._schedule(ctx, slot_index, block_index, dtype, streamed_keys, prefetch=True)
 
     def _stream_weights(
         self,
@@ -461,6 +466,7 @@ class ManagedBranchWeights(nn.Module):
                 valid_keys += len(slot.valid_keys)
         return {
             "mode": self.mode,
+            "streamable_keys": sorted(self.streamed_keys),
             "total_bytes": self.nbytes,
             "resident_bytes": self.resident_nbytes,
             "streamed_bytes": self.streamed_nbytes,

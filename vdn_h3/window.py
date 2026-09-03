@@ -49,6 +49,7 @@ class WindowAttentionCache:
         self.calibration = CalibrationStore()
         self.last_calibration_hit: str | None = None
         self.last_autotune_error: str | None = None
+        self.last_dispatch_reason: str | None = None
 
     def get(self, key):
         value = self._masks.get(key)
@@ -89,6 +90,7 @@ class WindowAttentionCache:
         self._broken.clear()
         self.last_calibration_hit = None
         self.last_autotune_error = None
+        self.last_dispatch_reason = None
 
     release = clear
 
@@ -304,6 +306,76 @@ def _device_key(device):
     return resolved.type, resolved.index
 
 
+def gpu_family(device) -> str:
+    """Coarse NVIDIA family for kernel policy.
+
+    Datacenter Hopper (sm_90) and Blackwell (sm_100/sm_103) have FlashAttention-4 /
+    CuTe kernels and the per-tensor FP8 cuBLAS path OpenVDN tuned for. Consumer and
+    workstation Blackwell (sm_120, RTX 50xx / RTX PRO 6000) shares the name but not the
+    kernels, so it must never be treated as sm_100.
+    """
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        return "unknown"
+    if major == 12:
+        return "blackwell_consumer"
+    if major == 10:
+        return "blackwell_dc"
+    if major == 9:
+        return "hopper"
+    if major == 8:
+        return "ada" if minor >= 9 else "ampere"
+    return f"sm_{major}{minor}"
+
+
+def prefers_fa4(device) -> bool:
+    """Whether the decomposed FA4/CuTe window kernel is worth trying first."""
+    return gpu_family(device) in {"hopper", "blackwell_dc"}
+
+
+GROUPED_COPY_GUARD_FRACTION = 0.35
+GROUPED_COPY_GUARD_TOTAL_BYTES = 8 * 1024**3
+
+
+def grouped_copy_bytes(
+    query, num_frames, tokens_per_frame, bounds, anchor_frames, video_start, video_end
+) -> tuple[int, int]:
+    """(peak, total) bytes of the K/V copies ``window_softmax_grouped`` makes per layer.
+
+    Every window group concatenates the global rows (text, audio, keyframes, reference
+    video) with its window frames. With a long reference clip those globals dominate:
+    the peak decides whether a group fits, the total decides how much bandwidth the
+    copies burn compared with a block-sparse Flex kernel that reads K/V in place.
+    """
+    global_rows = int(video_start) + (int(query.shape[0]) - int(video_end))
+    per_row = 2 * int(query.shape[1]) * int(query.shape[2]) * int(query.element_size())
+    peak = total = 0
+    for _first, _stop, selected in _window_runs(num_frames, bounds, anchor_frames):
+        if selected is None:
+            continue  # dense anchor rows reuse the full K/V without copying
+        size = (global_rows + len(selected) * int(tokens_per_frame)) * per_row
+        peak = max(peak, size)
+        total += size
+    return peak, total
+
+
+def grouped_copies_too_large(device, peak_bytes: int, total_bytes: int) -> str | None:
+    """Reason string when grouped attention should be skipped for this layout."""
+    if total_bytes > GROUPED_COPY_GUARD_TOTAL_BYTES:
+        return f"grouped K/V copies would move {total_bytes / 2**30:.1f} GiB per layer"
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+    except Exception:
+        return None
+    if peak_bytes > GROUPED_COPY_GUARD_FRACTION * free:
+        return (
+            f"one grouped K/V copy ({peak_bytes / 2**30:.1f} GiB) exceeds "
+            f"{GROUPED_COPY_GUARD_FRACTION:.0%} of free VRAM"
+        )
+    return None
+
+
 def flex_available(cache: WindowAttentionCache | None = None) -> bool:
     if cache is not None and cache.is_broken("flex"):
         return False
@@ -433,6 +505,24 @@ def resolve_attention_backend(
             cache.last_calibration_hit = calibrated
             return calibrated
         cache.last_calibration_hit = None
+        cache.last_dispatch_reason = None
+        if (
+            query.is_cuda
+            and video_start is not None
+            and video_end is not None
+            and tokens_per_frame is not None
+            and flex_available(cache)
+        ):
+            peak, total = grouped_copy_bytes(
+                query, num_frames, tokens_per_frame, bounds, anchor_frames, video_start, video_end
+            )
+            reason = grouped_copies_too_large(query.device, peak, total)
+            if reason is not None:
+                # Many global rows (reference video, keyframes): grouped would copy them
+                # for every window and the autotune itself could OOM. Flex reads K/V in
+                # place through the block mask, so it is chosen without benchmarking.
+                cache.last_dispatch_reason = f"flex: {reason}"
+                return "flex"
         tuned = _autotune_if_needed(
             query,
             num_frames,
@@ -448,8 +538,7 @@ def resolve_attention_backend(
             return tuned
     # CPU or a runtime with only grouped attention keeps the conservative heuristics.
     if query.is_cuda and torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability(query.device)
-        if capability[0] >= 10 and decomposed_available(cache):
+        if prefers_fa4(query.device) and decomposed_available(cache):
             return "decomposed"
     if groups <= 8:
         return "grouped"
@@ -638,11 +727,17 @@ def window_softmax_flash2(
 __all__ = [
     "ANCHOR_FRAME_MODES",
     "ATTENTION_BACKENDS",
+    "GROUPED_COPY_GUARD_FRACTION",
+    "GROUPED_COPY_GUARD_TOTAL_BYTES",
     "WindowAttentionCache",
     "decomposed_available",
     "flash2_available",
     "flex_available",
     "full_coverage",
+    "gpu_family",
+    "grouped_copies_too_large",
+    "grouped_copy_bytes",
+    "prefers_fa4",
     "resolve_attention_backend",
     "window_bounds",
     "window_group_count",

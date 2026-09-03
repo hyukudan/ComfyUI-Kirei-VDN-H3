@@ -25,6 +25,7 @@ def _cuda_snapshot(model_patcher: Any) -> dict:
                 "available": True,
                 "name": props.name,
                 "capability": list(torch.cuda.get_device_capability(device)),
+                "family": _gpu_family(device),
                 "total_bytes": int(total),
                 "free_bytes": int(free),
                 "allocated_bytes": int(torch.cuda.memory_allocated(device)),
@@ -35,6 +36,15 @@ def _cuda_snapshot(model_patcher: Any) -> dict:
     except Exception as exc:
         result["error"] = str(exc)
     return result
+
+
+def _gpu_family(device) -> str:
+    try:
+        from .window import gpu_family
+
+        return gpu_family(device)
+    except Exception:
+        return "unknown"
 
 
 def _module_inventory(module: Any) -> dict:
@@ -127,6 +137,24 @@ def _layout_snapshot(state):
             value = list(value)
         if value is not None:
             result[name] = value
+    try:
+        seq_len = int(layout.seq_len)
+        video_rows = int(layout.video_end) - int(layout.video_start)
+        text_rows = int(layout.text_len)
+    except (AttributeError, TypeError, ValueError):
+        return result
+    # Every non-target row (text, audio, keyframes, reference video) is a global key for
+    # every VDN window. This is what makes REF2VA layouts heavy, so it is reported.
+    global_rows = max(0, seq_len - video_rows)
+    result.update(
+        {
+            "video_rows": video_rows,
+            "text_rows": text_rows,
+            "other_global_rows": max(0, global_rows - text_rows),
+            "global_rows": global_rows,
+            "global_fraction": (global_rows / seq_len) if seq_len else 0.0,
+        }
+    )
     return result
 
 
@@ -271,6 +299,7 @@ def runtime_snapshot(model_patcher: Any) -> dict:
         "checkpoint": state.name,
         "checkpoint_recipe": _checkpoint_recipe(state),
         "adapters": _adapter_snapshot(state),
+        "adaln_fp32": bool(getattr(state, "adaln_fp32", False)),
         "profile": getattr(state, "profile", None),
         "forwards": int(state.forwards),
         "base_precision": getattr(state, "base_precision", "bf16"),
@@ -289,6 +318,7 @@ def runtime_snapshot(model_patcher: Any) -> dict:
             **calibration_snapshot,
             "last_hit": getattr(state.window_cache, "last_calibration_hit", None),
             "last_autotune_error": getattr(state.window_cache, "last_autotune_error", None),
+            "dispatch_reason": getattr(state.window_cache, "last_dispatch_reason", None),
         },
         "kernel_backend": getattr(state, "kernel_backend", state.linear_kernels),
         "compile_policy": getattr(state, "compile_policy", "off"),

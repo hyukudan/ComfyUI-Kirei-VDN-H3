@@ -185,3 +185,45 @@ def test_block_mask_cache_is_model_owned_bounded_and_releasable():
     cache.release()
     assert len(cache) == 0 and cache._compiled is None
     assert not hasattr(window, "_BLOCK_MASK_CACHE")
+
+
+def test_gpu_family_never_treats_consumer_blackwell_as_datacenter(monkeypatch):
+    cases = (
+        ((9, 0), "hopper", True),
+        ((10, 0), "blackwell_dc", True),
+        ((10, 3), "blackwell_dc", True),
+        ((12, 0), "blackwell_consumer", False),
+        ((8, 9), "ada", False),
+        ((8, 6), "ampere", False),
+    )
+    for capability, family, fa4 in cases:
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device, c=capability: c)
+        assert window.gpu_family("cuda:0") == family
+        assert window.prefers_fa4("cuda:0") is fa4
+
+
+def test_grouped_copy_bytes_grow_with_global_rows():
+    frames, per_frame, heads, dim = 10, 4, 2, 8
+    bounds = window.window_bounds(frames, 1, 5)
+    per_row = 2 * heads * dim * 2  # K and V, bf16
+
+    def measure(globals_rows):
+        seq = globals_rows + frames * per_frame
+        q = torch.zeros(seq, heads, dim, dtype=torch.bfloat16)
+        return window.grouped_copy_bytes(
+            q, frames, per_frame, bounds, "both", globals_rows, seq
+        )
+
+    peak_small, total_small = measure(2)
+    peak_big, total_big = measure(1000)
+    # frames 1..8 share one window covering all ten frames; frames 0 and 9 are dense rows
+    assert peak_small == total_small == (2 + frames * per_frame) * per_row
+    assert peak_big == total_big == (1000 + frames * per_frame) * per_row
+
+
+def test_grouped_copy_guard_reasons(monkeypatch):
+    gib = 1024**3
+    assert window.grouped_copies_too_large("cuda:0", 1 * gib, 9 * gib)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (10 * gib, 96 * gib))
+    assert window.grouped_copies_too_large("cuda:0", 4 * gib, 4 * gib)
+    assert window.grouped_copies_too_large("cuda:0", 1 * gib, 2 * gib) is None

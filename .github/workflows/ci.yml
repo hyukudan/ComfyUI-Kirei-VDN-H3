@@ -32,6 +32,7 @@ jobs:
             tests/test_adapters.py \
             tests/test_branch.py \
             tests/test_curve.py \
+            tests/test_domestic_runtime.py \
             tests/test_hybrid.py \
             tests/test_layout.py \
             tests/test_optimized_runtime.py \

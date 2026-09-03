@@ -1,4 +1,4 @@
-"""Runtime LoRA injection for ComfyUI's pruned MiniMax-H3 AdaLN curves."""
+"""Runtime low-rank injection for pruned MiniMax-H3 AdaLN curves."""
 
 from __future__ import annotations
 
@@ -26,15 +26,9 @@ def curve_runtime_scope():
 
 
 def load_egrid(path: str | None = None) -> torch.Tensor:
-    """Load the original-width silu(time-embedding) grid without pickle."""
-
     if path is None:
         custom_nodes = Path(__file__).resolve().parents[2]
-        path = str(
-            custom_nodes
-            / "ComfyUI-MiniMax-H3-Turbo"
-            / "h3_silu_temb_grid.safetensors"
-        )
+        path = str(custom_nodes / "ComfyUI-MiniMax-H3-Turbo" / "h3_silu_temb_grid.safetensors")
     source = Path(path).resolve()
     if not source.is_file() or source.suffix.lower() != ".safetensors":
         raise FileNotFoundError(
@@ -42,7 +36,6 @@ def load_egrid(path: str | None = None) -> torch.Tensor:
             f"expected {source}"
         )
     from safetensors.torch import load_file
-
     state = load_file(str(source), device="cpu")
     if set(state) != {"silu_t_emb_grid"}:
         raise ValueError(f"unexpected e-grid inventory in {source}: {sorted(state)}")
@@ -53,28 +46,35 @@ def load_egrid(path: str | None = None) -> torch.Tensor:
 
 
 class CurveAdapterState(nn.Module):
-    """Per-model low-rank AdaLN terms plus the original-width embedding grid."""
+    """Per-model low-rank AdaLN terms exposed as an auxiliary Comfy model."""
 
     def __init__(self, egrid: torch.Tensor, terms: Iterable[tuple[Any, float]]):
         super().__init__()
-        self.register_buffer("egrid", egrid, persistent=False)
+        self.device = torch.device("cpu")
+        self.register_parameter("egrid", nn.Parameter(egrid, requires_grad=False))
         self._terms: dict[str, list[tuple[str, str, float]]] = defaultdict(list)
         for index, (patch, strength) in enumerate(terms):
             up_name, down_name = f"up_{index}", f"down_{index}"
-            self.register_buffer(up_name, patch.up.detach().contiguous(), persistent=False)
-            self.register_buffer(down_name, patch.down.detach().contiguous(), persistent=False)
-            self._terms[patch.key].append(
-                (up_name, down_name, float(strength) * float(patch.scale))
+            self.register_parameter(
+                up_name, nn.Parameter(patch.up.detach().to("cpu").contiguous(), requires_grad=False)
             )
+            self.register_parameter(
+                down_name, nn.Parameter(patch.down.detach().to("cpu").contiguous(), requires_grad=False)
+            )
+            self._terms[patch.key].append((up_name, down_name, float(strength) * float(patch.scale)))
 
     @property
-    def targets(self) -> tuple[str, ...]:
+    def targets(self):
         return tuple(sorted(self._terms))
 
-    def release(self) -> None:
+    @property
+    def nbytes(self):
+        return sum(p.numel() * p.element_size() for p in self.parameters())
+
+    def release(self):
         self.to(device="cpu")
 
-    def full_embedding(self, t_emb: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    def full_embedding(self, t_emb, table):
         cache = _CURVE_CACHE.get()
         key = (t_emb.data_ptr(), tuple(t_emb.shape), t_emb.device.type, t_emb.device.index)
         if cache is not None and key in cache:
@@ -84,16 +84,13 @@ class CurveAdapterState(nn.Module):
         grid = self.egrid.to(device=t_emb.device, dtype=torch.float32)
         if table.ndim != 2 or coords.shape[1] != table.shape[1]:
             raise RuntimeError(
-                f"AdaLN curve coordinate shape {tuple(coords.shape)} is incompatible "
-                f"with table {tuple(table.shape)}"
+                f"AdaLN curve coordinate shape {tuple(coords.shape)} is incompatible with table {tuple(table.shape)}"
             )
         if grid.shape[0] != table.shape[0]:
-            raise RuntimeError(
-                f"e-grid rows {grid.shape[0]} do not match H3 curve table rows {table.shape[0]}"
-            )
+            raise RuntimeError(f"e-grid rows {grid.shape[0]} do not match H3 curve table rows {table.shape[0]}")
         nearest = torch.cdist(coords, table).argmin(dim=1)
 
-        def candidate(lo: torch.Tensor, hi: torch.Tensor):
+        def candidate(lo, hi):
             start, end = table[lo], table[hi]
             direction = end - start
             fraction = ((coords - start) * direction).sum(1) / direction.square().sum(1).clamp_min(1e-20)
@@ -102,10 +99,8 @@ class CurveAdapterState(nn.Module):
             error = (reconstruction - coords).square().sum(1)
             return fraction, error
 
-        left_lo = (nearest - 1).clamp_min(0)
-        left_hi = nearest
-        right_lo = nearest
-        right_hi = (nearest + 1).clamp_max(table.shape[0] - 1)
+        left_lo = (nearest - 1).clamp_min(0); left_hi = nearest
+        right_lo = nearest; right_hi = (nearest + 1).clamp_max(table.shape[0] - 1)
         left_fraction, left_error = candidate(left_lo, left_hi)
         right_fraction, right_error = candidate(right_lo, right_hi)
         choose_left = left_error <= right_error
@@ -117,7 +112,7 @@ class CurveAdapterState(nn.Module):
             cache[key] = full
         return full
 
-    def delta(self, key: str, full_embedding: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def delta(self, key, full_embedding, dtype):
         terms = self._terms.get(key)
         if not terms:
             raise KeyError(f"no curve AdaLN terms registered for {key!r}")
@@ -128,6 +123,9 @@ class CurveAdapterState(nn.Module):
             value = F.linear(F.linear(full_embedding.to(dtype), down), up) * scale
             result = value if result is None else result.add(value)
         return result
+
+    def forward(self, *args, **kwargs):  # pragma: no cover
+        raise RuntimeError("CurveAdapterState is storage-only")
 
 
 def make_curve_adaln_forward(base, dm, state: CurveAdapterState, key: str):
@@ -155,10 +153,23 @@ def apply_curve_adapters(model_patcher, vdn_state, terms, *, egrid_path: str | N
     curve_state = CurveAdapterState(load_egrid(egrid_path), terms)
     if curve_state.egrid.shape[1] != terms[0][0].down.shape[1]:
         raise RuntimeError(
-            f"e-grid width {curve_state.egrid.shape[1]} does not match adapter input "
-            f"width {terms[0][0].down.shape[1]}"
+            f"e-grid width {curve_state.egrid.shape[1]} does not match adapter input width {terms[0][0].down.shape[1]}"
         )
     vdn_state.curve_adapter = curve_state
+    try:
+        from comfy.model_patcher import ModelPatcher
+        patcher = ModelPatcher(
+            curve_state,
+            load_device=getattr(model_patcher, "load_device", torch.device("cpu")),
+            offload_device=getattr(model_patcher, "offload_device", torch.device("cpu")),
+            size=curve_state.nbytes,
+        )
+        setter = getattr(model_patcher, "set_additional_models", None)
+        if setter is not None:
+            setter("vdn_h3_curve", [patcher])
+    except ImportError:
+        pass
+
     existing = getattr(model_patcher, "object_patches", {})
     for key in curve_state.targets:
         module_path = key.removesuffix(".linear.weight")
@@ -166,16 +177,8 @@ def apply_curve_adapters(model_patcher, vdn_state, terms, *, egrid_path: str | N
         if forward_path in existing:
             raise RuntimeError(f"curve AdaLN patch collides with {forward_path}")
         base = model_patcher.get_model_object(module_path)
-        model_patcher.add_object_patch(
-            forward_path,
-            make_curve_adaln_forward(base, dm, curve_state, key),
-        )
+        model_patcher.add_object_patch(forward_path, make_curve_adaln_forward(base, dm, curve_state, key))
     return len(curve_state.targets)
 
 
-__all__ = [
-    "CurveAdapterState",
-    "apply_curve_adapters",
-    "curve_runtime_scope",
-    "load_egrid",
-]
+__all__ = ["CurveAdapterState", "apply_curve_adapters", "curve_runtime_scope", "load_egrid"]

@@ -1,9 +1,17 @@
 """Standalone CUDA validation/benchmark for the optimized VDN-H3 runtime.
 
-Run inside the same Python environment used by ComfyUI, for example:
+Run it with the Python that runs ComfyUI, from any directory:
 
-    python tests/probe_optimized_cuda.py --device cuda:0 --json vdn-6000.json
-    python tests/probe_optimized_cuda.py --device cuda:1 --json vdn-4090.json
+    # Linux / WSL2 (ComfyUI venv or conda env active)
+    python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_optimized_cuda.py --device cuda:0 --json vdn-6000.json
+    # Windows, native conda / venv
+    python <ComfyUI>\custom_nodes\ComfyUI-Kirei-VDN-H3\tests\probe_optimized_cuda.py --device cuda:0 --json vdn-6000.json
+    # Windows portable build
+    python_embeded\python.exe ComfyUI\custom_nodes\ComfyUI-Kirei-VDN-H3\tests\probe_optimized_cuda.py --device cuda:0
+
+The attention probe uses q/k/v with the strides of the real fused qkv_proj output, runs
+the real calibration path (into a scratch store, never the ComfyUI one) and times every
+installed exact backend: grouped, Flex, FA2 (flash2) and FA4 (decomposed).
 
 The probe uses synthetic tensors only. It validates numerical parity for the accelerated
 kernels/backends, exercises double-buffered branch streaming and emits machine-readable
@@ -14,10 +22,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 import time
 from pathlib import Path
 
 import torch
+
+import sys
+from pathlib import Path as _Path
+
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))  # importable from any cwd
 
 from vdn_h3 import branch, window
 from vdn_h3.kernels import (
@@ -138,22 +152,38 @@ def probe_attention(device, quick=False):
     video_end = video_start + frames * per_frame
     sequence = video_end + global_after
     heads, dim = 4, 64
-    q = torch.randn(sequence, heads, dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    # Same strides as the runtime: q/k/v are views into the fused [S, 3 * heads * dim]
+    # qkv_proj output, not three contiguous tensors.
+    inner = heads * dim
+    fused = torch.randn(sequence, 3 * inner, device=device, dtype=torch.bfloat16)
+    q, k, v = (part.view(sequence, heads, dim) for part in fused.split(inner, dim=-1))
     bounds = window.window_bounds(frames, 1, 5)
     scale = dim ** -0.5
     cache = window.WindowAttentionCache(limit=8)
+    # Real calibration path, persisted to a scratch file instead of models/vdn.
+    scratch = Path(tempfile.gettempdir()) / "kirei-vdn-h3-probe-calibration.json"
+    scratch.unlink(missing_ok=True)
+    cache.calibration = window.CalibrationStore(scratch)
 
     grouped_fn = lambda: window.window_softmax_grouped(
         q, k, v, video_start, video_end, frames, per_frame, bounds, scale,
         anchor_frames="both",
     )
     grouped = grouped_fn()
+    auto_resolved = window.resolve_attention_backend(
+        "auto", q, frames, bounds, "both", cache,
+        video_start=video_start, video_end=video_end, tokens_per_frame=per_frame,
+    )
     result = {
         "shape": list(q.shape),
+        "strides": list(q.stride()),
         "groups": window.window_group_count(frames, bounds, "both"),
-        "auto_resolved": window.resolve_attention_backend("auto", q, frames, bounds, "both", cache),
+        "auto_resolved": auto_resolved,
+        "dispatch_reason": cache.last_dispatch_reason,
+        "calibration_hit": cache.last_calibration_hit,
+        "autotune_error": cache.last_autotune_error,
+        "backends_available": window.backend_inventory(cache),
+        "fa4_kernel": window.fa4_kernel(device),
         "grouped_ms": _timed(device, grouped_fn, iters=3 if quick else 8),
     }
 
@@ -173,6 +203,23 @@ def probe_attention(device, quick=False):
             result["flex"] = {"available": False, "error": str(exc)}
     else:
         result["flex"] = {"available": False}
+
+    if window.flash2_available(cache):
+        try:
+            fa2_fn = lambda: window.window_softmax_flash2(
+                q, k, v, video_start, video_end, frames, per_frame, bounds, scale,
+                anchor_frames="both", cache=cache,
+            )
+            fa2_value = fa2_fn()
+            result["flash2"] = {
+                "available": True,
+                **_error(fa2_value, grouped),
+                "ms": _timed(device, fa2_fn, warmup=1, iters=3 if quick else 8),
+            }
+        except Exception as exc:
+            result["flash2"] = {"available": False, "error": str(exc)}
+    else:
+        result["flash2"] = {"available": False}
 
     if window.decomposed_available(cache):
         try:

@@ -434,6 +434,16 @@ trained VDN local window.
 The exact pattern is represented by a cached block mask and a model-owned compiled Flex
 call.
 
+### Flex compilation
+
+`flex_attention` is compiled once per cache with `dynamic=True`, and the window mask
+closure captures its geometry as tensors rather than Python ints, so neither the kernel
+nor `create_block_mask` recompiles per packed length. Dynamo's recompile limit is raised
+to at least 64 before the first compile: past that limit dynamo runs the function
+eagerly, and eager Flex materialises the full S x S score matrix.
+`tests/probe_flex_cuda.py` pushes twelve lengths through one cache with
+`fail_on_recompile_limit_hit` set to prove it.
+
 ### FA2 / FA4 decomposition
 
 A cached plan separates:
@@ -447,8 +457,13 @@ to packed row order. Dense rows remain exact SDPA.
 ### Auto calibration
 
 `auto` checks a persistent calibration signature before heuristics. The signature
-contains GPU/software identity and exact packed geometry. Only exact candidates that pass
-parity against the grouped oracle can win.
+contains the GPU name and capability, the software identity that decides which backends
+exist and how fast they run (node version, torch, CUDA, cuDNN, driver, Triton,
+flash-attn 2 and flash-attn-4 versions, the installed backend inventory) and the exact
+packed geometry. Any change re-measures instead of trusting an old winner; store files
+of an older schema are ignored. Only exact candidates that pass parity against the
+grouped oracle can win. The resolution reason (`explicit`, `calibrated`, `flex` guard,
+`autotuned`, `heuristic`) is rewritten on every call and reported.
 
 ### GPU families
 

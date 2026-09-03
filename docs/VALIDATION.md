@@ -212,16 +212,27 @@ The suite covers, among other things:
 
 Core runtime:
 
+Run with the Python that runs ComfyUI, from any directory (Windows: the same paths with
+backslashes, or `python_embeded\python.exe` in the portable build):
+
 ```bash
-python tests/probe_optimized_cuda.py --device cuda:0 --json vdn-core-gpu0.json
+python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_optimized_cuda.py --device cuda:0 --json vdn-core-gpu0.json
 ```
 
-Use `--quick` first if desired.
+Use `--quick` first if desired. The attention section reports the backend `auto` resolved
+through the real calibration path, the dispatch reason and timings for grouped, Flex, FA2
+and FA4 on q/k/v with the strides of the real fused projection.
 
 Workstation/consumer precision and memory:
 
 ```bash
-python tests/probe_domestic_cuda.py --device cuda:0 --json vdn-domestic-gpu0.json
+python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_domestic_cuda.py --device cuda:0 --json vdn-domestic-gpu0.json
+```
+
+Flex recompile regression (twelve packed lengths through one cache, must print `PASS`):
+
+```bash
+python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_flex_cuda.py
 ```
 
 Run independently on every target GPU. Do not infer RTX 4090 results from Blackwell or

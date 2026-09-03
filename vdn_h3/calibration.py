@@ -8,14 +8,82 @@ uses conservative built-in heuristics.
 from __future__ import annotations
 
 import json
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
 
 
-CALIBRATION_VERSION = 2
+CALIBRATION_VERSION = 3
 CALIBRATABLE_BACKENDS = ("grouped", "flex", "flash2", "decomposed")
+
+
+def _package_version(distribution: str, module: str | None = None) -> str | None:
+    try:
+        from importlib.metadata import version
+
+        return str(version(distribution))
+    except Exception:
+        pass
+    if module:
+        try:
+            import importlib
+
+            loaded = importlib.import_module(module)
+            return str(getattr(loaded, "__version__", None) or "present")
+        except Exception:
+            return None
+    return None
+
+
+def _driver_version() -> str | None:
+    try:
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        try:
+            value = pynvml.nvmlSystemGetDriverVersion()
+        finally:
+            pynvml.nvmlShutdown()
+        return value.decode() if isinstance(value, bytes) else str(value)
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+        return lines[0] if lines else None
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def runtime_environment() -> dict[str, Any]:
+    """Software identity that decides which exact backends exist and how fast they run.
+
+    Cached per process and embedded in every calibration signature: a node update, a
+    torch/CUDA/driver change or a newly installed flash-attn 2 / flash-attn-4 / Triton
+    changes the signature, so old winners are re-measured instead of trusted.
+    """
+    from . import __version__
+    from .window import backend_inventory
+
+    cudnn = torch.backends.cudnn
+    return {
+        "node": __version__,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": cudnn.version() if cudnn.is_available() else None,
+        "driver": _driver_version() if torch.cuda.is_available() else None,
+        "triton": _package_version("triton", "triton"),
+        "flash_attn": _package_version("flash-attn", "flash_attn"),
+        "flash_attn_4": _package_version("flash-attn-4", "flash_attn.cute"),
+        "backends": [name for name, ok in sorted(backend_inventory(None).items()) if ok],
+    }
 
 
 def default_calibration_path() -> Path:
@@ -51,7 +119,7 @@ def calibration_signature(
         capability = []
     payload = {
         "version": CALIBRATION_VERSION,
-        "torch": torch.__version__,
+        "env": runtime_environment(),
         "gpu": gpu,
         "capability": capability,
         "dtype": str(query.dtype),
@@ -121,6 +189,7 @@ class CalibrationStore:
             "path": str(self.path),
             "version": CALIBRATION_VERSION,
             "entries": len(self._entries),
+            "environment": runtime_environment(),
         }
 
 
@@ -130,4 +199,5 @@ __all__ = [
     "CalibrationStore",
     "calibration_signature",
     "default_calibration_path",
+    "runtime_environment",
 ]

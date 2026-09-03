@@ -27,6 +27,8 @@ def _cuda_snapshot(model_patcher: Any) -> dict:
                 "capability": list(torch.cuda.get_device_capability(device)),
                 "family": _gpu_family(device),
                 "fa4_kernel": _fa4_kernel(device),
+                "fa4_available": bool(_backend_inventory().get("decomposed", False)),
+                "backends_available": _backend_inventory(),
                 "total_bytes": int(total),
                 "free_bytes": int(free),
                 "allocated_bytes": int(torch.cuda.memory_allocated(device)),
@@ -37,6 +39,24 @@ def _cuda_snapshot(model_patcher: Any) -> dict:
     except Exception as exc:
         result["error"] = str(exc)
     return result
+
+
+def _backend_inventory() -> dict:
+    try:
+        from .window import backend_inventory
+
+        return backend_inventory(None)
+    except Exception:
+        return {}
+
+
+def _recompile_limit():
+    try:
+        from .window import recompile_limit
+
+        return recompile_limit()
+    except Exception:
+        return None
 
 
 def _fa4_kernel(device) -> str:
@@ -329,6 +349,8 @@ def runtime_snapshot(model_patcher: Any) -> dict:
             "last_hit": getattr(state.window_cache, "last_calibration_hit", None),
             "last_autotune_error": getattr(state.window_cache, "last_autotune_error", None),
             "dispatch_reason": getattr(state.window_cache, "last_dispatch_reason", None),
+            "flex_compile": "dynamic",
+            "dynamo_recompile_limit": _recompile_limit(),
         },
         "kernel_backend": getattr(state, "kernel_backend", state.linear_kernels),
         "compile_policy": getattr(state, "compile_policy", "off"),

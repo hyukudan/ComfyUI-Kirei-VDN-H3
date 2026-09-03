@@ -67,10 +67,14 @@ weights exactly and leaves no low-rank GEMMs in the hot path.
 
 **Requirements.** A current ComfyUI with native MiniMax-H3 support, a CUDA build of
 PyTorch, Triton (temporal kernel, FlexAttention, compiled fusions). Optional:
-comfy-kitchen for INT8/NVFP4 bases; flash-attn 2 for the varlen decomposition on
-Ampere/Ada/Hopper; **flash-attn-4**, the CuTe DSL package (`pip install flash-attn-4`,
-or `"flash-attn-4[cu13]"` on CUDA 13), which brings the tcgen05 kernel on B200, the
-wgmma kernel on Hopper and an mma.sync kernel on sm_120 / Ada / Ampere.
+comfy-kitchen for INT8/NVFP4 bases; flash-attn 2 for the varlen decomposition (Ampere
+and newer, sm_120 included when a wheel exists for your torch); **flash-attn-4**, the
+CuTe DSL package (`pip install flash-attn-4`, or `"flash-attn-4[cu13]"` on CUDA 13),
+which brings the tcgen05 kernel on B200, the wgmma kernel on Hopper and an mma.sync
+kernel on sm_120 / Ada / Ampere. flash-attn-4 depends on `nvidia-cutlass-dsl`, which has
+no Windows wheel: it cannot be installed on native Windows (do not force it with
+`--no-deps`); use WSL2 or a Linux ComfyUI to try it. Flex on Windows needs
+`triton-windows`.
 
 ---
 
@@ -183,6 +187,11 @@ cu130+ build; older builds run comfy-kitchen's slow fallback. ComfyUI's global
 SageAttention switch does not touch the exact VDN windows unless you select
 `attention_backend = compat`.
 
+**Native Windows.** flash-attn-4 is not installable (no `nvidia-cutlass-dsl` wheel), so
+the candidates are grouped SDPA, Flex through `triton-windows` and FA2 (`flash2`) when a
+wheel for your torch/CUDA is installed. The Runtime Report shows `fa4_available = false`
+next to `fa4_kernel`, the generation the card would run.
+
 **24 GB cards.** `auto` moves to hybrid or streamed branch storage and exact 5-frame tiles
 when the budget requires it; `low_vram` forces that layout.
 
@@ -237,6 +246,7 @@ H3 aligns the requested frame count to its temporal grid. That is not a quality 
 | Hard, patterned or oversharpened frames | `res_multistep`, 4 steps on the 8-step checkpoint, or CFG > 1 | use the recipe above |
 | Soft output on an INT8/FP8 base | adapters merged (`max_speed` or `lora_mode = merge`) | `auto` or `lora_mode = bypass` |
 | Out of memory on the first run with reference images | grouped attention copies every global row into every window | check `attention_calibration.dispatch_reason`; force `attention_backend = flex` or use `low_vram` |
+| Old attention winner after updating the node, torch or a backend | none: the calibration signature includes the node version, torch/CUDA/driver, Triton, flash-attn versions and the installed backends | a changed environment recalibrates by itself; delete `models/vdn/vdn_h3_calibration.json` to force it |
 | INT8 base is slow | torch build older than cu130: comfy-kitchen falls back | install a cu130+ build or use the `fp8_scaled` base |
 | Dropdown shows the placeholder instead of a checkpoint | the stage directory is not under `models/vdn` | move it there and refresh the node list |
 | "VDN-H3 is already applied to this MODEL" | one model was patched twice | keep a single Apply node per model |
@@ -270,8 +280,18 @@ Weights** frees the caches explicitly; the legacy node id keeps old workflows lo
 - [`benchmarks/README.md`](benchmarks/README.md): scenarios, recorder and comparison tooling.
 - [`CHANGELOG.md`](CHANGELOG.md).
 
-Tests run on CPU without a GPU or ComfyUI: `python -m pytest -q`. GPU probes:
-`tests/probe_optimized_cuda.py`, `tests/probe_domestic_cuda.py`, `tests/probe_flex_cuda.py`.
+Tests run on CPU without a GPU or ComfyUI: `python -m pytest -q`. The GPU probes run
+with the Python that runs ComfyUI, from any directory:
+
+```bash
+python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_optimized_cuda.py --device cuda:0 --json probe-core.json
+python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_domestic_cuda.py --device cuda:0 --json probe-domestic.json
+python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_flex_cuda.py
+```
+
+The core probe uses q/k/v with the strides of the real fused projection, runs the real
+calibration into a scratch store and times grouped, Flex, FA2 and FA4. The Flex probe
+pushes twelve packed lengths through one cache to prove the compiled kernel survives.
 
 ## Status
 

@@ -244,3 +244,64 @@ def test_fa4_kernel_generation_follows_the_family(monkeypatch):
         )
         assert window.fa4_kernel("cuda:0") == kernel
         assert window.prefers_fa4("cuda:0") is first
+
+
+def test_flex_wrapper_compiles_dynamic_and_raises_the_recompile_floor(monkeypatch):
+    import torch._dynamo.config as dynamo_config
+
+    captured = {}
+
+    def fake_compile(fn, **kwargs):
+        captured.update(kwargs)
+        return fn
+
+    monkeypatch.setattr(window.torch, "compile", fake_compile)
+    for name in ("recompile_limit", "cache_size_limit"):
+        monkeypatch.setattr(dynamo_config, name, 8, raising=False)
+    cache = window.WindowAttentionCache()
+
+    def sentinel(*args, **kwargs):
+        return None
+
+    assert cache.attention(sentinel) is sentinel
+    assert captured == {"dynamic": True}
+    assert window.recompile_limit() >= window.DYNAMO_RECOMPILE_FLOOR
+    for name in ("recompile_limit", "cache_size_limit"):
+        monkeypatch.setattr(dynamo_config, name, 512, raising=False)
+    assert window.raise_recompile_limit() == 512  # never lowered
+
+
+def test_mask_mod_captures_geometry_as_tensors_not_ints():
+    lo = torch.zeros(40, dtype=torch.long)
+    hi = torch.full((40,), 2, dtype=torch.long)
+    hi[24:34] = 0  # frame 2 only sees frame 0
+    mask_mod = window._window_mask_mod(4, 34, 3, 10, lo, hi, "none")
+    cells = [cell.cell_contents for cell in mask_mod.__closure__]
+    assert not any(isinstance(c, int) and not isinstance(c, bool) for c in cells)
+    q, k = torch.tensor(30), torch.tensor
+    assert bool(mask_mod(0, 0, q, k(18))) is False  # frame 1 is outside frame 2's window
+    assert bool(mask_mod(0, 0, q, k(8))) is True  # frame 0 inside
+    assert bool(mask_mod(0, 0, q, k(36))) is True  # global key
+    assert bool(mask_mod(0, 0, torch.tensor(1), k(18))) is True  # global query
+    anchored = window._window_mask_mod(4, 34, 3, 10, lo, hi, "both")
+    assert bool(anchored(0, 0, q, k(18))) is True  # last frame is an anchor row
+
+
+def test_dispatch_reason_is_rewritten_on_every_resolution(tmp_path):
+    q = torch.zeros(20, 2, 4)
+    bounds = window.window_bounds(3, 1)
+    cache = window.WindowAttentionCache()
+    cache.calibration = window.CalibrationStore(tmp_path / "cal.json")
+    cache.last_dispatch_reason = "stale"
+    assert window.resolve_attention_backend("flex", q, 3, bounds, "both", cache) == "flex"
+    assert cache.last_dispatch_reason == "explicit: flex"
+    geometry = dict(video_start=2, video_end=14, tokens_per_frame=4)
+    assert window.resolve_attention_backend("auto", q, 3, bounds, "both", cache, **geometry) == "grouped"
+    assert cache.last_dispatch_reason.startswith("heuristic: grouped")
+    signature = window.calibration_signature(
+        q, 3, bounds, "both", groups=window.window_group_count(3, bounds, "both"), **geometry
+    )
+    cache.calibration.record(signature, winner="grouped", results={})
+    assert window.resolve_attention_backend("auto", q, 3, bounds, "both", cache, **geometry) == "grouped"
+    assert cache.last_dispatch_reason == "calibrated: grouped"
+    assert cache.last_calibration_hit == "grouped"

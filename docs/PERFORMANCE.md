@@ -95,6 +95,9 @@ Saganaki number is the first one to beat with `profile=auto`.
 | B200 (sm_100) | resident | as above | BF16 | FA4 decomposition first |
 | RTX 4090 24 GB | hybrid + 5-frame tiles | bypass | follows an INT8/FP8 base | grouped, Flex |
 
+On native Windows flash-attn-4 cannot be installed (no `nvidia-cutlass-dsl` wheel), so
+the sm_120 candidates there are grouped, Flex through `triton-windows` and FA2.
+
 Explicit experiments that need a measured win *and* a passed quality gate before they
 move into `auto`: INT8/ConvRot or FP8 projection (`projection_precision`), merged
 adapters on quantized bases (`max_speed`), CUDA graphs (`compile_policy =
@@ -107,8 +110,10 @@ on the local windows (`attention_backend = compat`).
 
 1. Confirm the environment: torch with CUDA 13 or newer (comfy-kitchen's CUDA backend
    needs it for the INT8 fast path), Triton, and the base checkpoint you actually use.
-2. `python tests/probe_optimized_cuda.py --device cuda:0 --json benchmarks/results/probe-core.json`
-   and `python tests/probe_domestic_cuda.py --device cuda:0 --json benchmarks/results/probe-domestic.json`.
+2. With the Python that runs ComfyUI, from any directory:
+   `python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_optimized_cuda.py --device cuda:0 --json probe-core.json`,
+   the same for `probe_domestic_cuda.py`, and `probe_flex_cuda.py` once. Keep the JSON
+   files next to the results.
 3. Run the tiers in `benchmarks/scenarios.json` through the benchmark nodes (see
    [`benchmarks/README.md`](../benchmarks/README.md)): quick 608×352·121, detail
    960×544·121, primary 608×352·241, then stress and the canonical 1344×768·345.

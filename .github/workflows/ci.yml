@@ -30,7 +30,9 @@ jobs:
         run: |
           pytest -q \
             tests/test_adapters.py \
+            tests/test_benchmark_nodes.py \
             tests/test_benchmark_protocol.py \
+            tests/test_benchmark_record_result.py \
             tests/test_branch.py \
             tests/test_checkpoint_recipe_report.py \
             tests/test_curve.py \

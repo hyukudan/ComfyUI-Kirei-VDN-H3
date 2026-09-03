@@ -32,6 +32,46 @@ def _runtime_adapters(runtime):
     }
 
 
+def _expected_vdn_runtime(scenario: dict) -> dict:
+    """Expected resolved runtime implied by one scenario id/model variant.
+
+    These expectations are deliberately narrower than the normal node's `auto` policy:
+    a benchmark named BF16/INT8/reference/max_speed must actually execute that path or
+    the measurement is mislabeled and cannot enter the result set.
+    """
+    variant = str(scenario.get("model_variant", ""))
+    expected = {}
+    if variant == "vdn_max_speed":
+        expected["profile"] = "max_speed"
+    elif variant == "vdn_stage_b_reference":
+        expected["profile"] = "reference"
+    elif variant.startswith("vdn_"):
+        expected["profile"] = "auto"
+    precision = scenario.get("projection_precision")
+    if precision:
+        expected["projection_precision"] = str(precision)
+    return expected
+
+
+def _validate_vdn_runtime_label(runtime: dict, scenario: dict):
+    expected = _expected_vdn_runtime(scenario)
+    profile = expected.get("profile")
+    if profile is not None and runtime.get("profile") != profile:
+        raise ValueError(
+            f"scenario {scenario['id']!r} expects VDN profile={profile!r}, but Runtime Report "
+            f"resolved profile={runtime.get('profile')!r}"
+        )
+    precision = expected.get("projection_precision")
+    if precision is not None:
+        projection = runtime.get("projection")
+        got = projection.get("precision") if isinstance(projection, dict) else None
+        if got != precision:
+            raise ValueError(
+                f"scenario {scenario['id']!r} expects projection_precision={precision!r}, "
+                f"but Runtime Report resolved {got!r}; do not record a fallback under the wrong label"
+            )
+
+
 def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
     expected_steps = int(recipe["steps"])
     if int(scenario["steps"]) != expected_steps:
@@ -54,6 +94,7 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
         )
 
     if isinstance(runtime, dict):
+        _validate_vdn_runtime_label(runtime, scenario)
         expected_turbo_steps = recipe.get("runtime_turbo_num_steps")
         checkpoint_recipe = runtime.get("checkpoint_recipe")
         if expected_turbo_steps is not None:
@@ -65,8 +106,7 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
                 )
 
         # Newer Runtime Reports may expose exact named-adapter state. Validate it when
-        # available, but do not reject otherwise: older installed nodes still provide
-        # enough information to validate checkpoint recipe, sampling shifts and runtime.
+        # available, while remaining compatible with older installed reports.
         adapter_state = _runtime_adapters(runtime)
         required = list(recipe.get("required_adapters", []))
         if required and expects_vdn and adapter_state is not None and adapter_state["active"] is not None:

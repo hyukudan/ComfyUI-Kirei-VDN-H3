@@ -275,6 +275,8 @@ def apply_vdn_parallel(model_patcher: Any, state: Any):
         )
     from .block_kernels import install_block_fusions
     install_block_fusions(model_patcher, state, blocks)
+    from .adaln import install_adaln_fp32
+    install_adaln_fp32(model_patcher, state, _dm)
     try:
         from comfy.patcher_extension import WrappersMP
     except ImportError:

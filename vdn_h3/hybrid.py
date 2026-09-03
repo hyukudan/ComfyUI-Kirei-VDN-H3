@@ -98,6 +98,10 @@ class VDNState:
         self.last_layout = None
         self.branch_execution = "serial"
         self.diagnostics = DiagnosticsRecorder(diagnostics)
+        # AdaLN fidelity patch (see adaln.py): requested flag and the per-forward fp32
+        # time embedding it reads.
+        self.adaln_fp32 = True
+        self.adaln_source = None
 
         if weight_maps is None:
             maps = []
@@ -214,6 +218,7 @@ def make_layout_wrapper(state: VDNState):
         layout = layout_from_payload(kwargs.get("minimax_payload"), x, context, state.config)
         state.last_layout = layout
         state.forwards += 1
+        state.adaln_source = None
         curve_scope = nullcontext()
         if state.curve_adapter is not None:
             from .curve import curve_runtime_scope
@@ -594,6 +599,8 @@ def apply_vdn(model_patcher: Any, state: VDNState):
         )
     from .block_kernels import install_block_fusions
     install_block_fusions(model_patcher, state, blocks)
+    from .adaln import install_adaln_fp32
+    install_adaln_fp32(model_patcher, state, _dm)
     try:
         from comfy.patcher_extension import WrappersMP
     except ImportError:

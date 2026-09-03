@@ -48,6 +48,18 @@ def _resolve_scenario(scenario_id: str):
     return payload, scenario, recipe
 
 
+def _scenario_runtime_controls(spec: dict, recipe: dict):
+    expects_vdn = bool(recipe.get("expects_vdn_runtime", False))
+    if not expects_vdn:
+        return "n/a", "n/a", False
+    profile = str(spec.get("profile", "auto"))
+    projection = str(spec.get("projection_precision", "auto"))
+    apply_turbo = bool(
+        spec.get("apply_turbo_adapter", spec.get("recipe_id") == "vdn_stage_dmd_8")
+    )
+    return profile, projection, apply_turbo
+
+
 def _model_device(model: Any) -> torch.device:
     try:
         return torch.device(getattr(model, "load_device", "cpu"))
@@ -135,15 +147,18 @@ class KireiBenchmarkScenario:
                     _active_scenario_ids(),
                     {
                         "tooltip": (
-                            "Select once, then wire steps/width/height/frames/shifts into the "
-                            "workflow so the scenario controls the actual render rather than just its label."
+                            "Select once, then wire geometry/steps/shifts into the workflow. "
+                            "The VDN profile/projection/turbo outputs show the exact Apply VDN settings."
                         )
                     },
                 )
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING")
+    RETURN_TYPES = (
+        "STRING", "STRING", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT",
+        "STRING", "STRING", "BOOLEAN", "STRING",
+    )
     RETURN_NAMES = (
         "scenario_id",
         "recipe_id",
@@ -153,18 +168,27 @@ class KireiBenchmarkScenario:
         "frames",
         "video_shift",
         "audio_shift",
+        "vdn_profile",
+        "projection_precision",
+        "apply_turbo_adapter",
         "scenario_json",
     )
     FUNCTION = "resolve"
     CATEGORY = "model_patches/video/benchmark"
-    DESCRIPTION = "Resolve an active benchmark scenario into connectable recipe/geometry values."
+    DESCRIPTION = "Resolve an active benchmark scenario into connectable recipe, geometry and VDN-control values."
 
     def resolve(self, scenario):
         payload, spec, recipe = _resolve_scenario(str(scenario))
+        profile, projection, apply_turbo = _scenario_runtime_controls(spec, recipe)
         merged = {
             "schema_version": int(payload.get("schema_version", 0)),
             "scenario": spec,
             "recipe": recipe,
+            "runtime_controls": {
+                "vdn_profile": profile,
+                "projection_precision": projection,
+                "apply_turbo_adapter": apply_turbo,
+            },
         }
         return (
             str(spec["id"]),
@@ -175,6 +199,9 @@ class KireiBenchmarkScenario:
             int(spec["frames"]),
             float(recipe["video_shift"]),
             float(recipe["audio_shift"]),
+            profile,
+            projection,
+            apply_turbo,
             json.dumps(merged, indent=2, sort_keys=True, default=str),
         )
 
@@ -204,9 +231,7 @@ class KireiBenchmarkStart:
     RETURN_NAMES = ("model", "benchmark_token")
     FUNCTION = "start"
     CATEGORY = "model_patches/video/benchmark"
-    DESCRIPTION = (
-        "Start a recipe-aware sampler benchmark and record the model's actual H3 sampling shifts."
-    )
+    DESCRIPTION = "Start a recipe-aware sampler benchmark and record the model's actual H3 sampling shifts."
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
@@ -253,7 +278,7 @@ class KireiBenchmarkEnd:
                     {
                         "tooltip": (
                             "Connect the same sampled MODEL. VDN scenarios then embed the Runtime "
-                            "Report so checkpoint recipe/precision can be validated."
+                            "Report so checkpoint recipe/profile/precision can be validated."
                         )
                     },
                 ),

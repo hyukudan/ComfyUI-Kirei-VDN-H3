@@ -142,7 +142,9 @@ def test_auto_int8_resident_matches_native_speed_family(monkeypatch):
     runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
     assert runtime["base_precision"] == "int8"
     assert runtime["branch_mode"] == "resident"
-    assert runtime["branch_execution"] == "parallel"
+    # Auto follows the qualified upstream single-GPU tuned scheduler. Parallel remains
+    # an explicit experiment until a real-device benchmark proves it faster.
+    assert runtime["branch_execution"] == "serial"
     assert runtime["lora_mode"] == "merge"
     assert runtime["projection_precision"] == "int8"
     assert runtime["compile_policy"] == "shared"
@@ -150,10 +152,21 @@ def test_auto_int8_resident_matches_native_speed_family(monkeypatch):
     assert runtime["block_fusion"]
 
 
+def test_workstation_fp8_can_opt_into_parallel_when_eligible(monkeypatch):
+    monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
+    runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="workstation_fp8")
+    assert runtime["branch_mode"] == "resident"
+    assert runtime["branch_execution"] == "parallel"
+    assert runtime["lora_mode"] == "merge"
+    assert runtime["projection_precision"] == "fp8"
+    assert runtime["compile_policy"] == "shared"
+
+
 def test_auto_quantized_but_nonresident_keeps_factorized_lora(monkeypatch):
     monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
     monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "hybrid")
-    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "serial")
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
     monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 5)
 
     runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
@@ -197,6 +210,7 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (70 * gib, 96 * gib))
     assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "resident"
     assert nodes._auto_tile_frames(model, "resident") == 0
+    # Eligibility helper remains useful for explicit workstation experiments.
     assert nodes._auto_execution_mode(model, "resident") == "parallel"
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 * gib, 96 * gib))

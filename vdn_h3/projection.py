@@ -78,14 +78,13 @@ def _quantize_int8_weight(
     convrot: bool,
     convrot_groupsize: int,
 ):
+    """Quantize exactly like ComfyUI's current TensorWiseINT8 regression tests."""
     quant_ops = _comfy_int8_components()
     use_convrot = bool(convrot and weight.shape[1] % int(convrot_groupsize) == 0)
     source = weight.detach().to(device=device, dtype=torch.bfloat16, non_blocking=False).contiguous()
     qweight = quant_ops.QuantizedTensor.from_float(
         source,
         "TensorWiseINT8Layout",
-        scale="recalculate",
-        stochastic_rounding=0,
         per_channel=True,
         convrot=use_convrot,
         convrot_groupsize=int(convrot_groupsize),
@@ -118,8 +117,6 @@ def int8_supported(
         qweight = quant_ops.QuantizedTensor.from_float(
             w,
             "TensorWiseINT8Layout",
-            scale="recalculate",
-            stochastic_rounding=0,
             per_channel=True,
             convrot=bool(convrot),
             convrot_groupsize=int(convrot_groupsize),

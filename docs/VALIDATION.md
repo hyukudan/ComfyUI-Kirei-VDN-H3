@@ -1,222 +1,340 @@
 # VDN-H3 validation and profiling
 
-This document defines how to validate the runtime after code, ComfyUI, PyTorch, CUDA or
-GPU changes. It deliberately separates numerical correctness from performance.
+This document defines the qualification protocol for Kirei VDN-H3. It separates four
+questions that are easy to mix accidentally:
 
-No hardware-specific number should be promoted into a README claim unless it was
-measured with the exact command/workflow and environment being described.
+1. is the VDN mathematics correct?;
+2. is the released checkpoint being applied completely?;
+3. is the model being sampled with the trajectory it was trained for?;
+4. is an optimized runtime actually faster on the target GPU without failing the quality gate?
 
-## 1. Validation layers
-
-Use four levels:
-
-1. **CPU unit parity** — catches mathematical/API regressions cheaply.
-2. **synthetic CUDA probes** — qualifies kernels, attention and memory movement without
-   model weights.
-3. **real checkpoint application** — verifies adapter mapping, Comfy lifecycle and
-   quantized H3 integration.
-4. **generation benchmark** — measures actual sampler time, peak VRAM and output
-   behavior.
-
-A successful lower level does not replace the levels above it.
+A valid result needs all four.
 
 ---
 
-## 2. CPU suite
+## 1. Canonical inference trajectories
 
-From the custom-node repository:
+Sampler, scheduler, NFE, denoise and MiniMax-H3 shifts are part of model identity for a
+benchmark. Resolution and frame count alone are not enough.
+
+### OpenVDN Stage-DMD release
+
+Canonical few-step VDN:
+
+```text
+checkpoint      = stage-dmd-step-250
+adapters        = default 1.0 + turbo 1.0
+sampler         = euler
+scheduler       = simple
+steps / NFE     = 8
+denoise         = 1.0
+video shift     = 12.0
+audio shift     = 3.0
+```
+
+`res_multistep` is **not** valid for this recipe. It belongs to a base-model workflow and
+changes the denoising trajectory. A visually plausible output produced with the wrong
+sampler is not evidence about VDN quality.
+
+### OpenVDN Stage-B fidelity reference
+
+Use this before blaming the DMD/Turbo adapter when quality is suspicious:
+
+```text
+checkpoint      = stage-b-step-2000
+adapters        = default 1.0
+turbo           = OFF
+sampler         = euler
+scheduler       = simple
+steps / NFE     = 50
+denoise         = 1.0
+video shift     = 12.0
+audio shift     = 3.0
+projection      = BF16
+profile         = reference
+```
+
+If this path already diverges visually, investigate the VDN architecture, Stage-B
+adapter conversion, window semantics or AdaLN handling before examining Stage-DMD.
+
+### Larry MiniMax-H3 Turbo v4 clean control
+
+For a clean same-trajectory quality/control comparison with Stage-DMD:
+
+```text
+LoRA            = Larry v4
+strength        = 1.0
+sampler         = euler
+scheduler       = simple
+steps           = 8
+denoise         = 1.0
+video shift     = 12.0
+audio shift     = 3.0
+```
+
+Larry v4 supports 4–8 steps, while 6–8 is useful when motion/detail at the four-step
+minimum is not sufficient. On current ComfyUI, stock Euler is valid because the H3
+video/audio dual schedule is handled by the model sampling layer.
+
+### Local visual workflow reference
+
+The locally observed workflow that looked good is kept as a separate non-comparable
+reference:
+
+```text
+hybrid blocks   = b30-49
+SageAttention   = enabled
+Larry strength  = 0.6
+sampler         = euler
+scheduler       = beta
+steps           = 6
+```
+
+It is useful for visual context. It is not the canonical OpenVDN or clean Larry control.
+
+---
+
+## 2. Benchmark graph must own sampler and sigmas
+
+Do not reuse sampler widgets from a production/smoke-test workflow.
+
+Use:
+
+```text
+Kirei Benchmark Scenario
+        │ scenario_id
+        ▼
+Kirei Benchmark Sampling ◄──── MODEL
+        │
+        ├── SAMPLER ─────────────────┐
+        ├── SIGMAS ──────────────────┤
+        └── recipe_token             │
+                 │                   │
+                 ▼                   │
+Kirei Benchmark Start ◄────── MODEL │
+        │ MODEL                      │
+        └────────────────────────────┼──► SamplerCustomAdvanced
+                                    │
+SamplerCustomAdvanced ◄─────────────┘
+        │ LATENT
+        ▼
+Kirei Benchmark End
+```
+
+`Kirei Benchmark Sampling` constructs the actual Comfy sampler and sigma schedule from
+`benchmarks/scenarios.json`. `Kirei Benchmark Start` refuses to run without the opaque
+verified recipe token produced by that node.
+
+For Stage-DMD this guarantees:
+
+```text
+Euler / simple / 8 / denoise 1.0 / shifts 12,3
+```
+
+A manually configured `res_multistep`, `beta`, six-step or partial-denoise path cannot be
+recorded as the canonical scenario.
+
+---
+
+## 3. Result recorder validation
+
+`benchmarks/record_result.py` validates the measurement before appending it to the
+result set.
+
+For VDN it requires:
+
+- verified sampling plan;
+- expected sampler name;
+- expected scheduler name;
+- expected NFE;
+- expected denoise;
+- actual model video/audio shifts;
+- VDN Runtime Report;
+- checkpoint `turbo_num_steps` when declared;
+- scenario profile (`auto`, `max_speed`, `reference`, ...);
+- actual projection precision, so a BF16 fallback cannot be recorded as INT8/FP8;
+- exact active adapter inventory;
+- exact adapter strengths.
+
+The Stage-DMD recipe must therefore report:
+
+```text
+adapters.active     = [default, turbo]
+adapters.strengths  = {default: 1.0, turbo: 1.0}
+```
+
+Stage-B must report only `default=1.0`.
+
+---
+
+## 4. Validation layers
+
+Use these levels in order.
+
+### Level A — CPU/unit parity
 
 ```bash
 pytest -q
+python -m compileall -q vdn_h3 tests benchmarks
 ```
 
-The dependency-light tests cover:
+The suite covers, among other things:
 
-- strict model/checkpoint inventory;
-- upstream -> native adapter target mapping;
-- fused QKV slice mapping;
+- checkpoint and branch inventory;
+- Diffusers -> native target mapping;
+- Q/K/V slice mapping;
 - SwiGLU ordering;
+- PEFT alpha/rank scaling;
 - low-rank factor preservation;
-- VDN delta-rule solve;
+- grouped QKV LoRA bypass;
+- VDN solve / Cholesky recurrence;
 - frame statistics;
-- forward/reverse recurrence;
-- gather state math;
-- reference autograd;
-- grouped local attention vs dense-mask oracle;
-- anchor modes;
-- decomposed-plan coverage;
-- shared cache ownership;
-- tiled/untiled branch parity;
-- temporal halo behavior;
-- LoRA grouped-up fusion;
-- hybrid BF16/FP8 inventory;
-- calibration persistence/signature separation;
-- runtime profile policy.
+- bidirectional scan;
+- complementary state gather;
+- chunk-aligned windows and anchors;
+- grouped attention vs dense oracle;
+- exact Comfy SDPA dispatch without attention overrides;
+- Flex/FA2/FA4 coverage/fallback contracts;
+- tiled vs untiled branch parity;
+- temporal halo handling;
+- hybrid/stream slot validity;
+- INT8/FP8 storage policies;
+- robust pruned/curve AdaLN detection;
+- e-grid AdaLN reinjection;
+- benchmark recipe enforcement.
 
-### Static compile
+### Level B — synthetic CUDA probes
 
-```bash
-python -m compileall -q vdn_h3 tests
-```
-
-Run this before any GPU qualification.
-
----
-
-## 3. Synthetic CUDA probes
-
-### 3.1 Core optimized probe
+Core runtime:
 
 ```bash
-python tests/probe_optimized_cuda.py \
-  --device cuda:0 \
-  --json vdn-core-gpu0.json
+python tests/probe_optimized_cuda.py --device cuda:0 --json vdn-core-gpu0.json
 ```
 
-Use `--quick` for a first pass.
+Use `--quick` first if desired.
 
-It exercises:
-
-- temporal eager/Conv1d/compile/Triton parity;
-- optimized recurrence vs reference recurrence;
-- grouped/Flex/FA4 attention where available;
-- streamed weight correctness.
-
-### 3.2 Domestic/workstation probe
-
-```bash
-python tests/probe_domestic_cuda.py \
-  --device cuda:0 \
-  --json vdn-domestic-gpu0.json
-```
-
-It exercises:
-
-- exact tiled branch vs untiled branch;
-- temporal-convolution halo across tiles;
-- hybrid projection streaming;
-- H2D telemetry;
-- actual-device FP8 `_scaled_mm` probe;
-- FP8/BF16 projection parity and timing.
-
-Run the same probe separately for every GPU intended for use.
-
-For a two-GPU workstation where H3 is normally on GPU 0 and the display is on GPU 1:
+Workstation/consumer precision and memory:
 
 ```bash
 python tests/probe_domestic_cuda.py --device cuda:0 --json vdn-domestic-gpu0.json
-python tests/probe_domestic_cuda.py --device cuda:1 --json vdn-domestic-gpu1.json
 ```
 
-Do not infer the 4090 result from a Blackwell result or vice versa.
+Run independently on every target GPU. Do not infer RTX 4090 results from Blackwell or
+vice versa.
+
+### Level C — real checkpoint application
+
+Verify:
+
+- all 50 released branch blocks load;
+- Stage-B `default` is complete;
+- Stage-DMD `turbo` is complete when enabled;
+- Q/K/V factors land on correct fused slices;
+- `mlp.fc2` factors follow the native fused-linear exception;
+- curve AdaLN terms are not silently dropped;
+- e-grid is found and the curve adapter is active when required;
+- branch/LoRA/curve auxiliaries are registered in Comfy lifecycle;
+- runtime report shows the expected adapter recipe.
+
+### Level D — generation quality/performance
+
+Only here make user-facing quality or speed conclusions.
 
 ---
 
-## 4. Attention calibration
+## 5. Exact local attention contract
 
-The calibration node benchmarks only exact candidates that are available in the active
-environment:
+The released VDN local-window branch is validated against exact attention.
+
+Normal exact VDN paths therefore do **not** pass the local windows through
+`optimized_attention_override`; Sage/kitchen quantized attention must not silently alter
+the trained window branch.
+
+Exact does not mean “force the slowest PyTorch kernel”. When available,
+`comfy.ops.scaled_dot_product_attention` is used so Comfy can select the fastest exact
+backend for the platform:
+
+```text
+Flash attention -> cuDNN attention -> efficient attention -> math
+```
+
+This is particularly relevant on Windows/PyTorch combinations where raw
+`F.scaled_dot_product_attention` may otherwise choose a poor backend.
+
+`compat_reference` exists specifically for experiments that intentionally allow normal
+Comfy attention overrides.
+
+---
+
+## 6. Attention calibration
+
+The accelerated exact candidates are:
 
 - grouped SDPA;
 - FlexAttention;
-- FA2 varlen;
-- FA4/CuTe varlen.
+- FA2 varlen decomposition;
+- FA4/CuTe varlen decomposition.
 
-Grouped exact SDPA is the numerical oracle.
+Calibration compares candidates against the grouped exact oracle and persists the winner
+under a signature containing hardware/software and packed geometry.
 
-A candidate is eligible to win only when it passes:
-
-```text
-allclose(candidate, grouped, atol=2e-2, rtol=4e-2)
-```
-
-The winner is saved under an exact hardware/layout signature.
-
-### Calibration matrix
-
-Calibrate representative layouts rather than only one tiny sequence.
-
-Suggested latent-frame sets:
-
-- 22
-- 41
-- 102
-
-Suggested spatial token grids should include the actual workflows used on the machine.
-For each layout record:
-
-- global rows before video;
-- global rows after video;
-- tokens per frame;
-- exact frame count.
-
-A calibration entry from one geometry should not be treated as evidence for another.
+Do not treat a calibration result for one sequence geometry as evidence for another.
+Representative validation should include short, primary and stress workloads.
 
 ---
 
-## 5. Real checkpoint application
+## 7. AdaLN/pruned-base qualification
 
-After synthetic CUDA passes, apply the released VDN checkpoint to the real H3 base.
+Pruned H3 checkpoints may represent AdaLN through a small shared curve basis. Detection
+must not rely solely on `use_adaln_curves`: converted checkpoints can omit/misreport the
+flag.
 
-Verify at minimum:
+Kirei detects curve mode by either:
 
-- all declared branch blocks are present;
-- default adapter applies completely;
-- turbo adapter applies completely when enabled;
-- Q/K/V factorized targets resolve to native fused QKV slices;
-- native fused `mlp.fc2` factors use merge rather than activation bypass;
-- pruned AdaLN curves find their e-grid;
-- additional branch/LoRA/curve models appear in Comfy's model lifecycle;
-- no VDN attention patch collision is silently overwritten.
+- the model flag, or
+- structurally collapsed `blocks[0].adaln_proj.linear` input width.
 
-### Quantized base matrix
+When curve terms exist they are re-injected through `h3_silu_temb_grid.safetensors`.
+They must **not** be silently skipped merely because merge mode is selected.
 
-Qualify separately:
+Validate:
 
-- BF16 base, if available;
-- H3 INT8/ConvRot base;
-- any other quantized base intended for production.
-
-Do not assume LoRA/weight behavior on BF16 proves compatibility with a fused quantized
-base.
+- `adaln_t_table` exists;
+- e-grid row count matches the table;
+- e-grid full-width dimension matches the LoRA factor input;
+- Runtime Report shows non-zero `curve_factors` when the active checkpoint requires them.
 
 ---
 
-## 6. Reference comparisons
+## 8. Reference comparisons
 
-Use `profile=reference` for the exact oracle:
+Use `profile=reference` as the numerical oracle:
 
-- exact PyTorch SDPA;
-- no Comfy attention override;
-- BF16 projection;
+- BF16 VDN projection;
+- exact local SDPA without external quantized overrides;
 - FP32 sensitive recurrence state;
-- factorized LoRA bypass;
-- compile disabled;
-- inference-only recurrence shortcuts disabled.
+- eager/autograd-safe recurrence path;
+- factorized adapter path;
+- compiler policy off.
 
-Use `compat_reference` only when comparing how ComfyUI attention overrides affect the
-same VDN model.
+For a divergence, compare the earliest possible tensor rather than the final MP4:
 
-### What to compare
-
-For focused engineering probes, compare as early as possible:
-
-1. Q/K/V adapter outputs;
-2. frame A/B statistics;
-3. prefix/suffix states;
-4. gathered linear state;
-5. branch readout;
-6. projected linear delta;
-7. local attention output;
-8. complete block output.
-
-A final video mismatch is much harder to diagnose than the first divergent tensor.
+1. converted LoRA target/factor;
+2. raw Q/K/V adapter output;
+3. K/V short-conv feature;
+4. beta / A / B statistics;
+5. forward/reverse states;
+6. complementary gathered state;
+7. linear readout/gate;
+8. projected linear delta;
+9. local attention output;
+10. complete block output.
 
 ---
 
-## 7. Tiled branch qualification
+## 9. Tiled/consumer qualification
 
-For every representative frame size, compare:
+Compare:
 
 ```text
 tile_frames = 0
@@ -224,226 +342,249 @@ vs
 tile_frames = 5
 ```
 
-The test must include K/V temporal short convolution so the halo path is exercised.
+using a checkpoint with K/V temporal short convolution enabled.
 
 Check:
 
-- max/mean absolute error;
-- first/last anchor rows remain zero in linear delta;
+- numerical parity;
+- halo correctness;
+- anchor zero rows;
 - peak VRAM;
-- branch runtime;
+- branch time;
 - number of compiled shapes.
 
-The tiled path is intended to be numerically equivalent within normal BF16 execution
-error, not an approximate low-memory model.
+Tiling is an exact memory scheduling change, not a lower-quality model.
 
 ---
 
-## 8. Streaming qualification
+## 10. Branch weight placement
 
-For `stream` and `hybrid`, collect the runtime report after sampling.
+### Resident
 
-Record:
+Preferred when the whole VDN branch fits with sufficient activation headroom.
 
-- `h2d_bytes`;
-- `copies`;
-- `prefetch_blocks`;
-- `served_stream_requests`;
-- `ready_wait_events`;
-- `pinned_cpu_bytes`;
-- `gpu_stream_buffer_bytes`;
-- `weights.transfer` stage timing.
+### Hybrid
 
-### Expected hybrid behavior
+Keep small VDN tensors resident and stream the dominant projection representation.
+This is normally the useful consumer compromise.
 
-For a normal BF16 released branch:
+### Stream
 
-- the small branch tensors are resident;
-- only the large `to_out_linear.weight` is streamed;
-- there are two reusable GPU staging slots;
-- later denoising steps should benefit from the cyclic prefetch schedule.
+CPU master for all branch weights with double-buffered device staging.
 
-For FP8 interior blocks:
+For streaming/hybrid collect:
 
-- streamed weight dtype is FP8;
-- scale remains FP32/resident;
-- edge blocks stream BF16 projections.
-
-Any block receiving another block's projection is a correctness failure, regardless of
-final output plausibility.
-
----
-
-## 9. FP8 qualification
-
-FP8 is a different numerical model path and must be evaluated separately.
-
-First require the synthetic probe to report:
-
-```text
-available = true
-```
-
-Then measure:
-
-- storage ratio;
 - H2D bytes;
-- projection time;
-- complete sampler time;
-- latent/video quality against BF16 baseline.
+- copy/request count;
+- ready waits;
+- prefetches;
+- pinned bytes;
+- staging-buffer bytes;
+- transfer timing.
 
-### Edge-block matrix
-
-Test at least:
-
-- `fp8_skip_end_blocks=4` (default);
-- `0` (all transformed blocks FP8);
-- optionally `2` and `6` when exploring quality/speed.
-
-The default 4+4 BF16 policy is quality oriented.
-
-### Important interpretation
-
-FP8 can perturb the denoising trajectory. Pixel/latent equality with BF16 is not the
-success criterion after the local projection parity has been qualified. Evaluate final
-quality and consistency rather than demanding the same stochastic trajectory.
+Slot allocation is not validity. Per-slot `valid_keys` and block identity must remain
+correct under gate-only/partial requests.
 
 ---
 
-## 10. Target workstation matrix
+## 11. Precision qualification
 
-For a workstation with RTX PRO 6000 96 GB + RTX 4090 24 GB, use both cards as separate
-single-GPU targets.
+### BF16
 
-### RTX PRO 6000
+Use first for quality/fidelity. It isolates architecture and adapter correctness from
+quantization.
 
-Test:
+### INT8/ConvRot
 
-- `auto`;
+This is a Comfy-specific optimization path, not the OpenVDN published FP8 path. It must
+beat BF16 on the real GPU and pass its own visual gate before it can be called an
+optimization.
+
+### FP8
+
+OpenVDN's tuned stack quantizes large linears after LoRA merge while leaving narrow and
+sensitive operations at higher precision. In Kirei the VDN projection FP8 path is
+explicitly benchmarked rather than assumed to win.
+
+For every quantized path record:
+
+- projection precision actually resolved;
+- storage/H2D difference;
+- projection and complete sampler time;
+- final output quality.
+
+A fallback to BF16 is valid runtime behavior but an invalid result for an INT8/FP8-labelled
+benchmark scenario.
+
+---
+
+## 12. Target GPU matrix
+
+### RTX PRO 6000 Blackwell 96 GB
+
+Qualify:
+
+- VDN BF16 `auto`;
+- VDN INT8/ConvRot;
+- VDN FP8;
 - `max_speed`;
-- explicit grouped;
-- calibrated attention;
-- FA4 if installed;
-- experimental FP8;
-- diagnostics off and on separately.
+- grouped vs calibrated exact attention;
+- FA4 when available;
+- resident placement;
+- experimental parallel scheduler separately.
 
-Primary measurements:
+Do not enable two-stream parallel execution by default solely because memory permits it;
+it must beat the serial tuned path on the actual workload.
 
-- resident branch viability;
-- first-run compile time;
-- warm sampler time;
-- peak allocated/reserved VRAM;
-- FA4 vs grouped crossover;
-- FP8 projection and end-to-end benefit.
+### RTX 4090 24 GB
 
-### RTX 4090
-
-Test:
+Qualify:
 
 - `auto`;
 - `low_vram`;
-- explicit `stream` as a lower-VRAM fallback;
-- grouped;
-- Flex;
+- hybrid vs stream;
+- tiled path;
+- grouped/Flex;
 - FA2 when installed;
-- experimental FP8 only if `_scaled_mm` probe passes.
-
-Primary measurements:
-
-- hybrid vs stream H2D waits;
-- tiled vs untiled peak VRAM;
-- FA2 gather overhead;
-- whether the base H3 + resident small VDN tensors leave sufficient activation headroom.
+- FP8 only if the actual-device probe succeeds and timing wins.
 
 ---
 
-## 11. Generation benchmark protocol
+## 13. Generation benchmark tiers
 
-Use a fixed workflow, seed, prompt and model files when comparing runtime changes.
+The active scenario matrix lives in `benchmarks/scenarios.json`.
 
-Measure two phases separately:
+### Quick regression
 
-### Cold
+```text
+608×352 / 121 requested frames / Euler + simple + 8
+```
 
-Includes:
+Run Larry clean control and VDN BF16/INT8/FP8.
 
-- first kernel compilation;
-- first model/auxiliary loads;
-- first mask/plan creation.
+### Detail A/B
 
-### Warm
+```text
+960×544 / 121 / Euler + simple + 8
+```
 
-Run after all expected compilation/cache initialization.
+Use for micro-detail, faces/hands, texture, edge artifacts and quantization softness.
 
-Report:
+### Primary long-video performance
 
-- sampler-only wall time;
-- time per denoising step;
-- end-to-end wall time;
-- peak allocated VRAM;
-- peak reserved VRAM;
-- host RAM;
-- pinned host RAM;
-- H2D bytes;
-- selected attention backend.
+```text
+608×352 / 241 / Euler + simple + 8
+```
 
-Do not combine VAE decode/video encoding with sampler timing unless the metric is
-explicitly labelled end-to-end.
+This is the main repeated optimization decision workload.
+
+### Stress/crossover
+
+```text
+608×352 / 401 / Euler + simple + 8
+```
+
+If VDN still loses materially here, investigate the hot path rather than explaining the
+result as a short-sequence crossover.
+
+### Canonical release-quality geometry
+
+```text
+1344×768 / 345
+```
+
+Run:
+
+- Stage-B reference at 50 NFE;
+- Larry clean control at 8;
+- Stage-DMD BF16 at 8;
+- INT8/FP8 only after BF16 is understood.
+
+H3 can align requested frame counts internally to its supported temporal grid. Record
+both requested and actual latent/packed geometry in the Runtime Report.
 
 ---
 
-## 12. Suggested geometry matrix
+## 14. Timing protocol
 
-At minimum:
+For each scenario:
 
-| Frames | Purpose |
-| ---: | --- |
-| 22 | short smoke / regression |
-| 41 | common medium workload |
-| 102 | long-video pressure test |
+1. record cold compilation/autotune separately;
+2. perform at least one warm-up;
+3. collect five warm measurements by default;
+4. primary metric = median sampler-only seconds;
+5. also retain peak allocated/reserved VRAM;
+6. keep VAE decode/video encoding out of sampler timing;
+7. record end-to-end time separately when useful.
 
-For each frame count include at least one low/medium resolution and the largest normal
-production resolution for the machine.
-
-The important variable for attention is packed sequence geometry, not only output pixel
-resolution.
+Do not compare a warmed Turbo path against the first VDN compile/autotune run.
 
 ---
 
-## 13. Failure triage
+## 15. Failure triage
 
-### Backend falls back to grouped
+### Quality looks hard/patterned
 
-Inspect `attention_failures` in the runtime report. A latched failure is intentional;
-the backend is not retried on every block.
+First inspect the verified sampling plan. If it says `res_multistep`, `beta`, six steps or
+partial denoise for Stage-DMD, the render is not a canonical VDN test.
 
-### Tiled differs from untiled
+### Quality is soft
 
-Check temporal halo, tile-local frame numbering and gather start/stop indices before
-looking at the final video.
+Check:
+
+- local VDN attention did not receive Sage/kitchen quantized override;
+- adapter strengths are exactly 1.0 for the canonical Stage-DMD run;
+- curve AdaLN factors were not dropped;
+- projection precision is really BF16 in the fidelity test.
+
+### Backend falls back
+
+Inspect `attention_failures` and `block_fusion_error`. Optional acceleration failures are
+latched intentionally.
+
+### INT8 is slower than BF16
+
+Treat it as a failed optimization for that GPU/geometry. Do not promote it merely because
+the H3 base is INT8.
 
 ### Streaming corruption
 
-Inspect per-slot valid-key logic and ensure a partial request did not preserve validity
-from a previous block. The allocated buffer dictionary is not a validity map.
-
-### FP8 unavailable
-
-The actual-device `_scaled_mm` probe failed. Treat the BF16 fallback as correct behavior;
-do not force an unsupported kernel based only on advertised GPU FP8 capability.
-
-### High compile latency
-
-Use `compile_policy=off` or `shared` for interactive use. `reduce_overhead` and
-`max_autotune` are intended for repeated static geometries where warm-run speed matters.
+Inspect slot block identity and `valid_keys`; allocated buffers are not proof that their
+contents belong to the current block.
 
 ---
 
-## 14. Current CI note
+## 16. Audit status
 
-The repository contains a GitHub Actions CPU/current-ComfyUI workflow. Hardware CUDA
-qualification cannot be delegated to a standard GitHub-hosted runner and must be run on
-the target machine or an equivalent GPU runner.
+The original optimization audit recommended, in order:
 
-A CI badge/failure should only be interpreted as a code result when the workflow jobs
-actually received a runner and executed their steps.
+- compact low-rank LoRA runtime;
+- shared QKV bypass;
+- Comfy-managed branch weights;
+- preallocated recurrence;
+- fused temporal kernel;
+- optimized frame-statistics prologue;
+- compiled gather/epilogue;
+- asynchronous streaming;
+- automatic attention backend selection;
+- production profiles and benchmark matrix.
+
+Those architectural recommendations are represented in the current runtime. The newer
+post-audit corrections are equally important for trustworthy results:
+
+- benchmark-owned sampler/sigmas;
+- canonical Euler/simple Stage-DMD trajectory;
+- exact local attention protected from quantized overrides;
+- Comfy exact-SDPA backend-priority dispatch;
+- structural curve/pruned AdaLN detection;
+- mandatory adapter/strength metadata in benchmark results.
+
+---
+
+## 17. CI note
+
+The repository contains CPU/current-ComfyUI GitHub Actions jobs. CUDA qualification must
+still run on the target GPU or an equivalent runner.
+
+A red Actions badge is only a code result if GitHub actually assigned a runner and
+executed the job steps. A no-runner infrastructure failure is not a pytest failure.

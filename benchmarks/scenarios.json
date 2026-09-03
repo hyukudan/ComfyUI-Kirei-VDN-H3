@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "rules": {
     "warmup_runs": 1,
     "measured_runs": 5,
@@ -20,7 +20,7 @@
       "model_role": "dense_base_plus_external_turbo",
       "expects_vdn_runtime": false,
       "required_adapters": ["turbo_external"],
-      "notes": "The community/Comfy Turbo LoRA is a 4-step recipe. Do not force it to 8 steps merely to match VDN NFE."
+      "notes": "Community/Comfy Turbo is a 4-step recipe. Do not force it to 8 NFE merely to match VDN."
     },
     "vdn_stage_dmd_8": {
       "label": "VDN-H3 Stage-DMD release",
@@ -56,7 +56,7 @@
       "model_role": "dense_base_no_lora",
       "expects_vdn_runtime": false,
       "required_adapters": [],
-      "notes": "Local native-quality reference from the existing Comfy workflow; not a kernel-control for distilled methods."
+      "notes": "Existing local native-quality reference; not a same-NFE control for distilled methods."
     }
   },
   "scenarios": [
@@ -85,6 +85,7 @@
       "frames": 121,
       "steps": 4,
       "model_variant": "vdn_auto",
+      "profile": "auto",
       "projection_precision": "bf16"
     },
     {
@@ -99,6 +100,7 @@
       "frames": 121,
       "steps": 4,
       "model_variant": "vdn_auto",
+      "profile": "auto",
       "projection_precision": "int8"
     },
     {
@@ -146,7 +148,9 @@
       "frames": 121,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "bf16"
+      "profile": "auto",
+      "projection_precision": "bf16",
+      "apply_turbo_adapter": true
     },
     {
       "id": "vdn_dmd_int8_8step_608x352_121",
@@ -157,13 +161,34 @@
       "quality_gate_required": true,
       "quality_target": "fewstep_production_quality",
       "recipe_id": "vdn_stage_dmd_8",
-      "purpose": "Quick INT8/ConvRot quality and speed regression after BF16",
+      "purpose": "Quick Comfy INT8/ConvRot quality and speed regression after BF16",
       "width": 608,
       "height": 352,
       "frames": 121,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "int8"
+      "profile": "auto",
+      "projection_precision": "int8",
+      "apply_turbo_adapter": true
+    },
+    {
+      "id": "vdn_dmd_fp8_8step_608x352_121",
+      "active": true,
+      "comparable": true,
+      "product_group": "fewstep_product_608x352_121",
+      "technical_group": "vdn_dmd8_608x352_121",
+      "quality_gate_required": true,
+      "quality_target": "fewstep_production_quality",
+      "recipe_id": "vdn_stage_dmd_8",
+      "purpose": "Quick OpenVDN-style FP8 projection experiment after BF16",
+      "width": 608,
+      "height": 352,
+      "frames": 121,
+      "steps": 8,
+      "model_variant": "vdn_auto",
+      "profile": "auto",
+      "projection_precision": "fp8",
+      "apply_turbo_adapter": true
     },
 
     {
@@ -196,7 +221,9 @@
       "frames": 121,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "bf16"
+      "profile": "auto",
+      "projection_precision": "bf16",
+      "apply_turbo_adapter": true
     },
     {
       "id": "vdn_dmd_int8_8step_960x544_121",
@@ -213,7 +240,28 @@
       "frames": 121,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "int8"
+      "profile": "auto",
+      "projection_precision": "int8",
+      "apply_turbo_adapter": true
+    },
+    {
+      "id": "vdn_dmd_fp8_8step_960x544_121",
+      "active": true,
+      "comparable": true,
+      "product_group": "fewstep_product_960x544_121",
+      "technical_group": "vdn_dmd8_960x544_121",
+      "quality_gate_required": true,
+      "quality_target": "fewstep_high_detail_quality",
+      "recipe_id": "vdn_stage_dmd_8",
+      "purpose": "FP8 visual A/B after BF16 qualifies",
+      "width": 960,
+      "height": 544,
+      "frames": 121,
+      "steps": 8,
+      "model_variant": "vdn_auto",
+      "profile": "auto",
+      "projection_precision": "fp8",
+      "apply_turbo_adapter": true
     },
 
     {
@@ -246,7 +294,9 @@
       "frames": 241,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "bf16"
+      "profile": "auto",
+      "projection_precision": "bf16",
+      "apply_turbo_adapter": true
     },
     {
       "id": "vdn_dmd_int8_8step_608x352_241",
@@ -263,7 +313,28 @@
       "frames": 241,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "int8"
+      "profile": "auto",
+      "projection_precision": "int8",
+      "apply_turbo_adapter": true
+    },
+    {
+      "id": "vdn_dmd_fp8_8step_608x352_241",
+      "active": true,
+      "comparable": true,
+      "product_group": "fewstep_product_608x352_241",
+      "technical_group": "vdn_dmd8_608x352_241",
+      "quality_gate_required": true,
+      "quality_target": "fewstep_production_quality",
+      "recipe_id": "vdn_stage_dmd_8",
+      "purpose": "PRIMARY upstream-style FP8 comparison after BF16 quality gate",
+      "width": 608,
+      "height": 352,
+      "frames": 241,
+      "steps": 8,
+      "model_variant": "vdn_auto",
+      "profile": "auto",
+      "projection_precision": "fp8",
+      "apply_turbo_adapter": true
     },
     {
       "id": "vdn_dmd_max_speed_8step_608x352_241",
@@ -279,7 +350,9 @@
       "height": 352,
       "frames": 241,
       "steps": 8,
-      "model_variant": "vdn_max_speed"
+      "model_variant": "vdn_max_speed",
+      "profile": "max_speed",
+      "apply_turbo_adapter": true
     },
 
     {
@@ -312,7 +385,9 @@
       "frames": 401,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "bf16"
+      "profile": "auto",
+      "projection_precision": "bf16",
+      "apply_turbo_adapter": true
     },
     {
       "id": "vdn_dmd_int8_8step_608x352_401",
@@ -329,7 +404,28 @@
       "frames": 401,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "int8"
+      "profile": "auto",
+      "projection_precision": "int8",
+      "apply_turbo_adapter": true
+    },
+    {
+      "id": "vdn_dmd_fp8_8step_608x352_401",
+      "active": true,
+      "comparable": true,
+      "product_group": "fewstep_product_608x352_401",
+      "technical_group": "vdn_dmd8_608x352_401",
+      "quality_gate_required": true,
+      "quality_target": "fewstep_production_quality",
+      "recipe_id": "vdn_stage_dmd_8",
+      "purpose": "Stress/crossover FP8 after BF16 qualification",
+      "width": 608,
+      "height": 352,
+      "frames": 401,
+      "steps": 8,
+      "model_variant": "vdn_auto",
+      "profile": "auto",
+      "projection_precision": "fp8",
+      "apply_turbo_adapter": true
     },
 
     {
@@ -345,6 +441,7 @@
       "frames": 345,
       "steps": 50,
       "model_variant": "vdn_stage_b_reference",
+      "profile": "reference",
       "projection_precision": "bf16",
       "apply_turbo_adapter": false
     },
@@ -378,7 +475,9 @@
       "frames": 345,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "bf16"
+      "profile": "auto",
+      "projection_precision": "bf16",
+      "apply_turbo_adapter": true
     },
     {
       "id": "vdn_dmd_int8_8step_1344x768_345",
@@ -389,13 +488,34 @@
       "quality_gate_required": true,
       "quality_target": "release_geometry_fewstep_quality",
       "recipe_id": "vdn_stage_dmd_8",
-      "purpose": "Quantized quality experiment; do not promote until BF16 canonical gate passes",
+      "purpose": "Comfy INT8/ConvRot quality experiment; do not promote until BF16 canonical gate passes",
       "width": 1344,
       "height": 768,
       "frames": 345,
       "steps": 8,
       "model_variant": "vdn_auto",
-      "projection_precision": "int8"
+      "profile": "auto",
+      "projection_precision": "int8",
+      "apply_turbo_adapter": true
+    },
+    {
+      "id": "vdn_dmd_fp8_8step_1344x768_345",
+      "active": true,
+      "comparable": true,
+      "product_group": "fewstep_product_release_1344x768_345",
+      "technical_group": "vdn_dmd8_release_1344x768_345",
+      "quality_gate_required": true,
+      "quality_target": "release_geometry_fewstep_quality",
+      "recipe_id": "vdn_stage_dmd_8",
+      "purpose": "OpenVDN-style FP8 quality experiment at canonical geometry",
+      "width": 1344,
+      "height": 768,
+      "frames": 345,
+      "steps": 8,
+      "model_variant": "vdn_auto",
+      "profile": "auto",
+      "projection_precision": "fp8",
+      "apply_turbo_adapter": true
     }
   ]
 }

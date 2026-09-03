@@ -5,6 +5,10 @@ the dispatch facts used by OpenVDN: SM100 uses per-tensor activation/weight scal
 the fast cuBLAS `_scaled_mm` path; pre-SM100 cards use rowwise activation scaling and
 per-output-channel weight scales. Only this large projection is quantized here. Gates,
 beta, alpha, frame statistics, Cholesky and recurrent state remain BF16/FP32.
+
+Following the upstream accuracy policy, the first and last four transformed blocks stay
+in BF16 by default. Those edge blocks contribute disproportionately to FP8 trajectory
+error while representing a small share of total projection compute.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ FP8_WEIGHT_KEY = "to_out_linear.weight_fp8"
 FP8_SCALE_KEY = "to_out_linear.weight_scale"
 BF16_WEIGHT_KEY = "to_out_linear.weight"
 PROJECTION_PRECISIONS = ("bf16", "fp8")
+DEFAULT_SKIP_END_BLOCKS = 4
 
 
 if triton is not None:  # pragma: no cover - compiled on CUDA hosts
@@ -71,6 +76,9 @@ class FP8ProjectionInfo:
     per_tensor: bool
     original_bytes: int
     quantized_bytes: int
+    quantized_blocks: int
+    bf16_blocks: int
+    skip_end_blocks: int
 
 
 def _per_tensor_for(device: torch.device) -> bool:
@@ -85,8 +93,6 @@ def _quantize_weight_cpu(weight: torch.Tensor, *, per_tensor: bool):
         return q.contiguous(), scale.to(torch.float32).contiguous()
     scale = (value.abs().amax(dim=1, keepdim=True) / _FP8_MAX).clamp_min(1e-12)
     q = (value / scale).clamp(-_FP8_MAX, _FP8_MAX).to(FP8_DTYPE)
-    # torch._scaled_mm sees B = weight.T, therefore scale_b indexes its columns/output
-    # features and has shape [1, N].
     return q.contiguous(), scale.reshape(1, -1).to(torch.float32).contiguous()
 
 
@@ -162,31 +168,58 @@ def fp8_supported(device: torch.device | str, *, probe: bool = True) -> bool:
 def prepare_projection_maps(
     branch_maps: Sequence[Mapping[str, torch.Tensor]],
     device: torch.device | str,
+    *,
+    skip_end_blocks: int = DEFAULT_SKIP_END_BLOCKS,
 ):
-    """Replace BF16 projection weights with FP8 masters + FP32 scales on CPU."""
+    """Build heterogeneous BF16-edge / FP8-interior CPU projection masters."""
     device = torch.device(device)
     if not fp8_supported(device, probe=True):
         raise RuntimeError(
             f"FP8 VDN projection is not supported by the active PyTorch/CUDA path on {device}"
         )
+    if isinstance(skip_end_blocks, bool) or not isinstance(skip_end_blocks, int) or skip_end_blocks < 0:
+        raise ValueError("skip_end_blocks must be a non-negative integer")
+    count = len(branch_maps)
+    if count == 0:
+        raise ValueError("branch_maps cannot be empty")
+    if skip_end_blocks * 2 >= count:
+        raise ValueError(
+            f"skip_end_blocks={skip_end_blocks} leaves no FP8 interior blocks for {count} branches"
+        )
     per_tensor = _per_tensor_for(device)
     transformed = []
     original_bytes = quantized_bytes = 0
+    quantized_blocks = bf16_blocks = 0
     for index, block in enumerate(branch_maps):
         if BF16_WEIGHT_KEY not in block:
             raise KeyError(f"VDN block {index} has no {BF16_WEIGHT_KEY!r}")
         weight = block[BF16_WEIGHT_KEY]
+        original_bytes += int(weight.numel() * weight.element_size())
+        keep_bf16 = index < skip_end_blocks or index >= count - skip_end_blocks
+        if keep_bf16:
+            copied = dict(block)
+            transformed.append(copied)
+            quantized_bytes += int(weight.numel() * weight.element_size())
+            bf16_blocks += 1
+            continue
         weight_fp8, scale = _quantize_weight_cpu(weight, per_tensor=per_tensor)
         copied = dict(block)
         copied.pop(BF16_WEIGHT_KEY)
         copied[FP8_WEIGHT_KEY] = weight_fp8
         copied[FP8_SCALE_KEY] = scale
         transformed.append(copied)
-        original_bytes += int(weight.numel() * weight.element_size())
         quantized_bytes += int(
             weight_fp8.numel() * weight_fp8.element_size() + scale.numel() * scale.element_size()
         )
-    return tuple(transformed), FP8ProjectionInfo(per_tensor, original_bytes, quantized_bytes)
+        quantized_blocks += 1
+    return tuple(transformed), FP8ProjectionInfo(
+        per_tensor=per_tensor,
+        original_bytes=original_bytes,
+        quantized_bytes=quantized_bytes,
+        quantized_blocks=quantized_blocks,
+        bf16_blocks=bf16_blocks,
+        skip_end_blocks=skip_end_blocks,
+    )
 
 
 def projection_out_features(weights: Mapping[str, torch.Tensor]) -> int:
@@ -197,13 +230,26 @@ def projection_out_features(weights: Mapping[str, torch.Tensor]) -> int:
     raise KeyError("VDN branch has no projection weight")
 
 
+def _dequantized_weight(weight_fp8, weight_scale, dtype):
+    if weight_scale.numel() == 1:
+        return weight_fp8.to(dtype) * weight_scale.to(dtype)
+    return weight_fp8.to(dtype) * weight_scale.t().to(dtype)
+
+
 def project(rows: torch.Tensor, weights: Mapping[str, torch.Tensor]) -> torch.Tensor:
-    """Dispatch BF16 or FP8 branch projection, with a dequantized FP8 fallback."""
+    """Dispatch BF16 or FP8 projection with a same-quantized-model fallback."""
     if BF16_WEIGHT_KEY in weights:
         return torch.nn.functional.linear(rows, weights[BF16_WEIGHT_KEY])
     weight_fp8 = weights[FP8_WEIGHT_KEY]
     weight_scale = weights[FP8_SCALE_KEY]
     per_tensor = weight_scale.numel() == 1
+    # `_scaled_mm` is an inference kernel. If somebody explicitly exercises this
+    # experimental projection under autograd, preserve graph semantics by dequantizing
+    # the already-quantized weight and using the ordinary Linear spelling.
+    if torch.is_grad_enabled():
+        return torch.nn.functional.linear(
+            rows, _dequantized_weight(weight_fp8, weight_scale, rows.dtype)
+        )
     try:
         x_fp8, x_scale = quantize_activation(rows, per_tensor=per_tensor)
         return torch._scaled_mm(
@@ -215,18 +261,14 @@ def project(rows: torch.Tensor, weights: Mapping[str, torch.Tensor]) -> torch.Te
             use_fast_accum=True,
         )
     except Exception:
-        # The CPU masters are intentionally FP8-only. If a specific scaled-MM shape is
-        # unsupported, reconstruct the already-quantized weight rather than failing the
-        # render. This is slower but preserves the same quantized model semantics.
-        if per_tensor:
-            weight = weight_fp8.to(rows.dtype) * weight_scale.to(rows.dtype)
-        else:
-            weight = weight_fp8.to(rows.dtype) * weight_scale.t().to(rows.dtype)
-        return torch.nn.functional.linear(rows, weight)
+        return torch.nn.functional.linear(
+            rows, _dequantized_weight(weight_fp8, weight_scale, rows.dtype)
+        )
 
 
 __all__ = [
     "BF16_WEIGHT_KEY",
+    "DEFAULT_SKIP_END_BLOCKS",
     "FP8ProjectionInfo",
     "FP8_DTYPE",
     "FP8_SCALE_KEY",

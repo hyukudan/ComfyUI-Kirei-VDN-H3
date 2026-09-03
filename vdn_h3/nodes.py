@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Any
 
 import torch
 
 from .apply import apply_factor_patches
 from .bypass import WeightedFactor, install_bypass, partition_factors
 from .hybrid import VDNState, apply_vdn, validate_h3_model
+from .kernels import COMPILE_POLICIES, KERNEL_BACKENDS
+from .weights import BRANCH_MODES, PIN_STRATEGIES, STREAMED_PROJECTION_KEY
+from .window import ATTENTION_BACKENDS
 
 
 _LOG = logging.getLogger("comfy.vdn_h3")
 _PLACEHOLDER = "<place an authorized VDN checkpoint under models/vdn>"
-_PROFILES = ("auto", "max_speed", "balanced", "low_vram", "reference")
+_PROFILES = (
+    "auto",
+    "max_speed",
+    "balanced",
+    "low_vram",
+    "reference",
+    "compat_reference",
+)
 
 
 def _checkpoints() -> list[str]:
@@ -48,7 +57,9 @@ def _branch_shapes(branches, *, hidden, heads, linear_dim, gate):
         "output_gate.up.bias": (heads * linear_dim,),
     }
     if gate:
-        expected.update({"softmax_gate.up.weight": (heads, hidden), "softmax_gate.up.bias": (heads,)})
+        expected.update(
+            {"softmax_gate.up.weight": (heads, hidden), "softmax_gate.up.bias": (heads,)}
+        )
     for block_index, weights in enumerate(branches):
         for key, shape in expected.items():
             tensor = weights.get(key)
@@ -61,17 +72,22 @@ def _branch_shapes(branches, *, hidden, heads, linear_dim, gate):
                 )
 
 
-def _make_branches(branch_maps, config, heads, head_dim, linear_kernels):
-    from .branch import LinearBranch
+def _make_branches(branch_maps, config, heads, head_dim, runtime):
+    from .runtime import OptimizedLinearBranch
+
     return [
-        LinearBranch(
-            weights, heads, head_dim,
+        OptimizedLinearBranch(
+            weights,
+            heads,
+            head_dim,
             delta_rule=config.get("delta_rule", "vdn_solve"),
             bridge=config.get("bridge", "alpha"),
             a_fp32=bool(config.get("a_fp32", True)),
             short_conv=tuple(config.get("short_conv", ())),
             enable_text_state=bool(config.get("enable_text_state", False)),
-            linear_kernels=linear_kernels,
+            kernel_backend=runtime["kernel_backend"],
+            compile_policy=runtime["compile_policy"],
+            tile_frames=runtime["tile_frames"],
         )
         for weights in branch_maps
     ]
@@ -89,24 +105,61 @@ def _branch_bytes(branch_maps) -> int:
     return sum(t.numel() * t.element_size() for block in branch_maps for t in block.values())
 
 
+def _projection_bytes(branch_maps) -> int:
+    return sum(
+        block[STREAMED_PROJECTION_KEY].numel() * block[STREAMED_PROJECTION_KEY].element_size()
+        for block in branch_maps
+        if STREAMED_PROJECTION_KEY in block
+    )
+
+
 def _model_cuda_device(model):
-    device = torch.device(getattr(model, "load_device", "cpu"))
+    try:
+        device = torch.device(getattr(model, "load_device", "cpu"))
+    except Exception:
+        return None
     if device.type != "cuda" or not torch.cuda.is_available():
         return None
     return device
 
 
-def _auto_branch_mode(model, branch_bytes: int) -> str:
+def _gpu_budget(model):
     device = _model_cuda_device(model)
     if device is None:
-        return "stream"
+        return None
     try:
-        total = torch.cuda.get_device_properties(device).total_memory
+        props = torch.cuda.get_device_properties(device)
         free, _ = torch.cuda.mem_get_info(device)
+        return device, int(props.total_memory), int(free)
     except Exception:
+        return None
+
+
+def _auto_branch_mode(model, branch_bytes: int, projection_bytes: int | None = None) -> str:
+    budget = _gpu_budget(model)
+    if budget is None:
         return "stream"
-    headroom = max(16 * 1024**3, int(total * 0.20))
-    return "resident" if total >= 48 * 1024**3 and free > branch_bytes * 1.25 + headroom else "stream"
+    _device, total, free = budget
+    projection_bytes = int(projection_bytes or branch_bytes * 0.90)
+    headroom = max(18 * 1024**3, int(total * 0.22))
+    if total >= 48 * 1024**3 and free > branch_bytes * 1.20 + headroom:
+        return "resident"
+    small_resident = max(0, branch_bytes - projection_bytes)
+    if free > small_resident + 6 * 1024**3:
+        return "hybrid"
+    return "stream"
+
+
+def _auto_tile_frames(model, branch_mode: str) -> int:
+    budget = _gpu_budget(model)
+    if budget is None:
+        return 5
+    _device, total, _free = budget
+    if branch_mode == "resident" and total >= 48 * 1024**3:
+        return 0
+    if total <= 32 * 1024**3:
+        return 5
+    return 0
 
 
 def _resolve_runtime(
@@ -114,51 +167,113 @@ def _resolve_runtime(
     branch_maps,
     *,
     profile,
-    branch_mode,
-    lora_mode,
-    attention_backend,
-    linear_kernels,
+    branch_mode="auto",
+    lora_mode="auto",
+    attention_backend="auto",
+    kernel_backend="auto",
+    compile_policy="auto",
+    tile_frames=0,
+    pin_strategy="auto",
+    linear_kernels=None,
     legacy_branch_weights=None,
 ):
     if profile not in _PROFILES:
         raise ValueError(f"unknown VDN profile {profile!r}")
-    if branch_mode not in {"auto", "resident", "stream"}:
+    if branch_mode not in {"auto", *BRANCH_MODES}:
         raise ValueError(f"unknown branch mode {branch_mode!r}")
     if lora_mode not in {"auto", "bypass", "merge"}:
         raise ValueError(f"unknown LoRA mode {lora_mode!r}")
-    if attention_backend not in {"auto", "grouped", "flex", "decomposed", "reference"}:
+    if attention_backend not in ATTENTION_BACKENDS:
         raise ValueError(f"unknown attention backend {attention_backend!r}")
-    if linear_kernels not in {"auto", "triton", "compile", "conv1d", "eager"}:
-        raise ValueError(f"unknown linear kernel mode {linear_kernels!r}")
+    if pin_strategy not in PIN_STRATEGIES:
+        raise ValueError(f"unknown pin strategy {pin_strategy!r}")
+    if isinstance(tile_frames, bool) or not isinstance(tile_frames, int) or tile_frames < 0:
+        raise ValueError("tile_frames must be a non-negative integer")
 
-    if legacy_branch_weights in {"resident", "stream"} and branch_mode == "auto":
+    if linear_kernels not in {None, "auto"} and kernel_backend == "auto":
+        if linear_kernels == "compile":
+            kernel_backend = "auto"
+            if compile_policy == "auto":
+                compile_policy = "shared"
+        else:
+            kernel_backend = linear_kernels
+    if kernel_backend not in {"auto", *KERNEL_BACKENDS, "compile"}:
+        raise ValueError(f"unknown kernel backend {kernel_backend!r}")
+    if kernel_backend == "compile":
+        kernel_backend = "auto"
+        if compile_policy == "auto":
+            compile_policy = "shared"
+    if compile_policy not in {"auto", *COMPILE_POLICIES}:
+        raise ValueError(f"unknown compile policy {compile_policy!r}")
+
+    total_bytes = _branch_bytes(branch_maps)
+    projection_bytes = _projection_bytes(branch_maps)
+    if legacy_branch_weights in BRANCH_MODES and branch_mode == "auto":
         resolved_branch = legacy_branch_weights
     elif branch_mode != "auto":
         resolved_branch = branch_mode
     elif profile == "max_speed":
         resolved_branch = "resident"
-    elif profile in {"low_vram", "reference"}:
+    elif profile == "low_vram":
+        resolved_branch = "hybrid"
+    elif profile in {"reference", "compat_reference"}:
         resolved_branch = "stream"
     else:
-        resolved_branch = _auto_branch_mode(model, _branch_bytes(branch_maps))
+        resolved_branch = _auto_branch_mode(model, total_bytes, projection_bytes)
 
-    resolved_lora = lora_mode
-    if resolved_lora == "auto":
-        resolved_lora = "merge" if profile == "reference" else "bypass"
-    resolved_attention = attention_backend
-    if resolved_attention == "auto" and profile == "reference":
+    resolved_lora = "bypass" if lora_mode == "auto" else lora_mode
+
+    if attention_backend != "auto":
+        resolved_attention = attention_backend
+    elif profile == "reference":
         resolved_attention = "reference"
-    resolved_linear = linear_kernels
-    if resolved_linear == "auto" and profile == "reference":
-        resolved_linear = "eager"
+    elif profile == "compat_reference":
+        resolved_attention = "compat"
+    else:
+        resolved_attention = "auto"
+
+    if kernel_backend != "auto":
+        resolved_kernel = kernel_backend
+    elif profile in {"reference", "compat_reference"}:
+        resolved_kernel = "eager"
+    else:
+        resolved_kernel = "auto"
+
+    if compile_policy != "auto":
+        resolved_compile = compile_policy
+    elif profile in {"reference", "compat_reference"}:
+        resolved_compile = "off"
+    elif profile == "max_speed":
+        resolved_compile = "reduce_overhead"
+    else:
+        resolved_compile = "shared"
+
+    if tile_frames > 0:
+        resolved_tile = tile_frames
+    elif profile == "low_vram":
+        resolved_tile = 5
+    elif profile in {"reference", "compat_reference", "max_speed"}:
+        resolved_tile = 0
+    else:
+        resolved_tile = _auto_tile_frames(model, resolved_branch)
+
     return {
         "profile": profile,
         "branch_mode": resolved_branch,
         "lora_mode": resolved_lora,
         "attention_backend": resolved_attention,
-        "linear_kernels": resolved_linear,
-        "inference": profile != "reference",
+        "kernel_backend": resolved_kernel,
+        "compile_policy": resolved_compile,
+        "tile_frames": int(resolved_tile),
+        "pin_strategy": pin_strategy,
+        "inference": profile not in {"reference", "compat_reference"},
     }
+
+
+def _finite_strength(value, name):
+    if not isinstance(value, (int, float)) or not torch.isfinite(torch.tensor(float(value))):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return float(value)
 
 
 def apply_checkpoint(
@@ -167,13 +282,19 @@ def apply_checkpoint(
     *,
     apply_turbo: bool = True,
     strength: float = 1.0,
+    default_strength: float | None = None,
+    turbo_strength: float | None = None,
     profile: str = "auto",
     branch_mode: str = "auto",
     lora_mode: str = "auto",
     attention_backend: str = "auto",
-    linear_kernels: str = "auto",
+    kernel_backend: str = "auto",
+    compile_policy: str = "auto",
+    tile_frames: int = 0,
+    pin_strategy: str = "auto",
     strict_validation: bool = True,
     diagnostics: bool = False,
+    linear_kernels: str | None = None,
     branch_weights: str | None = None,
 ):
     """Load, validate and apply the complete VDN stack transactionally."""
@@ -182,8 +303,16 @@ def apply_checkpoint(
             "No VDN checkpoint was found. Put an authorized, complete stage directory "
             "under ComfyUI/models/vdn and refresh the node list."
         )
-    if not isinstance(strength, (int, float)) or not torch.isfinite(torch.tensor(float(strength))):
-        raise ValueError(f"adapter strength must be finite, got {strength!r}")
+    global_strength = _finite_strength(strength, "adapter strength")
+    default_strength = (
+        global_strength if default_strength is None or default_strength < 0
+        else _finite_strength(default_strength, "default adapter strength")
+    )
+    turbo_strength = (
+        global_strength if turbo_strength is None or turbo_strength < 0
+        else _finite_strength(turbo_strength, "turbo adapter strength")
+    )
+
     from .spec import load_vdn_checkpoint, resolve_vdn_checkpoint
 
     path = resolve_vdn_checkpoint(checkpoint_name)
@@ -196,9 +325,10 @@ def apply_checkpoint(
     linear_dim = int(config.get("linear_head_dim", head_dim))
     if linear_dim != head_dim:
         raise RuntimeError(
-            "VDN checkpoint/base geometry mismatch: this native ComfyUI integration "
-            f"shares H3 raw Q/K/V with the linear branch, so linear_head_dim={linear_dim} "
-            f"must equal the loaded H3 attention head_dim={head_dim}."
+            "VDN checkpoint/base geometry mismatch: this checkpoint shares H3 raw Q/K/V "
+            f"with the linear branch, so linear_head_dim={linear_dim} must equal the "
+            f"loaded H3 attention head_dim={head_dim}. A different state dimension "
+            "requires a separately trained VDN checkpoint."
         )
     if strict_validation:
         _branch_shapes(
@@ -207,16 +337,36 @@ def apply_checkpoint(
         )
 
     runtime = _resolve_runtime(
-        model, branch_maps, profile=profile, branch_mode=branch_mode, lora_mode=lora_mode,
-        attention_backend=attention_backend, linear_kernels=linear_kernels,
+        model,
+        branch_maps,
+        profile=profile,
+        branch_mode=branch_mode,
+        lora_mode=lora_mode,
+        attention_backend=attention_backend,
+        kernel_backend=kernel_backend,
+        compile_policy=compile_policy,
+        tile_frames=tile_frames,
+        pin_strategy=pin_strategy,
+        linear_kernels=linear_kernels,
         legacy_branch_weights=branch_weights,
     )
-    branches = _make_branches(branch_maps, config, heads, head_dim, runtime["linear_kernels"])
+    branches = _make_branches(branch_maps, config, heads, head_dim, runtime)
     state = VDNState(
-        checkpoint_name, config, branches, heads, head_dim,
-        weight_mode=runtime["branch_mode"], attention_backend=runtime["attention_backend"],
-        weight_maps=branch_maps, inference=runtime["inference"],
-        linear_kernels=runtime["linear_kernels"], diagnostics=diagnostics,
+        checkpoint_name,
+        config,
+        branches,
+        heads,
+        head_dim,
+        weight_mode=runtime["branch_mode"],
+        pin_strategy=runtime["pin_strategy"],
+        attention_backend=runtime["attention_backend"],
+        weight_maps=branch_maps,
+        inference=runtime["inference"],
+        kernel_backend=runtime["kernel_backend"],
+        compile_policy=runtime["compile_policy"],
+        tile_frames=runtime["tile_frames"],
+        checkpoint_root=path,
+        diagnostics=diagnostics,
     )
     cloned = model.clone()
     try:
@@ -235,6 +385,7 @@ def apply_checkpoint(
 
     from .adapters import convert_adapter_factors
 
+    per_adapter_strength = {"default": default_strength, "turbo": turbo_strength}
     target_shapes = {key: tuple(value.shape) for key, value in cloned.model_state_dict().items()}
     bypass_terms: list[WeightedFactor] = []
     curve_terms = []
@@ -243,10 +394,13 @@ def apply_checkpoint(
         for name in wanted:
             adapter_state, adapter_spec = _adapter_parts(adapters[name])
             factors = convert_adapter_factors(
-                adapter_state, adapter_spec,
-                target_shapes=target_shapes, target_prefix="diffusion_model.",
+                adapter_state,
+                adapter_spec,
+                target_shapes=target_shapes,
+                target_prefix="diffusion_model.",
             )
-            weighted = [WeightedFactor(patch, float(strength)) for patch in factors]
+            adapter_strength = per_adapter_strength.get(name, global_strength)
+            weighted = [WeightedFactor(patch, adapter_strength) for patch in factors]
             bypass, merge, curve = partition_factors(weighted, runtime["lora_mode"])
             merged = 0
             for term in merge:
@@ -255,7 +409,9 @@ def apply_checkpoint(
             curve_terms.extend((term.patch, term.strength) for term in curve)
             if not (bypass or merge or curve):
                 raise RuntimeError(f"VDN adapter {name!r} contained no applicable factors")
-            reports.append(f"{name}:bypass={len(bypass)},merge={merged},curve={len(curve)}")
+            reports.append(
+                f"{name}@{adapter_strength:.3g}:bypass={len(bypass)},merge={merged},curve={len(curve)}"
+            )
 
         _, lora_runtime = install_bypass(cloned, bypass_terms)
         state.lora_runtime = lora_runtime
@@ -267,14 +423,14 @@ def apply_checkpoint(
         raise
 
     _LOG.info(
-        "VDN-H3 %s applied: profile=%s branch=%s lora=%s attention=%s linear=%s; "
-        "%d blocks, %.2f GiB branch weights; adapters %s",
-        checkpoint_name, runtime["profile"], runtime["branch_mode"], runtime["lora_mode"],
-        runtime["attention_backend"], runtime["linear_kernels"], len(blocks),
+        "VDN-H3 %s applied: profile=%s branch=%s lora=%s attention=%s kernel=%s "
+        "compile=%s tile_frames=%d pin=%s; %d blocks, %.2f GiB branch; adapters %s",
+        checkpoint_name,
+        runtime["profile"], runtime["branch_mode"], runtime["lora_mode"],
+        runtime["attention_backend"], runtime["kernel_backend"], runtime["compile_policy"],
+        runtime["tile_frames"], runtime["pin_strategy"], len(blocks),
         state.weight_store.nbytes / 1024**3, ", ".join(reports),
     )
-    if diagnostics:
-        _LOG.info("VDN-H3 diagnostics enabled; synchronized stage timings will be logged during inference")
     return cloned
 
 
@@ -288,19 +444,26 @@ class KireiApplyVDNH3:
                 "vdn_checkpoint": (_checkpoints(),),
                 "profile": (list(_PROFILES), {"default": "auto"}),
                 "apply_turbo_adapter": ("BOOLEAN", {"default": True}),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "strength": (
+                    "FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
+                ),
             },
             "optional": {
-                "branch_mode": (["auto", "resident", "stream"], {"default": "auto", **advanced}),
+                "default_adapter_strength": (
+                    "FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced}
+                ),
+                "turbo_adapter_strength": (
+                    "FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced}
+                ),
+                "branch_mode": (["auto", *BRANCH_MODES], {"default": "auto", **advanced}),
                 "lora_mode": (["auto", "bypass", "merge"], {"default": "auto", **advanced}),
-                "attention_backend": (
-                    ["auto", "grouped", "flex", "decomposed", "reference"],
-                    {"default": "auto", **advanced},
+                "attention_backend": (list(ATTENTION_BACKENDS), {"default": "auto", **advanced}),
+                "kernel_backend": (list(KERNEL_BACKENDS), {"default": "auto", **advanced}),
+                "compile_policy": (["auto", *COMPILE_POLICIES], {"default": "auto", **advanced}),
+                "tile_frames": (
+                    "INT", {"default": 0, "min": 0, "max": 64, "step": 1, **advanced}
                 ),
-                "linear_kernels": (
-                    ["auto", "triton", "compile", "conv1d", "eager"],
-                    {"default": "auto", **advanced},
-                ),
+                "pin_strategy": (list(PIN_STRATEGIES), {"default": "auto", **advanced}),
                 "strict_validation": ("BOOLEAN", {"default": True, **advanced}),
                 "diagnostics": ("BOOLEAN", {"default": False, **advanced}),
             },
@@ -309,19 +472,27 @@ class KireiApplyVDNH3:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "model_patches/video"
-    DESCRIPTION = "Apply VideoDeltaNet H3 with automatic memory, LoRA and attention dispatch."
+    DESCRIPTION = (
+        "Apply VideoDeltaNet H3 with automatic workstation/consumer memory policy, "
+        "factorized adapters and calibrated attention dispatch."
+    )
 
     def apply(
         self, model, vdn_checkpoint, profile, apply_turbo_adapter, strength,
+        default_adapter_strength=-1.0, turbo_adapter_strength=-1.0,
         branch_mode="auto", lora_mode="auto", attention_backend="auto",
-        linear_kernels="auto", strict_validation=True, diagnostics=False,
+        kernel_backend="auto", compile_policy="auto", tile_frames=0,
+        pin_strategy="auto", strict_validation=True, diagnostics=False,
     ):
         return (
             apply_checkpoint(
                 model, vdn_checkpoint, apply_turbo=apply_turbo_adapter, strength=strength,
+                default_strength=default_adapter_strength, turbo_strength=turbo_adapter_strength,
                 profile=profile, branch_mode=branch_mode, lora_mode=lora_mode,
-                attention_backend=attention_backend, linear_kernels=linear_kernels,
-                strict_validation=strict_validation, diagnostics=diagnostics,
+                attention_backend=attention_backend, kernel_backend=kernel_backend,
+                compile_policy=compile_policy, tile_frames=tile_frames,
+                pin_strategy=pin_strategy, strict_validation=strict_validation,
+                diagnostics=diagnostics,
             ),
         )
 
@@ -336,7 +507,9 @@ class KireiApplyVDNH3Alpha:
                 "model": ("MODEL",),
                 "vdn_checkpoint": (_checkpoints(),),
                 "apply_turbo_adapter": ("BOOLEAN", {"default": True}),
-                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "strength": (
+                    "FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
+                ),
                 "branch_weights": (["stream", "resident"], {"default": "stream"}),
                 "attention_backend": (["grouped", "flex", "reference"], {"default": "grouped"}),
             }

@@ -18,6 +18,7 @@ from .window import ATTENTION_BACKENDS
 
 _LOG = logging.getLogger("comfy.vdn_h3")
 _PLACEHOLDER = "<place an authorized VDN checkpoint under models/vdn>"
+_EXECUTION_MODES = ("serial", "parallel")
 _PROFILES = (
     "auto",
     "max_speed",
@@ -171,6 +172,7 @@ def _resolve_runtime(
     *,
     profile,
     branch_mode="auto",
+    branch_execution="auto",
     lora_mode="auto",
     attention_backend="auto",
     kernel_backend="auto",
@@ -185,6 +187,8 @@ def _resolve_runtime(
         raise ValueError(f"unknown VDN profile {profile!r}")
     if branch_mode not in {"auto", *BRANCH_MODES}:
         raise ValueError(f"unknown branch mode {branch_mode!r}")
+    if branch_execution not in {"auto", *_EXECUTION_MODES}:
+        raise ValueError(f"unknown branch execution mode {branch_execution!r}")
     if lora_mode not in {"auto", "bypass", "merge"}:
         raise ValueError(f"unknown LoRA mode {lora_mode!r}")
     if attention_backend not in ATTENTION_BACKENDS:
@@ -227,6 +231,17 @@ def _resolve_runtime(
     else:
         resolved_branch = _auto_branch_mode(model, total_bytes, projection_bytes)
 
+    if branch_execution != "auto":
+        resolved_execution = branch_execution
+    elif profile == "workstation_fp8":
+        # Explicit high-VRAM/precision-changing profile: trade raw-feature copies for
+        # exact overlap of the linear branch with local softmax.
+        resolved_execution = "parallel"
+    else:
+        resolved_execution = "serial"
+    if resolved_execution == "parallel" and resolved_branch != "resident":
+        raise ValueError("parallel branch execution requires resident branch weights")
+
     resolved_lora = "bypass" if lora_mode == "auto" else lora_mode
 
     if attention_backend != "auto":
@@ -249,8 +264,12 @@ def _resolve_runtime(
         resolved_compile = compile_policy
     elif profile in {"reference", "compat_reference"}:
         resolved_compile = "off"
-    elif profile in {"max_speed", "workstation_fp8"}:
+    elif profile == "max_speed":
         resolved_compile = "reduce_overhead"
+    elif profile == "workstation_fp8":
+        # Avoid forcing CUDA-graph capture while two model streams are active. Shared
+        # static compilation still removes Python/epilogue overhead safely.
+        resolved_compile = "shared"
     else:
         resolved_compile = "shared"
 
@@ -272,12 +291,12 @@ def _resolve_runtime(
     elif profile in {"experimental_fp8", "workstation_fp8"}:
         resolved_projection = "fp8"
     else:
-        # Precision changes are never silently selected by auto/balanced profiles.
         resolved_projection = "bf16"
 
     return {
         "profile": profile,
         "branch_mode": resolved_branch,
+        "branch_execution": resolved_execution,
         "lora_mode": resolved_lora,
         "attention_backend": resolved_attention,
         "kernel_backend": resolved_kernel,
@@ -305,6 +324,7 @@ def apply_checkpoint(
     turbo_strength: float | None = None,
     profile: str = "auto",
     branch_mode: str = "auto",
+    branch_execution: str = "auto",
     lora_mode: str = "auto",
     attention_backend: str = "auto",
     kernel_backend: str = "auto",
@@ -357,10 +377,19 @@ def apply_checkpoint(
         )
 
     runtime = _resolve_runtime(
-        model, branch_maps, profile=profile, branch_mode=branch_mode, lora_mode=lora_mode,
-        attention_backend=attention_backend, kernel_backend=kernel_backend,
-        compile_policy=compile_policy, tile_frames=tile_frames, pin_strategy=pin_strategy,
-        projection_precision=projection_precision, linear_kernels=linear_kernels,
+        model,
+        branch_maps,
+        profile=profile,
+        branch_mode=branch_mode,
+        branch_execution=branch_execution,
+        lora_mode=lora_mode,
+        attention_backend=attention_backend,
+        kernel_backend=kernel_backend,
+        compile_policy=compile_policy,
+        tile_frames=tile_frames,
+        pin_strategy=pin_strategy,
+        projection_precision=projection_precision,
+        linear_kernels=linear_kernels,
         legacy_branch_weights=branch_weights,
     )
     branches = _make_branches(branch_maps, config, heads, head_dim, runtime)
@@ -400,9 +429,14 @@ def apply_checkpoint(
         projection_info=projection_info,
         diagnostics=diagnostics,
     )
+    state.branch_execution = runtime["branch_execution"]
     cloned = model.clone()
     try:
-        apply_vdn(cloned, state)
+        if runtime["branch_execution"] == "parallel":
+            from .parallel import apply_vdn_parallel
+            apply_vdn_parallel(cloned, state)
+        else:
+            apply_vdn(cloned, state)
     except Exception:
         state.close()
         raise
@@ -453,12 +487,22 @@ def apply_checkpoint(
         raise
 
     _LOG.info(
-        "VDN-H3 %s applied: profile=%s branch=%s lora=%s attention=%s kernel=%s "
+        "VDN-H3 %s applied: profile=%s branch=%s execution=%s lora=%s attention=%s kernel=%s "
         "compile=%s tile_frames=%d pin=%s projection=%s; %d blocks, %.2f GiB branch; adapters %s",
-        checkpoint_name, runtime["profile"], runtime["branch_mode"], runtime["lora_mode"],
-        runtime["attention_backend"], runtime["kernel_backend"], runtime["compile_policy"],
-        runtime["tile_frames"], runtime["pin_strategy"], runtime["projection_precision"],
-        len(blocks), state.weight_store.nbytes / 1024**3, ", ".join(reports),
+        checkpoint_name,
+        runtime["profile"],
+        runtime["branch_mode"],
+        runtime["branch_execution"],
+        runtime["lora_mode"],
+        runtime["attention_backend"],
+        runtime["kernel_backend"],
+        runtime["compile_policy"],
+        runtime["tile_frames"],
+        runtime["pin_strategy"],
+        runtime["projection_precision"],
+        len(blocks),
+        state.weight_store.nbytes / 1024**3,
+        ", ".join(reports),
     )
     return cloned
 
@@ -485,6 +529,7 @@ class KireiApplyVDNH3:
                     "FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced}
                 ),
                 "branch_mode": (["auto", *BRANCH_MODES], {"default": "auto", **advanced}),
+                "branch_execution": (["auto", *_EXECUTION_MODES], {"default": "auto", **advanced}),
                 "lora_mode": (["auto", "bypass", "merge"], {"default": "auto", **advanced}),
                 "attention_backend": (list(ATTENTION_BACKENDS), {"default": "auto", **advanced}),
                 "kernel_backend": (list(KERNEL_BACKENDS), {"default": "auto", **advanced}),
@@ -510,22 +555,46 @@ class KireiApplyVDNH3:
     )
 
     def apply(
-        self, model, vdn_checkpoint, profile, apply_turbo_adapter, strength,
-        default_adapter_strength=-1.0, turbo_adapter_strength=-1.0,
-        branch_mode="auto", lora_mode="auto", attention_backend="auto",
-        kernel_backend="auto", compile_policy="auto", tile_frames=0,
-        pin_strategy="auto", projection_precision="auto",
-        strict_validation=True, diagnostics=False,
+        self,
+        model,
+        vdn_checkpoint,
+        profile,
+        apply_turbo_adapter,
+        strength,
+        default_adapter_strength=-1.0,
+        turbo_adapter_strength=-1.0,
+        branch_mode="auto",
+        branch_execution="auto",
+        lora_mode="auto",
+        attention_backend="auto",
+        kernel_backend="auto",
+        compile_policy="auto",
+        tile_frames=0,
+        pin_strategy="auto",
+        projection_precision="auto",
+        strict_validation=True,
+        diagnostics=False,
     ):
         return (
             apply_checkpoint(
-                model, vdn_checkpoint, apply_turbo=apply_turbo_adapter, strength=strength,
-                default_strength=default_adapter_strength, turbo_strength=turbo_adapter_strength,
-                profile=profile, branch_mode=branch_mode, lora_mode=lora_mode,
-                attention_backend=attention_backend, kernel_backend=kernel_backend,
-                compile_policy=compile_policy, tile_frames=tile_frames,
-                pin_strategy=pin_strategy, projection_precision=projection_precision,
-                strict_validation=strict_validation, diagnostics=diagnostics,
+                model,
+                vdn_checkpoint,
+                apply_turbo=apply_turbo_adapter,
+                strength=strength,
+                default_strength=default_adapter_strength,
+                turbo_strength=turbo_adapter_strength,
+                profile=profile,
+                branch_mode=branch_mode,
+                branch_execution=branch_execution,
+                lora_mode=lora_mode,
+                attention_backend=attention_backend,
+                kernel_backend=kernel_backend,
+                compile_policy=compile_policy,
+                tile_frames=tile_frames,
+                pin_strategy=pin_strategy,
+                projection_precision=projection_precision,
+                strict_validation=strict_validation,
+                diagnostics=diagnostics,
             ),
         )
 
@@ -578,6 +647,11 @@ class KireiReleaseVDNH3Weights:
         if not isinstance(state, VDNState):
             raise RuntimeError("the supplied MODEL does not carry VDN-H3 state")
         state.release()
+        try:
+            from .parallel import release_parallel_contexts
+            release_parallel_contexts(state)
+        except Exception:
+            pass
         return (model,)
 
 

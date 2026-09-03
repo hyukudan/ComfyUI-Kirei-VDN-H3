@@ -82,6 +82,90 @@ def _projection_info(state):
     return data
 
 
+def _stage_total(stages: dict, name: str) -> float:
+    value = stages.get(name)
+    if not isinstance(value, dict):
+        return 0.0
+    try:
+        return float(value.get("total_ms", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict) -> dict:
+    """Summarize the timing split without pretending overlapping stages are additive."""
+    stages = diagnostics.get("stages", {}) if isinstance(diagnostics, dict) else {}
+    softmax_ms = _stage_total(stages, "attention.softmax")
+    linear_serial_ms = _stage_total(stages, "attention.linear_branch")
+    linear_parallel_ms = _stage_total(stages, "attention.linear_branch.parallel")
+    linear_ms = linear_parallel_ms or linear_serial_ms
+    transfer_ms = _stage_total(stages, "weights.transfer")
+    raw_copy_ms = _stage_total(stages, "parallel.raw_copy")
+    join_ms = _stage_total(stages, "parallel.join")
+    forward_ms = _stage_total(stages, "forward.total")
+
+    # Sort only top-level scopes useful to a human profiler. Internal linear.* scopes
+    # intentionally overlap their parent and therefore must not be summed together.
+    ranked = []
+    for name, item in stages.items():
+        if not isinstance(item, dict) or name.startswith("linear."):
+            continue
+        try:
+            ranked.append((name, float(item.get("total_ms", 0.0))))
+        except (TypeError, ValueError):
+            continue
+    ranked.sort(key=lambda pair: pair[1], reverse=True)
+
+    recommendations = []
+    precision = projection.get("precision", "bf16")
+    execution = getattr(state, "branch_execution", "serial")
+    attention = getattr(state, "last_attention_backend", None)
+    calibration_hit = getattr(getattr(state, "window_cache", None), "last_calibration_hit", None)
+    if precision == "bf16" and linear_ms > 0 and linear_ms >= max(softmax_ms * 0.65, 1.0):
+        recommendations.append(
+            "The VDN linear branch is a large share of runtime while to_out_linear is BF16; "
+            "benchmark the explicit workstation_fp8 profile on a large-VRAM GPU."
+        )
+    if attention == "grouped" and calibration_hit is None:
+        recommendations.append(
+            "Grouped attention is running without a calibration hit; benchmark grouped/Flex/FA2/FA4 "
+            "for the exact render geometry before assuming grouped is fastest."
+        )
+    if (
+        execution == "serial"
+        and getattr(state, "weight_mode", "") == "resident"
+        and cuda.get("available")
+        and int(cuda.get("total_bytes", 0)) >= 48 * 1024**3
+        and linear_ms > 0
+    ):
+        recommendations.append(
+            "The branch is resident on a large-VRAM GPU but still serial; branch_execution=parallel can "
+            "overlap exact VDN recurrence/projection with local softmax at the cost of extra raw Q/K/V VRAM."
+        )
+    if transfer_ms > max(linear_ms * 0.15, 2.0):
+        recommendations.append(
+            "Branch H2D transfer time is visible in the profile; prefer resident or hybrid placement if VRAM allows."
+        )
+
+    return {
+        "forward_total_ms": forward_ms,
+        "softmax_total_ms": softmax_ms,
+        "linear_branch_total_ms": linear_ms,
+        "weights_transfer_total_ms": transfer_ms,
+        "parallel_raw_copy_total_ms": raw_copy_ms,
+        "parallel_join_total_ms": join_ms,
+        "linear_to_softmax_ratio": (linear_ms / softmax_ms) if softmax_ms > 0 else None,
+        "top_level_stages": [
+            {"name": name, "total_ms": elapsed} for name, elapsed in ranked[:10]
+        ],
+        "recommendations": recommendations,
+        "note": (
+            "CUDA stage totals on different streams may overlap. Compare them to locate bottlenecks; "
+            "do not add parallel-stage totals to estimate wall time."
+        ),
+    }
+
+
 def runtime_snapshot(model_patcher: Any) -> dict:
     """Return resolved runtime, fallback state and diagnostics without mutation."""
     state = getattr(model_patcher, "object_patches", {}).get(
@@ -93,10 +177,14 @@ def runtime_snapshot(model_patcher: Any) -> dict:
     branch_bytes = int(state.weight_store.nbytes)
     calibration = getattr(getattr(state, "window_cache", None), "calibration", None)
     calibration_snapshot = calibration.snapshot() if calibration is not None else {}
+    projection = _projection_info(state)
+    diagnostics = state.diagnostics.snapshot(flush=True)
+    cuda = _cuda_snapshot(model_patcher)
     return {
         "checkpoint": state.name,
         "forwards": int(state.forwards),
         "branch_mode": state.weight_mode,
+        "branch_execution": getattr(state, "branch_execution", "serial"),
         "branch_bytes": branch_bytes,
         "branch_gib": branch_bytes / 1024**3,
         "branch_storage": state.weight_store.telemetry(),
@@ -111,12 +199,13 @@ def runtime_snapshot(model_patcher: Any) -> dict:
         "compile_policy": getattr(state, "compile_policy", "off"),
         "tile_frames": int(getattr(state, "tile_frames", 0)),
         "inference": bool(state.inference),
-        "projection": _projection_info(state),
+        "projection": projection,
         "lora_factors": _module_inventory(getattr(state, "lora_runtime", None)),
         "curve_factors": _module_inventory(getattr(state, "curve_adapter", None)),
         "diagnostics_enabled": bool(state.diagnostics.enabled),
-        "diagnostics": state.diagnostics.snapshot(flush=True),
-        "cuda": _cuda_snapshot(model_patcher),
+        "diagnostics": diagnostics,
+        "cuda": cuda,
+        "performance_analysis": _performance_analysis(state, diagnostics, projection, cuda),
     }
 
 

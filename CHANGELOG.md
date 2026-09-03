@@ -32,6 +32,14 @@ September 2026 audit against OpenVDN and current ComfyUI.
 - `detect_base_precision` recognises NVFP4, MXFP8, W4A4 and W4A8 comfy-kitchen layouts.
 - `auto` branch placement budgets against total VRAM minus the base model size instead
   of the free VRAM seen before ComfyUI loads the base.
+- Flex: `flex_attention` compiled with dynamic shapes, mask geometry captured as tensors,
+  dynamo recompile limit raised to 64. The static compile fell back to eager Flex (a
+  dense S x S score matrix) after eight distinct packed lengths.
+- Calibration store v3: signatures include the node version, torch/CUDA/cuDNN/driver,
+  Triton, flash-attn 2 / flash-attn-4 versions and the installed backend inventory, so a
+  node update or a newly installed backend re-measures; v2 files are ignored.
+- Dispatch reason rewritten on every resolution (`explicit`, `calibrated`, `flex` guard,
+  `autotuned`, `heuristic`); it no longer survives a calibration hit.
 
 ### Nodes and reports
 
@@ -40,6 +48,8 @@ September 2026 audit against OpenVDN and current ComfyUI.
 - Runtime Report: `adaln_fp32`, GPU family, attention `dispatch_reason`, and a
   video / text / other-global row breakdown of the packed layout.
 - Benchmark recorder requires the active adapter recipe and `lora_mode`.
+- Runtime Report: `fa4_available` next to `fa4_kernel`, `backends_available`, the dynamo
+  recompile limit and the calibration environment.
 
 ### Documentation
 
@@ -47,6 +57,10 @@ September 2026 audit against OpenVDN and current ComfyUI.
   (Euler / simple / 8 / cfg 1) and what `auto` decides per GPU.
 - New `docs/PERFORMANCE.md` with the FLOP model and the measured-results table.
 - Architecture and validation docs synchronised with the runtime.
+- CUDA probes run from any directory with the ComfyUI Python; the core probe uses the
+  real qkv strides, the real calibration path and times FA2; the Flex probe is a
+  twelve-length recompile regression. Windows notes: flash-attn-4 is not installable
+  natively, Flex needs `triton-windows`.
 
 ## 0.2.0
 

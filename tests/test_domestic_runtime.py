@@ -224,3 +224,35 @@ def test_calibration_store_roundtrip_and_geometry_signature(tmp_path):
         video_start=5, video_end=14, tokens_per_frame=3,
     )
     assert first != second
+
+
+def test_calibration_signature_tracks_node_version_and_backend_inventory(monkeypatch):
+    from vdn_h3 import __version__, calibration
+
+    calibration.runtime_environment.cache_clear()
+    env = calibration.runtime_environment()
+    assert env["node"] == __version__
+    assert env["torch"] == torch.__version__
+    assert "grouped" in env["backends"]
+    q = torch.zeros(20, 2, 4)
+    bounds = window.window_bounds(3, 1)
+    geometry = dict(groups=1, video_start=2, video_end=14, tokens_per_frame=4)
+    before = calibration_signature(q, 3, bounds, "both", **geometry)
+    parsed = json.loads(before)
+    assert parsed["version"] == CALIBRATION_VERSION == 3
+    assert parsed["env"]["node"] == __version__
+    flash2_was_available = "flash2" in parsed["env"]["backends"]
+    calibration.runtime_environment.cache_clear()
+    monkeypatch.setattr(window, "flash2_available", lambda cache=None: not flash2_was_available)
+    after = calibration_signature(q, 3, bounds, "both", **geometry)
+    assert after != before
+    assert ("flash2" in json.loads(after)["env"]["backends"]) is not flash2_was_available
+    calibration.runtime_environment.cache_clear()
+
+
+def test_calibration_store_ignores_previous_schema_versions(tmp_path):
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({"version": 2, "entries": {"sig": {"winner": "flex"}}}), encoding="utf-8")
+    store = CalibrationStore(path)
+    assert store.lookup("sig") is None
+    assert store.snapshot()["entries"] == 0

@@ -28,6 +28,45 @@ ATTENTION_BACKENDS = (
 )
 
 
+DYNAMO_RECOMPILE_FLOOR = 64
+_RECOMPILE_LIMIT_NAMES = ("recompile_limit", "cache_size_limit")
+
+
+def _dynamo_config():
+    import torch._dynamo.config as dynamo_config
+
+    return dynamo_config
+
+
+def recompile_limit() -> int | None:
+    """Current dynamo per-function recompile limit (``None`` without dynamo)."""
+    try:
+        config = _dynamo_config()
+    except Exception:
+        return None
+    values = [int(getattr(config, name)) for name in _RECOMPILE_LIMIT_NAMES if hasattr(config, name)]
+    return min(values) if values else None
+
+
+def raise_recompile_limit(floor: int = DYNAMO_RECOMPILE_FLOOR) -> int | None:
+    """Raise dynamo's recompile limit to at least ``floor``; never lower it.
+
+    Past the limit dynamo stops compiling a function and runs it eagerly. For
+    ``flex_attention`` and ``create_block_mask`` eager means a dense S x S intermediate,
+    so that fallback has to stay out of reach however many layouts a session sees.
+    """
+    try:
+        config = _dynamo_config()
+    except Exception:
+        return None
+    current = recompile_limit()
+    if current is not None and current < floor:
+        for name in _RECOMPILE_LIMIT_NAMES:
+            if hasattr(config, name):
+                setattr(config, name, int(floor))
+    return recompile_limit()
+
+
 def _cache_put(cache: OrderedDict, key, value, limit):
     cache[key] = value
     cache.move_to_end(key)
@@ -72,7 +111,12 @@ class WindowAttentionCache:
     def attention(self, flex_attention):
         if self._compiled is None and not self.is_broken("flex_compile"):
             try:
-                self._compiled = torch.compile(flex_attention, dynamic=False)
+                raise_recompile_limit()
+                # dynamic=True: one compiled kernel serves every packed length. A static
+                # compile recompiles per length and, past dynamo's recompile limit,
+                # silently falls back to eager flex_attention, which materialises the
+                # full S x S score matrix (extreme slowdown or OOM on long clips).
+                self._compiled = torch.compile(flex_attention, dynamic=True)
             except Exception as exc:
                 self.mark_broken("flex_compile", exc)
         return self._compiled or flex_attention
@@ -284,18 +328,29 @@ def _build_window_tables(sequence_length, video_start, video_end, num_frames, to
 def _window_mask_mod(video_start, video_end, num_frames, tokens_per_frame, lo, hi, anchor_frames):
     allow_anchor_columns = anchor_frames in ("columns", "both")
     allow_anchor_rows = anchor_frames in ("rows", "both")
+    # The geometry is captured as 0-d tensors, not Python ints. torch.compile guards on
+    # the value of every captured int, so each new layout would add a cache entry to the
+    # compiled create_block_mask body until dynamo hit its recompile limit and ran the
+    # eager path, which materialises the full S x S mask. Tensors are guarded by
+    # shape/dtype only.
+    geometry = torch.tensor(
+        [int(video_start), int(video_end), int(num_frames) - 1, int(tokens_per_frame)],
+        dtype=torch.long,
+        device=lo.device,
+    )
+    v_start, v_end, last_frame, per_frame = geometry[0], geometry[1], geometry[2], geometry[3]
 
     def mask_mod(batch, head, query_index, key_index):
         del batch, head
-        global_query = (query_index < video_start) | (query_index >= video_end)
-        global_key = (key_index < video_start) | (key_index >= video_end)
-        query_frame = (query_index - video_start) // tokens_per_frame
-        key_frame = (key_index - video_start) // tokens_per_frame
+        global_query = (query_index < v_start) | (query_index >= v_end)
+        global_key = (key_index < v_start) | (key_index >= v_end)
+        query_frame = (query_index - v_start) // per_frame
+        key_frame = (key_index - v_start) // per_frame
         allowed = global_query | global_key | ((key_frame >= lo[query_index]) & (key_frame <= hi[query_index]))
         if allow_anchor_columns:
-            allowed = allowed | (key_frame == 0) | (key_frame == num_frames - 1)
+            allowed = allowed | (key_frame == 0) | (key_frame == last_frame)
         if allow_anchor_rows:
-            allowed = allowed | (query_frame == 0) | (query_frame == num_frames - 1)
+            allowed = allowed | (query_frame == 0) | (query_frame == last_frame)
         return allowed
 
     return mask_mod
@@ -433,6 +488,16 @@ def decomposed_available(cache: WindowAttentionCache | None = None) -> bool:
         return False
 
 
+def backend_inventory(cache: WindowAttentionCache | None = None) -> dict[str, bool]:
+    """Which exact window backends can run here (pure import checks when ``cache`` is None)."""
+    return {
+        "grouped": True,
+        "flex": flex_available(cache),
+        "flash2": flash2_available(cache),
+        "decomposed": decomposed_available(cache),
+    }
+
+
 def _backend_available(backend: str, cache: WindowAttentionCache | None):
     if backend == "grouped":
         return True
@@ -498,6 +563,20 @@ def _autotune_if_needed(
         return None
 
 
+def _heuristic_backend(query, groups, cache) -> tuple[str, str]:
+    """Conservative choice when nothing was calibrated; returns (backend, why)."""
+    if query.is_cuda and torch.cuda.is_available():
+        if prefers_fa4(query.device) and decomposed_available(cache):
+            return "decomposed", f"{fa4_kernel(query.device)} FA4 kernel installed"
+    if groups <= 8:
+        return "grouped", f"{groups} window groups"
+    if query.is_cuda and query.shape[0] >= 8192 and flex_available(cache):
+        return "flex", f"{groups} window groups, {int(query.shape[0])} tokens"
+    if not query.is_cuda:
+        return "grouped", f"{groups} window groups, cpu"
+    return "grouped", f"{groups} window groups, flex unavailable or short sequence"
+
+
 def resolve_attention_backend(
     requested: str,
     query: torch.Tensor,
@@ -512,7 +591,12 @@ def resolve_attention_backend(
 ) -> str:
     if requested not in ATTENTION_BACKENDS:
         raise ValueError(f"unsupported attention backend {requested!r}")
+    if cache is not None:
+        # Every resolution rewrites the reason; a stale one must never outlive a hit.
+        cache.last_dispatch_reason = None
     if requested != "auto":
+        if cache is not None:
+            cache.last_dispatch_reason = f"explicit: {requested}"
         return requested
     groups = window_group_count(num_frames, bounds, anchor_frames)
     signature = None
@@ -530,9 +614,9 @@ def resolve_attention_backend(
         calibrated = cache.calibration.lookup(signature)
         if calibrated and _backend_available(calibrated, cache):
             cache.last_calibration_hit = calibrated
+            cache.last_dispatch_reason = f"calibrated: {calibrated}"
             return calibrated
         cache.last_calibration_hit = None
-        cache.last_dispatch_reason = None
         if (
             query.is_cuda
             and video_start is not None
@@ -562,16 +646,13 @@ def resolve_attention_backend(
         )
         if tuned and _backend_available(tuned, cache):
             cache.last_calibration_hit = tuned
+            cache.last_dispatch_reason = f"autotuned: {tuned}"
             return tuned
     # CPU or a runtime with only grouped attention keeps the conservative heuristics.
-    if query.is_cuda and torch.cuda.is_available():
-        if prefers_fa4(query.device) and decomposed_available(cache):
-            return "decomposed"
-    if groups <= 8:
-        return "grouped"
-    if query.is_cuda and query.shape[0] >= 8192 and flex_available(cache):
-        return "flex"
-    return "grouped"
+    backend, why = _heuristic_backend(query, groups, cache)
+    if cache is not None:
+        cache.last_dispatch_reason = f"heuristic: {backend} ({why})"
+    return backend
 
 
 def window_softmax_flex(
@@ -754,9 +835,11 @@ def window_softmax_flash2(
 __all__ = [
     "ANCHOR_FRAME_MODES",
     "ATTENTION_BACKENDS",
+    "DYNAMO_RECOMPILE_FLOOR",
     "GROUPED_COPY_GUARD_FRACTION",
     "GROUPED_COPY_GUARD_TOTAL_BYTES",
     "WindowAttentionCache",
+    "backend_inventory",
     "decomposed_available",
     "flash2_available",
     "flex_available",
@@ -766,6 +849,8 @@ __all__ = [
     "grouped_copy_bytes",
     "fa4_kernel",
     "prefers_fa4",
+    "raise_recompile_limit",
+    "recompile_limit",
     "resolve_attention_backend",
     "window_bounds",
     "window_group_count",

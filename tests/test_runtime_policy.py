@@ -11,17 +11,27 @@ from vdn_h3.report_node import KireiVDNH3RuntimeReport
 class _Diagnostics:
     enabled = True
 
-    def snapshot(self):
-        return {"attention.softmax": {"last_ms": 1.25}}
+    def snapshot(self, flush=True):
+        return {"attention.softmax": {"last_ms": 1.25}, "flush": flush}
 
 
 class _WeightStore:
     mode = "resident"
     nbytes = 4 * 1024**3
 
+    def telemetry(self):
+        return {"mode": self.mode, "total_bytes": self.nbytes, "h2d_bytes": 123}
+
+
+class _Calibration:
+    def snapshot(self):
+        return {"path": "fixture.json", "entries": 1}
+
 
 class _Cache:
     _broken = {"flex": "synthetic failure"}
+    last_calibration_hit = "grouped"
+    calibration = _Calibration()
 
 
 class _Patcher:
@@ -36,7 +46,14 @@ class _Patcher:
             attention_backend="auto",
             last_attention_backend="grouped",
             window_cache=_Cache(),
+            kernel_backend="auto",
             linear_kernels="auto",
+            compile_policy="shared",
+            tile_frames=5,
+            projection_precision="bf16",
+            projection_info=None,
+            lora_runtime=None,
+            curve_adapter=None,
             inference=True,
             diagnostics=_Diagnostics(),
         )
@@ -44,55 +61,83 @@ class _Patcher:
 
 
 def _branch_maps():
-    return [{"w": torch.zeros(16)}]
+    return [
+        {
+            "to_out_linear.weight": torch.zeros(8, 8),
+            "small": torch.zeros(16),
+        }
+    ]
 
 
-def test_profile_resolution_has_safe_reference_and_low_vram_modes(monkeypatch):
-    monkeypatch.setattr(nodes, "_auto_branch_mode", lambda model, size: "resident")
+def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatch):
+    monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
+    monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 0)
     model = object()
 
     reference = nodes._resolve_runtime(
         model,
         _branch_maps(),
         profile="reference",
-        branch_mode="auto",
-        lora_mode="auto",
-        attention_backend="auto",
         linear_kernels="auto",
     )
     assert reference == {
         "profile": "reference",
         "branch_mode": "stream",
-        "lora_mode": "merge",
+        "lora_mode": "bypass",
         "attention_backend": "reference",
-        "linear_kernels": "eager",
+        "kernel_backend": "eager",
+        "compile_policy": "off",
+        "tile_frames": 0,
+        "pin_strategy": "auto",
+        "projection_precision": "bf16",
         "inference": False,
     }
+
+    compat = nodes._resolve_runtime(
+        model,
+        _branch_maps(),
+        profile="compat_reference",
+    )
+    assert compat["attention_backend"] == "compat"
+    assert compat["compile_policy"] == "off"
+    assert compat["projection_precision"] == "bf16"
 
     low = nodes._resolve_runtime(
         model,
         _branch_maps(),
         profile="low_vram",
-        branch_mode="auto",
-        lora_mode="auto",
-        attention_backend="auto",
-        linear_kernels="auto",
     )
-    assert low["branch_mode"] == "stream"
+    assert low["branch_mode"] == "hybrid"
+    assert low["tile_frames"] == 5
     assert low["lora_mode"] == "bypass"
+    assert low["projection_precision"] == "bf16"
     assert low["inference"]
 
     fast = nodes._resolve_runtime(
         model,
         _branch_maps(),
         profile="max_speed",
-        branch_mode="auto",
-        lora_mode="auto",
-        attention_backend="auto",
-        linear_kernels="auto",
     )
     assert fast["branch_mode"] == "resident"
-    assert fast["lora_mode"] == "bypass"
+    assert fast["compile_policy"] == "reduce_overhead"
+    assert fast["tile_frames"] == 0
+
+    fp8 = nodes._resolve_runtime(
+        model,
+        _branch_maps(),
+        profile="experimental_fp8",
+    )
+    assert fp8["projection_precision"] == "fp8"
+    assert fp8["inference"]
+
+
+def test_reference_rejects_fp8_precision():
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot be used as a reference"):
+        nodes._resolve_runtime(
+            object(), _branch_maps(), profile="reference", projection_precision="fp8"
+        )
 
 
 def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
@@ -107,7 +152,8 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
         lambda device: SimpleNamespace(total_memory=24 * gib),
     )
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (20 * gib, 24 * gib))
-    assert nodes._auto_branch_mode(model, 5 * gib) == "stream"
+    assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "hybrid"
+    assert nodes._auto_tile_frames(model, "hybrid") == 5
 
     monkeypatch.setattr(
         torch.cuda,
@@ -115,10 +161,11 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
         lambda device: SimpleNamespace(total_memory=96 * gib),
     )
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (70 * gib, 96 * gib))
-    assert nodes._auto_branch_mode(model, 5 * gib) == "resident"
+    assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "resident"
+    assert nodes._auto_tile_frames(model, "resident") == 0
 
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (18 * gib, 96 * gib))
-    assert nodes._auto_branch_mode(model, 5 * gib) == "stream"
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 * gib, 96 * gib))
+    assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "stream"
 
 
 def test_runtime_snapshot_and_node_are_machine_readable():
@@ -126,7 +173,11 @@ def test_runtime_snapshot_and_node_are_machine_readable():
     snapshot = runtime_snapshot(model)
     assert snapshot["checkpoint"] == "fixture"
     assert snapshot["branch_gib"] == 4.0
+    assert snapshot["branch_storage"]["h2d_bytes"] == 123
     assert snapshot["attention_failures"] == {"flex": "synthetic failure"}
+    assert snapshot["attention_calibration"]["last_hit"] == "grouped"
+    assert snapshot["compile_policy"] == "shared"
+    assert snapshot["tile_frames"] == 5
     assert snapshot["cuda"]["available"] is False
 
     node = KireiVDNH3RuntimeReport()

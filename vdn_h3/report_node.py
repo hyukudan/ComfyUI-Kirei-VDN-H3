@@ -42,7 +42,10 @@ class KireiVDNH3RuntimeReport:
     def report(self, model, after=None):
         del after
         snapshot = runtime_snapshot(model)
-        return model, json.dumps(snapshot, indent=2, sort_keys=True, default=str)
+        report_json = json.dumps(snapshot, indent=2, sort_keys=True, default=str)
+        # Keep the socket outputs for existing workflows and also publish the text in
+        # ComfyUI's history payload so headless benchmarks can retrieve it over the API.
+        return {"ui": {"text": [report_json]}, "result": (model, report_json)}
 
 
 def _state(model):
@@ -237,7 +240,11 @@ class KireiVDNH3CalibrateAttention:
             "calibration": cache.calibration.snapshot(),
         }
         del reference, q, k, v
-        return model, json.dumps(payload, indent=2, sort_keys=True)
+        calibration_json = json.dumps(payload, indent=2, sort_keys=True)
+        return {
+            "ui": {"text": [calibration_json]},
+            "result": (model, calibration_json),
+        }
 
 
 NODE_CLASS_MAPPINGS = {

@@ -191,14 +191,22 @@ def _probe_quantized_projection(device, precision, quick=False):
     quantized = maps[0]
     x = torch.randn(rows, in_features, device=device, dtype=torch.bfloat16)
     bf16_weight = weight.to(device)
+    def run_reference():
+        with torch.inference_mode():
+            return torch.nn.functional.linear(x, bf16_weight)
+
     reference, bf16_ms = _time(
-        device, lambda: torch.nn.functional.linear(x, bf16_weight), runs=4 if quick else 10
+        device, run_reference, runs=4 if quick else 10
     )
     gpu_weights = {
         FP8_WEIGHT_KEY: quantized[FP8_WEIGHT_KEY].to(device),
         FP8_SCALE_KEY: quantized[FP8_SCALE_KEY].to(device),
     }
-    got, quant_ms = _time(device, lambda: project(x, gpu_weights), runs=4 if quick else 10)
+    def run_quantized():
+        with torch.inference_mode():
+            return project(x, gpu_weights)
+
+    got, quant_ms = _time(device, run_quantized, runs=4 if quick else 10)
     error = _error(
         got,
         reference,

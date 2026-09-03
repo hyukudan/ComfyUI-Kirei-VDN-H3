@@ -232,8 +232,10 @@ def test_runtime_snapshot_and_node_are_machine_readable():
 
     node = KireiVDNH3RuntimeReport()
     sentinel = object()
-    passthrough, text = node.report(model, after=sentinel)
+    response = node.report(model, after=sentinel)
+    passthrough, text = response["result"]
     assert passthrough is model
+    assert response["ui"]["text"] == [text]
     parsed = json.loads(text)
     assert parsed["attention_last"] == "grouped"
     assert parsed["diagnostics"]["attention.softmax"]["last_ms"] == 1.25

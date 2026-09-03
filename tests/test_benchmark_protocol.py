@@ -73,7 +73,6 @@ def test_product_groups_compare_same_output_objective_not_same_nfe():
         groups[group]["steps"].add(scenario["steps"])
     assert groups
     assert all(len(item["objectives"]) == 1 for item in groups.values())
-    # At least one real product group must compare recipe-faithful Turbo 4 NFE to VDN 8 NFE.
     assert any(item["steps"] == {4, 8} for item in groups.values())
 
 
@@ -186,7 +185,7 @@ def test_quality_gate_controls_product_speed_claim():
     assert qualified["speed_claim_eligible"] is True
 
 
-def test_record_result_validates_stage_dmd_steps_and_shifts():
+def test_record_result_validates_stage_dmd_steps_shifts_and_runtime_label():
     module = _module(RECORD, "vdn_bench_record")
     payload = _payload()
     scenarios = {item["id"]: item for item in payload["scenarios"]}
@@ -196,7 +195,11 @@ def test_record_result_validates_stage_dmd_steps_and_shifts():
         "scenario_id": scenario["id"],
         "sampler_seconds": 1.0,
         "sampling": {"video_shift": 12.0, "audio_shift": 3.0},
-        "runtime_report": {"checkpoint_recipe": {"turbo_num_steps": 8}},
+        "runtime_report": {
+            "profile": "auto",
+            "projection": {"precision": "bf16"},
+            "checkpoint_recipe": {"turbo_num_steps": 8},
+        },
     }
     row = module.build_result(
         measurement,
@@ -226,3 +229,24 @@ def test_record_result_validates_stage_dmd_steps_and_shifts():
         assert "sampling shifts" in str(exc)
     else:
         raise AssertionError("wrong H3 shift must be rejected")
+
+    fallback = dict(measurement)
+    fallback["runtime_report"] = {
+        "profile": "auto",
+        "projection": {"precision": "int8"},
+        "checkpoint_recipe": {"turbo_num_steps": 8},
+    }
+    try:
+        module.build_result(
+            fallback,
+            scenario,
+            recipe,
+            seed=1,
+            scheduler="euler",
+            prompt_hash="p",
+            quality_status="pending",
+        )
+    except ValueError as exc:
+        assert "projection_precision='bf16'" in str(exc)
+    else:
+        raise AssertionError("mislabeled benchmark precision must be rejected")

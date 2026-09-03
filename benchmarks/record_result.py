@@ -10,13 +10,103 @@ QUALITY_STATUSES = {"pending", "qualified", "failed", "diagnostic"}
 def load_scenarios(path: Path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     scenarios = {item["id"]: item for item in payload["scenarios"]}
-    return payload, scenarios
+    recipes = dict(payload.get("recipes", {}))
+    return payload, scenarios, recipes
+
+
+def _close(a, b, tol=1e-6):
+    return a is not None and b is not None and abs(float(a) - float(b)) <= tol
+
+
+def _runtime_adapters(runtime):
+    if not isinstance(runtime, dict):
+        return None
+    adapters = runtime.get("adapters")
+    if not isinstance(adapters, dict):
+        return None
+    active = adapters.get("active")
+    strengths = adapters.get("strengths")
+    return {
+        "active": list(active) if isinstance(active, (list, tuple)) else None,
+        "strengths": dict(strengths) if isinstance(strengths, dict) else {},
+    }
+
+
+def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
+    expected_steps = int(recipe["steps"])
+    if int(scenario["steps"]) != expected_steps:
+        # Historical/diagnostic scenarios are allowed to document deliberately wrong recipes.
+        if scenario.get("active") or scenario.get("comparable"):
+            raise ValueError(
+                f"active scenario {scenario['id']!r} uses {scenario['steps']} steps, "
+                f"but recipe {scenario['recipe_id']!r} requires {expected_steps}"
+            )
+
+    runtime = measurement.get("runtime_report")
+    expects_vdn = bool(recipe.get("expects_vdn_runtime", False))
+    if expects_vdn and not isinstance(runtime, dict):
+        raise ValueError(
+            f"scenario {scenario['id']!r} uses VDN recipe {scenario['recipe_id']!r} but "
+            "the measurement has no VDN Runtime Report"
+        )
+    if not expects_vdn and isinstance(runtime, dict):
+        raise ValueError(
+            f"scenario {scenario['id']!r} is a non-VDN control but the measurement carries VDN state"
+        )
+
+    if isinstance(runtime, dict):
+        expected_turbo_steps = recipe.get("runtime_turbo_num_steps")
+        checkpoint_recipe = runtime.get("checkpoint_recipe")
+        if expected_turbo_steps is not None:
+            got = checkpoint_recipe.get("turbo_num_steps") if isinstance(checkpoint_recipe, dict) else None
+            if got is None or int(got) != int(expected_turbo_steps):
+                raise ValueError(
+                    f"runtime checkpoint turbo_num_steps={got!r}, expected {expected_turbo_steps} "
+                    f"for recipe {scenario['recipe_id']!r}"
+                )
+
+        adapter_state = _runtime_adapters(runtime)
+        required = list(recipe.get("required_adapters", []))
+        # External Turbo controls do not have a VDN Runtime Report, so this check applies
+        # only to VDN recipes where the node can expose exact adapter state.
+        if required and expects_vdn:
+            if adapter_state is None or adapter_state["active"] is None:
+                raise ValueError("VDN Runtime Report does not expose active adapters")
+            if set(adapter_state["active"]) != set(required):
+                raise ValueError(
+                    f"runtime adapters {adapter_state['active']} != required {required} "
+                    f"for recipe {scenario['recipe_id']!r}"
+                )
+            strength = recipe.get("required_adapter_strength")
+            if strength is not None:
+                for name in required:
+                    got = adapter_state["strengths"].get(name)
+                    if not _close(got, strength):
+                        raise ValueError(
+                            f"adapter {name!r} strength={got!r}, expected {strength} for "
+                            f"recipe {scenario['recipe_id']!r}"
+                        )
+
+    sampling = measurement.get("sampling")
+    if not isinstance(sampling, dict):
+        raise ValueError(
+            "benchmark measurement does not expose model sampling shifts; update/reload the "
+            "Kirei Benchmark Start node before recording this result"
+        )
+    expected_v = float(recipe["video_shift"])
+    expected_a = float(recipe["audio_shift"])
+    got_v, got_a = sampling.get("video_shift"), sampling.get("audio_shift")
+    if not _close(got_v, expected_v) or not _close(got_a, expected_a):
+        raise ValueError(
+            f"sampling shifts video/audio={got_v}/{got_a}, expected {expected_v}/{expected_a} "
+            f"for recipe {scenario['recipe_id']!r}"
+        )
 
 
 def build_result(
     measurement: dict,
     scenario: dict,
-    rules: dict,
+    recipe: dict,
     *,
     seed: int,
     scheduler: str,
@@ -31,38 +121,15 @@ def build_result(
         raise ValueError(
             f"measurement scenario_id={scenario_id!r} does not match selected scenario {scenario['id']!r}"
         )
-
-    declared = int(rules.get("checkpoint_declared_turbo_steps", 0) or 0)
-    if (
-        scenario.get("active")
-        and scenario.get("quality_target", "").startswith("checkpoint_declared_distilled8")
-        and declared
-        and int(scenario["steps"]) != declared
-    ):
-        raise ValueError(
-            f"active distilled scenario {scenario['id']!r} uses {scenario['steps']} steps, "
-            f"but benchmark rules declare {declared}"
-        )
-
-    runtime = measurement.get("runtime_report")
-    runtime_declared = None
-    if isinstance(runtime, dict):
-        recipe = runtime.get("checkpoint_recipe")
-        if isinstance(recipe, dict):
-            value = recipe.get("turbo_num_steps")
-            if value is not None:
-                runtime_declared = int(value)
-                if int(scenario["steps"]) != runtime_declared:
-                    raise ValueError(
-                        f"runtime checkpoint declares turbo_num_steps={runtime_declared}, but scenario "
-                        f"{scenario['id']!r} requests steps={scenario['steps']}"
-                    )
+    _validate_recipe(measurement, scenario, recipe)
 
     row = {
         "scenario_id": scenario["id"],
-        "comparison_group": scenario["comparison_group"],
+        "product_group": scenario.get("product_group"),
+        "technical_group": scenario.get("technical_group"),
         "quality_target": scenario["quality_target"],
-        "recipe": scenario["recipe"],
+        "recipe_id": scenario["recipe_id"],
+        "recipe_label": recipe.get("label"),
         "quality_status": quality_status,
         "quality_gate_required": bool(scenario.get("quality_gate_required", False)),
         "comparable": bool(scenario.get("comparable", True)),
@@ -72,12 +139,15 @@ def build_result(
         "steps": int(scenario["steps"]),
         "seed": int(seed),
         "scheduler": str(scheduler),
+        "scheduler_family": str(recipe["scheduler_family"]),
+        "video_shift": float(recipe["video_shift"]),
+        "audio_shift": float(recipe["audio_shift"]),
         "prompt_hash": str(prompt_hash),
-        "checkpoint_turbo_num_steps": runtime_declared if runtime_declared is not None else declared or None,
         "run_kind": str(measurement.get("run_kind", "warm")),
         "sampler_seconds": float(measurement["sampler_seconds"]),
         "peak_vram_bytes": measurement.get("peak_vram_bytes"),
-        "runtime_report": runtime,
+        "sampling": measurement.get("sampling"),
+        "runtime_report": measurement.get("runtime_report"),
     }
     if end_to_end_seconds is not None:
         row["end_to_end_seconds"] = float(end_to_end_seconds)
@@ -86,7 +156,7 @@ def build_result(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge a Kirei Benchmark End measurement with a validated benchmark scenario."
+        description="Merge a Kirei Benchmark End measurement with a validated benchmark recipe."
     )
     parser.add_argument("measurement", type=Path, help="JSON emitted by Kirei Benchmark End")
     parser.add_argument("--scenarios", type=Path, default=Path(__file__).with_name("scenarios.json"))
@@ -94,23 +164,23 @@ def main():
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--scheduler", required=True)
     parser.add_argument("--prompt-hash", required=True)
-    parser.add_argument(
-        "--quality-status",
-        choices=sorted(QUALITY_STATUSES),
-        default="pending",
-    )
+    parser.add_argument("--quality-status", choices=sorted(QUALITY_STATUSES), default="pending")
     parser.add_argument("--end-to-end-seconds", type=float)
     args = parser.parse_args()
 
     measurement = json.loads(args.measurement.read_text(encoding="utf-8"))
-    payload, scenarios = load_scenarios(args.scenarios)
+    payload, scenarios, recipes = load_scenarios(args.scenarios)
     scenario_id = str(measurement.get("scenario_id", ""))
     if scenario_id not in scenarios:
         raise SystemExit(f"unknown scenario_id {scenario_id!r}")
+    scenario = scenarios[scenario_id]
+    recipe_id = scenario.get("recipe_id")
+    if recipe_id not in recipes:
+        raise SystemExit(f"scenario {scenario_id!r} references unknown recipe {recipe_id!r}")
     row = build_result(
         measurement,
-        scenarios[scenario_id],
-        payload["rules"],
+        scenario,
+        recipes[recipe_id],
         seed=args.seed,
         scheduler=args.scheduler,
         prompt_hash=args.prompt_hash,

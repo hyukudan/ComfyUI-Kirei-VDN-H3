@@ -35,7 +35,6 @@ def _runtime_adapters(runtime):
 def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
     expected_steps = int(recipe["steps"])
     if int(scenario["steps"]) != expected_steps:
-        # Historical/diagnostic scenarios are allowed to document deliberately wrong recipes.
         if scenario.get("active") or scenario.get("comparable"):
             raise ValueError(
                 f"active scenario {scenario['id']!r} uses {scenario['steps']} steps, "
@@ -65,13 +64,12 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
                     f"for recipe {scenario['recipe_id']!r}"
                 )
 
+        # Newer Runtime Reports may expose exact named-adapter state. Validate it when
+        # available, but do not reject otherwise: older installed nodes still provide
+        # enough information to validate checkpoint recipe, sampling shifts and runtime.
         adapter_state = _runtime_adapters(runtime)
         required = list(recipe.get("required_adapters", []))
-        # External Turbo controls do not have a VDN Runtime Report, so this check applies
-        # only to VDN recipes where the node can expose exact adapter state.
-        if required and expects_vdn:
-            if adapter_state is None or adapter_state["active"] is None:
-                raise ValueError("VDN Runtime Report does not expose active adapters")
+        if required and expects_vdn and adapter_state is not None and adapter_state["active"] is not None:
             if set(adapter_state["active"]) != set(required):
                 raise ValueError(
                     f"runtime adapters {adapter_state['active']} != required {required} "
@@ -169,7 +167,7 @@ def main():
     args = parser.parse_args()
 
     measurement = json.loads(args.measurement.read_text(encoding="utf-8"))
-    payload, scenarios, recipes = load_scenarios(args.scenarios)
+    _payload, scenarios, recipes = load_scenarios(args.scenarios)
     scenario_id = str(measurement.get("scenario_id", ""))
     if scenario_id not in scenarios:
         raise SystemExit(f"unknown scenario_id {scenario_id!r}")

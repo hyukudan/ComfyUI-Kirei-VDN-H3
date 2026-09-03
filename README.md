@@ -66,3 +66,8 @@ PRO 6000 Blackwell Workstation Edition:
 
 These checks do **not** establish real-checkpoint visual parity, generation quality,
 or production stability.
+
+## Engineering report
+
+The private feasibility study, upstream audit, hardware findings and phased validation
+plan are maintained in [`docs/PORT_REPORT.md`](docs/PORT_REPORT.md).

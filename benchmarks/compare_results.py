@@ -32,8 +32,6 @@ def _normalize(row: dict) -> dict:
     row.setdefault("recipe_id", row.get("recipe", "legacy"))
     row.setdefault("product_group", None)
     row.setdefault("technical_group", row.get("comparison_group"))
-    # Historical v2/v3 rows predate verified sampling plans. They can still be
-    # summarized as diagnostics but cannot silently masquerade as the new recipe.
     row.setdefault("sampler_name", row.get("sampler", "legacy_unknown"))
     row.setdefault("scheduler_name", row.get("scheduler", "legacy_unknown"))
     row.setdefault("denoise", 1.0)
@@ -74,7 +72,6 @@ def _trajectory(row):
 
 
 def scenario_invariant(row):
-    """Fields that must never vary between repeated runs of one scenario."""
     return (
         int(row["width"]),
         int(row["height"]),
@@ -88,7 +85,6 @@ def scenario_invariant(row):
 
 
 def product_invariant(item):
-    """Same quality objective and same denoising trajectory; recipe/model may differ."""
     row = item["representative"]
     return (
         int(row["width"]),
@@ -102,7 +98,6 @@ def product_invariant(item):
 
 
 def technical_invariant(item):
-    """Strict same-work comparison for VDN precision/profile engineering changes."""
     row = item["representative"]
     return (*product_invariant(item), str(row["recipe_id"]))
 
@@ -148,7 +143,7 @@ def summarize(rows):
     return summary
 
 
-def _comparison(summary, group_field: str, invariant_fn, mode: str):
+def _comparison(summary, group_field: str, invariant_fn, mode: str, *, min_items: int = 1):
     grouped = defaultdict(list)
     for scenario, item in summary.items():
         group = item.get(group_field)
@@ -158,6 +153,8 @@ def _comparison(summary, group_field: str, invariant_fn, mode: str):
 
     out = {}
     for group, items in sorted(grouped.items()):
+        if len(items) < min_items:
+            continue
         invariants = {invariant_fn(item) for _, item in items}
         if len(invariants) != 1:
             raise ValueError(
@@ -204,11 +201,30 @@ def _comparison(summary, group_field: str, invariant_fn, mode: str):
 
 
 def product_comparisons(summary):
-    return _comparison(summary, "product_group", product_invariant, "same_objective_product")
+    return _comparison(summary, "product_group", product_invariant, "same_objective_product", min_items=2)
 
 
 def technical_comparisons(summary):
-    return _comparison(summary, "technical_group", technical_invariant, "same_recipe_technical")
+    # Product groups intentionally contain Larry and VDN controls.  Technical speed
+    # comparisons must never mix those recipes, so partition a nominal technical group
+    # by recipe_id and omit singletons (Larry becomes a product control, while the VDN
+    # BF16/INT8/FP8/max_speed variants remain a meaningful same-recipe group).
+    partitioned = {}
+    for scenario, item in summary.items():
+        group = item.get("technical_group")
+        if not group:
+            partitioned[scenario] = item
+            continue
+        clone = dict(item)
+        clone["technical_partition"] = f"{group}::{item['recipe_id']}"
+        partitioned[scenario] = clone
+    return _comparison(
+        partitioned,
+        "technical_partition",
+        technical_invariant,
+        "same_recipe_technical",
+        min_items=2,
+    )
 
 
 def comparisons(summary):
@@ -219,7 +235,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Summarize verified VDN-H3 benchmark JSONL. Comparable rows must share the exact "
-            "sampler trajectory (including Euler/simple/NFE/denoise); quality gates control claims."
+            "sampler trajectory (Euler/simple/NFE/denoise); technical rankings are isolated by recipe."
         )
     )
     parser.add_argument("results", type=Path)

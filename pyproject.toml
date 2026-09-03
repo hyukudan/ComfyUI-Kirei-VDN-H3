@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-kirei-vdn-h3"
+version = "0.2.0"
+description = "Optimized VideoDeltaNet H3 model patch for native ComfyUI MiniMax-H3"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

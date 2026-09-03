@@ -1,0 +1,63 @@
+name: VDN-H3 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install pytest safetensors
+      - name: Compile Python sources
+        run: python -m compileall -q vdn_h3 tests
+      - name: Run dependency-light suite
+        run: |
+          pytest -q \
+            tests/test_adapters.py \
+            tests/test_branch.py \
+            tests/test_curve.py \
+            tests/test_hybrid.py \
+            tests/test_layout.py \
+            tests/test_optimized_runtime.py \
+            tests/test_runtime_policy.py \
+            tests/test_spec.py \
+            tests/test_window.py
+
+  comfyui-current:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Clone current ComfyUI
+        run: git clone --depth 1 https://github.com/Comfy-Org/ComfyUI.git "$RUNNER_TEMP/ComfyUI"
+      - name: Install ComfyUI CPU dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+          sed '/^torch$/d;/^torchvision$/d;/^torchaudio$/d' "$RUNNER_TEMP/ComfyUI/requirements.txt" > "$RUNNER_TEMP/comfy-requirements.txt"
+          python -m pip install -r "$RUNNER_TEMP/comfy-requirements.txt"
+          python -m pip install pytest
+      - name: Run complete suite against current ComfyUI
+        env:
+          PYTHONPATH: ${{ runner.temp }}/ComfyUI:${{ github.workspace }}
+        run: pytest -q

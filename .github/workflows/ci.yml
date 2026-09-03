@@ -25,11 +25,12 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install pytest safetensors
       - name: Compile Python sources
-        run: python -m compileall -q vdn_h3 tests
+        run: python -m compileall -q vdn_h3 tests benchmarks
       - name: Run dependency-light suite
         run: |
           pytest -q \
             tests/test_adapters.py \
+            tests/test_benchmark_protocol.py \
             tests/test_branch.py \
             tests/test_curve.py \
             tests/test_domestic_runtime.py \

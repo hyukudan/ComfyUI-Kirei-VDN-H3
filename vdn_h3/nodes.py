@@ -9,9 +9,9 @@ import torch
 
 from .apply import apply_factor_patches
 from .bypass import WeightedFactor, install_bypass, partition_factors
-from .fp8 import PROJECTION_PRECISIONS, prepare_projection_maps
 from .hybrid import VDNState, apply_vdn, validate_h3_model
 from .kernels import COMPILE_POLICIES, KERNEL_BACKENDS
+from .projection import PROJECTION_PRECISIONS, detect_base_precision, prepare_projection_maps
 from .weights import BRANCH_MODES, PIN_STRATEGIES, STREAMED_PROJECTION_KEY
 from .window import ATTENTION_BACKENDS
 
@@ -166,6 +166,17 @@ def _auto_tile_frames(model, branch_mode: str) -> int:
     return 0
 
 
+def _auto_execution_mode(model, branch_mode: str) -> str:
+    """Trade extra raw-QKV VRAM for exact branch/softmax overlap on workstations."""
+    if branch_mode != "resident":
+        return "serial"
+    budget = _gpu_budget(model)
+    if budget is None:
+        return "serial"
+    _device, total, free = budget
+    return "parallel" if total >= 48 * 1024**3 and free >= 28 * 1024**3 else "serial"
+
+
 def _resolve_runtime(
     model,
     branch_maps,
@@ -216,6 +227,7 @@ def _resolve_runtime(
     if compile_policy not in {"auto", *COMPILE_POLICIES}:
         raise ValueError(f"unknown compile policy {compile_policy!r}")
 
+    base_precision = detect_base_precision(model)
     total_bytes = _branch_bytes(branch_maps)
     projection_bytes = _projection_bytes(branch_maps)
     if legacy_branch_weights in BRANCH_MODES and branch_mode == "auto":
@@ -233,16 +245,27 @@ def _resolve_runtime(
 
     if branch_execution != "auto":
         resolved_execution = branch_execution
-    elif profile == "workstation_fp8":
-        # Explicit high-VRAM/precision-changing profile: trade raw-feature copies for
-        # exact overlap of the linear branch with local softmax.
-        resolved_execution = "parallel"
-    else:
+    elif profile in {"reference", "compat_reference", "low_vram"}:
         resolved_execution = "serial"
+    elif profile in {"max_speed", "workstation_fp8"}:
+        resolved_execution = _auto_execution_mode(model, resolved_branch)
+    else:
+        resolved_execution = _auto_execution_mode(model, resolved_branch)
     if resolved_execution == "parallel" and resolved_branch != "resident":
         raise ValueError("parallel branch execution requires resident branch weights")
 
-    resolved_lora = "bypass" if lora_mode == "auto" else lora_mode
+    if lora_mode != "auto":
+        resolved_lora = lora_mode
+    elif profile in {"reference", "compat_reference", "low_vram"}:
+        resolved_lora = "bypass"
+    elif profile in {"max_speed", "workstation_fp8"}:
+        resolved_lora = "merge"
+    elif resolved_branch == "resident" and base_precision in {"int8", "fp8"}:
+        # Match the official tuned strategy: patch/requantize once at load time instead
+        # of paying the low-rank QKV/O GEMMs in all 50 blocks on every denoising step.
+        resolved_lora = "merge"
+    else:
+        resolved_lora = "bypass"
 
     if attention_backend != "auto":
         resolved_attention = attention_backend
@@ -264,12 +287,11 @@ def _resolve_runtime(
         resolved_compile = compile_policy
     elif profile in {"reference", "compat_reference"}:
         resolved_compile = "off"
+    elif resolved_execution == "parallel":
+        # Keep static shared compilation, but do not force CUDA-graph capture across two streams.
+        resolved_compile = "shared"
     elif profile == "max_speed":
         resolved_compile = "reduce_overhead"
-    elif profile == "workstation_fp8":
-        # Avoid forcing CUDA-graph capture while two model streams are active. Shared
-        # static compilation still removes Python/epilogue overhead safely.
-        resolved_compile = "shared"
     else:
         resolved_compile = "shared"
 
@@ -283,18 +305,25 @@ def _resolve_runtime(
         resolved_tile = _auto_tile_frames(model, resolved_branch)
 
     if profile in {"reference", "compat_reference"}:
-        if projection_precision == "fp8":
-            raise ValueError("FP8 changes the numerical model and cannot be used as a reference profile")
+        if projection_precision in {"fp8", "int8"}:
+            raise ValueError("quantized VDN projection cannot be used as a reference profile")
         resolved_projection = "bf16"
     elif projection_precision != "auto":
         resolved_projection = projection_precision
-    elif profile in {"experimental_fp8", "workstation_fp8"}:
+    elif profile in {"workstation_fp8", "experimental_fp8"}:
         resolved_projection = "fp8"
+    elif profile == "max_speed":
+        resolved_projection = base_precision if base_precision in {"int8", "fp8"} else "fp8"
+    elif base_precision in {"int8", "fp8"}:
+        # A quantized H3 base should not acquire a new 7168->5376 BF16 GEMM in every block.
+        resolved_projection = base_precision
     else:
         resolved_projection = "bf16"
 
+    inference = profile not in {"reference", "compat_reference"}
     return {
         "profile": profile,
+        "base_precision": base_precision,
         "branch_mode": resolved_branch,
         "branch_execution": resolved_execution,
         "lora_mode": resolved_lora,
@@ -304,7 +333,8 @@ def _resolve_runtime(
         "tile_frames": int(resolved_tile),
         "pin_strategy": pin_strategy,
         "projection_precision": resolved_projection,
-        "inference": profile not in {"reference", "compat_reference"},
+        "block_fusion": bool(inference and resolved_branch == "resident" and resolved_compile != "off"),
+        "inference": inference,
     }
 
 
@@ -395,15 +425,30 @@ def apply_checkpoint(
     branches = _make_branches(branch_maps, config, heads, head_dim, runtime)
     storage_maps = branch_maps
     projection_info = None
-    if runtime["projection_precision"] == "fp8":
+    if runtime["projection_precision"] != "bf16":
         device = _model_cuda_device(model)
         try:
             if device is None:
                 raise RuntimeError("the loaded H3 model has no CUDA load device")
-            storage_maps, projection_info = prepare_projection_maps(branch_maps, device)
+            # Top-speed and native-INT8 profiles quantize every VDN projection, matching
+            # the official tuned rung (skip_end_blocks=0). The explicit experimental
+            # FP8 profile keeps the conservative FP8 helper default.
+            skip_end = (
+                0
+                if runtime["projection_precision"] == "int8"
+                or profile in {"auto", "max_speed", "workstation_fp8"}
+                else None
+            )
+            storage_maps, projection_info = prepare_projection_maps(
+                branch_maps,
+                device,
+                runtime["projection_precision"],
+                skip_end_blocks=skip_end,
+            )
         except Exception as exc:
             _LOG.warning(
-                "VDN-H3 FP8 projection unavailable (%s); falling back to BF16 before model construction",
+                "VDN-H3 %s projection unavailable (%s); falling back to BF16 before model construction",
+                runtime["projection_precision"],
                 exc,
             )
             runtime["projection_precision"] = "bf16"
@@ -427,9 +472,13 @@ def apply_checkpoint(
         checkpoint_root=path,
         projection_precision=runtime["projection_precision"],
         projection_info=projection_info,
+        block_fusion=runtime["block_fusion"],
         diagnostics=diagnostics,
     )
+    state.profile = runtime["profile"]
+    state.base_precision = runtime["base_precision"]
     state.branch_execution = runtime["branch_execution"]
+
     cloned = model.clone()
     try:
         if runtime["branch_execution"] == "parallel":
@@ -487,10 +536,12 @@ def apply_checkpoint(
         raise
 
     _LOG.info(
-        "VDN-H3 %s applied: profile=%s branch=%s execution=%s lora=%s attention=%s kernel=%s "
-        "compile=%s tile_frames=%d pin=%s projection=%s; %d blocks, %.2f GiB branch; adapters %s",
+        "VDN-H3 %s applied: profile=%s base=%s branch=%s execution=%s lora=%s attention=%s "
+        "kernel=%s compile=%s tile_frames=%d pin=%s projection=%s block_fusion=%s; "
+        "%d blocks, %.2f GiB branch; adapters %s",
         checkpoint_name,
         runtime["profile"],
+        runtime["base_precision"],
         runtime["branch_mode"],
         runtime["branch_execution"],
         runtime["lora_mode"],
@@ -500,6 +551,7 @@ def apply_checkpoint(
         runtime["tile_frames"],
         runtime["pin_strategy"],
         runtime["projection_precision"],
+        runtime["block_fusion"],
         len(blocks),
         state.weight_store.nbytes / 1024**3,
         ", ".join(reports),
@@ -550,8 +602,8 @@ class KireiApplyVDNH3:
     FUNCTION = "apply"
     CATEGORY = "model_patches/video"
     DESCRIPTION = (
-        "Apply VideoDeltaNet H3 with automatic workstation/consumer memory policy, "
-        "factorized adapters and calibrated attention dispatch."
+        "Apply VideoDeltaNet H3 with native-precision projection, optimized branch "
+        "execution, factorized/merged adapters and calibrated attention dispatch."
     )
 
     def apply(
@@ -647,11 +699,6 @@ class KireiReleaseVDNH3Weights:
         if not isinstance(state, VDNState):
             raise RuntimeError("the supplied MODEL does not carry VDN-H3 state")
         state.release()
-        try:
-            from .parallel import release_parallel_contexts
-            release_parallel_contexts(state)
-        except Exception:
-            pass
         return (model,)
 
 

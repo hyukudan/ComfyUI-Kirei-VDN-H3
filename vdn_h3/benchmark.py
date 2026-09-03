@@ -173,12 +173,12 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
     if base_precision in {"int8", "fp8"} and precision == "bf16":
         recommendations.append(
             f"The H3 backbone is {base_precision} but the dominant VDN projection is BF16; "
-            "match the VDN projection to the native backbone precision."
+            "benchmark native-precision VDN separately rather than assuming it is faster."
         )
     if precision == "bf16" and linear_ms > 0 and linear_ms >= max(softmax_ms * 0.65, 1.0):
         recommendations.append(
             "The VDN linear branch is a large share of runtime and its projection is BF16; "
-            "use a supported native INT8/ConvRot or FP8 projection profile."
+            "benchmark a supported INT8/ConvRot or FP8 projection as a separate quality-gated path."
         )
     if attention == "grouped" and calibration_hit is None:
         recommendations.append(
@@ -194,7 +194,7 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
     ):
         recommendations.append(
             "The branch is resident on a large-VRAM GPU but still serial; parallel branch execution "
-            "can overlap exact VDN recurrence/projection with local softmax."
+            "is an experimental benchmark candidate, not an assumed optimization."
         )
     if transfer_ms > max(linear_ms * 0.15, 2.0):
         recommendations.append(
@@ -203,13 +203,14 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
     if getattr(state, "block_fusion_error", None):
         recommendations.append(
             "The H3 block pointwise fusion fell back to native ComfyUI; inspect block_fusion_error "
-            "before comparing against the fully tuned upstream path."
+            "before comparing against the fully tuned path."
         )
     declared_steps = _checkpoint_recipe(state).get("turbo_num_steps")
     if declared_steps is not None:
         recommendations.append(
-            f"Checkpoint declares turbo_num_steps={declared_steps}; benchmark Turbo/VDN with that "
-            "step recipe unless intentionally running a diagnostic ablation."
+            f"This VDN checkpoint declares turbo_num_steps={declared_steps}; benchmark the Stage-DMD "
+            "VDN path at that NFE unless intentionally running an ablation. Conventional external "
+            "MiniMax-H3 Turbo has its own 4-step recipe and must not be forced to match this value."
         )
 
     return {
@@ -233,9 +234,7 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
 
 def runtime_snapshot(model_patcher: Any) -> dict:
     """Return resolved runtime, fallback state and diagnostics without mutation."""
-    state = getattr(model_patcher, "object_patches", {}).get(
-        "diffusion_model._vdn_h3_state"
-    )
+    state = getattr(model_patcher, "object_patches", {}).get("diffusion_model._vdn_h3_state")
     if state is None:
         raise RuntimeError("MODEL does not carry Kirei VDN-H3 state")
     broken = dict(getattr(getattr(state, "window_cache", None), "_broken", {}) or {})

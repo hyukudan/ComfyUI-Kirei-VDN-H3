@@ -82,6 +82,32 @@ def _projection_info(state):
     return data
 
 
+def _layout_snapshot(state):
+    layout = getattr(state, "last_layout", None)
+    if layout is None:
+        return {}
+    names = (
+        "seq_len",
+        "num_frames",
+        "tokens_per_frame",
+        "video_start",
+        "video_end",
+        "text_start",
+        "text_len",
+        "frame_size",
+        "anchor_frames",
+        "full_cover",
+    )
+    result = {}
+    for name in names:
+        value = getattr(layout, name, None)
+        if isinstance(value, tuple):
+            value = list(value)
+        if value is not None:
+            result[name] = value
+    return result
+
+
 def _stage_total(stages: dict, name: str) -> float:
     value = stages.get(name)
     if not isinstance(value, dict):
@@ -93,7 +119,6 @@ def _stage_total(stages: dict, name: str) -> float:
 
 
 def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict) -> dict:
-    """Summarize the timing split without pretending overlapping stages are additive."""
     stages = diagnostics.get("stages", {}) if isinstance(diagnostics, dict) else {}
     softmax_ms = _stage_total(stages, "attention.softmax")
     linear_serial_ms = _stage_total(stages, "attention.linear_branch")
@@ -104,8 +129,6 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
     join_ms = _stage_total(stages, "parallel.join")
     forward_ms = _stage_total(stages, "forward.total")
 
-    # Sort only top-level scopes useful to a human profiler. Internal linear.* scopes
-    # intentionally overlap their parent and therefore must not be summed together.
     ranked = []
     for name, item in stages.items():
         if not isinstance(item, dict) or name.startswith("linear."):
@@ -118,18 +141,24 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
 
     recommendations = []
     precision = projection.get("precision", "bf16")
+    base_precision = getattr(state, "base_precision", "bf16")
     execution = getattr(state, "branch_execution", "serial")
     attention = getattr(state, "last_attention_backend", None)
     calibration_hit = getattr(getattr(state, "window_cache", None), "last_calibration_hit", None)
+    if base_precision in {"int8", "fp8"} and precision == "bf16":
+        recommendations.append(
+            f"The H3 backbone is {base_precision} but the dominant VDN projection is BF16; "
+            "match the VDN projection to the native backbone precision."
+        )
     if precision == "bf16" and linear_ms > 0 and linear_ms >= max(softmax_ms * 0.65, 1.0):
         recommendations.append(
-            "The VDN linear branch is a large share of runtime while to_out_linear is BF16; "
-            "benchmark the explicit workstation_fp8 profile on a large-VRAM GPU."
+            "The VDN linear branch is a large share of runtime and its projection is BF16; "
+            "use a supported native INT8/ConvRot or FP8 projection profile."
         )
     if attention == "grouped" and calibration_hit is None:
         recommendations.append(
-            "Grouped attention is running without a calibration hit; benchmark grouped/Flex/FA2/FA4 "
-            "for the exact render geometry before assuming grouped is fastest."
+            "Grouped attention is running without a calibration hit; let auto benchmark the exact "
+            "grouped/Flex/FA2/FA4 geometry before treating grouped as the steady-state winner."
         )
     if (
         execution == "serial"
@@ -139,12 +168,17 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
         and linear_ms > 0
     ):
         recommendations.append(
-            "The branch is resident on a large-VRAM GPU but still serial; branch_execution=parallel can "
-            "overlap exact VDN recurrence/projection with local softmax at the cost of extra raw Q/K/V VRAM."
+            "The branch is resident on a large-VRAM GPU but still serial; parallel branch execution "
+            "can overlap exact VDN recurrence/projection with local softmax."
         )
     if transfer_ms > max(linear_ms * 0.15, 2.0):
         recommendations.append(
-            "Branch H2D transfer time is visible in the profile; prefer resident or hybrid placement if VRAM allows."
+            "Branch H2D transfer time is visible; prefer resident or hybrid placement if VRAM allows."
+        )
+    if getattr(state, "block_fusion_error", None):
+        recommendations.append(
+            "The H3 block pointwise fusion fell back to native ComfyUI; inspect block_fusion_error "
+            "before comparing against the fully tuned upstream path."
         )
 
     return {
@@ -156,12 +190,12 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
         "parallel_join_total_ms": join_ms,
         "linear_to_softmax_ratio": (linear_ms / softmax_ms) if softmax_ms > 0 else None,
         "top_level_stages": [
-            {"name": name, "total_ms": elapsed} for name, elapsed in ranked[:10]
+            {"name": name, "total_ms": elapsed} for name, elapsed in ranked[:12]
         ],
         "recommendations": recommendations,
         "note": (
-            "CUDA stage totals on different streams may overlap. Compare them to locate bottlenecks; "
-            "do not add parallel-stage totals to estimate wall time."
+            "CUDA stage totals on different streams may overlap. Use them to locate bottlenecks; "
+            "do not sum parallel-stage totals to estimate wall time."
         ),
     }
 
@@ -182,18 +216,24 @@ def runtime_snapshot(model_patcher: Any) -> dict:
     cuda = _cuda_snapshot(model_patcher)
     return {
         "checkpoint": state.name,
+        "profile": getattr(state, "profile", None),
         "forwards": int(state.forwards),
+        "base_precision": getattr(state, "base_precision", "bf16"),
         "branch_mode": state.weight_mode,
         "branch_execution": getattr(state, "branch_execution", "serial"),
+        "block_fusion": bool(getattr(state, "block_fusion", False)),
+        "block_fusion_error": getattr(state, "block_fusion_error", None),
         "branch_bytes": branch_bytes,
         "branch_gib": branch_bytes / 1024**3,
         "branch_storage": state.weight_store.telemetry(),
+        "last_layout": _layout_snapshot(state),
         "attention_requested": state.attention_backend,
         "attention_last": state.last_attention_backend,
         "attention_failures": broken,
         "attention_calibration": {
             **calibration_snapshot,
             "last_hit": getattr(state.window_cache, "last_calibration_hit", None),
+            "last_autotune_error": getattr(state.window_cache, "last_autotune_error", None),
         },
         "kernel_backend": getattr(state, "kernel_backend", state.linear_kernels),
         "compile_policy": getattr(state, "compile_policy", "off"),

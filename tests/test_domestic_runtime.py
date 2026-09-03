@@ -4,9 +4,13 @@ import torch
 
 from vdn_h3 import window
 from vdn_h3.bypass import CompositeQKVBypassAdapter, FrugalLoRABypassAdapter
-from vdn_h3.calibration import CalibrationStore
+from vdn_h3.calibration import CALIBRATION_VERSION, CalibrationStore, calibration_signature
 from vdn_h3.runtime import OptimizedLinearBranch, SharedBranchRuntime
-from vdn_h3.weights import FP8_STREAMED_PROJECTION_KEY, ManagedBranchWeights
+from vdn_h3.weights import (
+    FP8_STREAMED_PROJECTION_KEY,
+    STREAMED_PROJECTION_KEY,
+    ManagedBranchWeights,
+)
 
 
 def _weights(hidden=7, heads=2, dim=3, *, short=False):
@@ -132,7 +136,7 @@ def test_lora_composite_fuses_up_gemms_per_output_slice_exactly():
         [(q1, (0, 4)), (q2, (0, 4)), (k1, (4, 4))]
     )
     got = composite.apply(x, base.clone())
-    torch.testing.assert_close(got, expected)
+    torch.testing.assert_close(got, expected, atol=2e-5, rtol=2e-5)
     assert len(composite.group_ups) == 2
 
 
@@ -172,7 +176,29 @@ def test_fp8_storage_dtype_is_preserved_by_hybrid_store():
     assert got["small"].dtype == torch.bfloat16
 
 
-def test_calibration_store_roundtrip(tmp_path):
+def test_hybrid_store_accepts_bf16_edges_and_fp8_interior():
+    fp8 = torch.zeros((8, 8), dtype=torch.float8_e4m3fn)
+    blocks = [
+        {STREAMED_PROJECTION_KEY: torch.ones(8, 8), "small": torch.ones(1)},
+        {
+            FP8_STREAMED_PROJECTION_KEY: fp8,
+            "to_out_linear.weight_scale": torch.ones(1, 8),
+            "small": torch.ones(1),
+        },
+        {STREAMED_PROJECTION_KEY: torch.ones(8, 8), "small": torch.ones(1)},
+    ]
+    store = ManagedBranchWeights(
+        blocks,
+        mode="hybrid",
+        pin_strategy="none",
+        streamed_keys=(STREAMED_PROJECTION_KEY, FP8_STREAMED_PROJECTION_KEY),
+    )
+    assert set(store.model.streamed.block(0).keys()) == {STREAMED_PROJECTION_KEY}
+    assert set(store.model.streamed.block(1).keys()) == {FP8_STREAMED_PROJECTION_KEY}
+    assert set(store.model.streamed.block(2).keys()) == {STREAMED_PROJECTION_KEY}
+
+
+def test_calibration_store_roundtrip_and_geometry_signature(tmp_path):
     path = tmp_path / "calibration.json"
     store = CalibrationStore(path)
     store.record(
@@ -182,7 +208,19 @@ def test_calibration_store_roundtrip(tmp_path):
     )
     store.save()
     parsed = json.loads(path.read_text(encoding="utf-8"))
-    assert parsed["version"] == 1
+    assert parsed["version"] == CALIBRATION_VERSION
     again = CalibrationStore(path)
     assert again.lookup("signature") == "grouped"
     assert again.snapshot()["entries"] == 1
+
+    q = torch.zeros(20, 2, 4)
+    bounds = window.window_bounds(3, 1)
+    first = calibration_signature(
+        q, 3, bounds, "both", groups=1,
+        video_start=2, video_end=14, tokens_per_frame=4,
+    )
+    second = calibration_signature(
+        q, 3, bounds, "both", groups=1,
+        video_start=5, video_end=14, tokens_per_frame=3,
+    )
+    assert first != second

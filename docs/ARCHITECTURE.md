@@ -1,176 +1,180 @@
 # VDN-H3 runtime architecture
 
-This document describes the current runtime as a product architecture. It focuses on
-mathematical invariants, tensor lifetime, memory placement and backend contracts.
+This document describes the current Kirei VDN-H3 runtime as an implementation contract:
+mathematical invariants, tensor lifetime, memory placement, adapter handling, exact
+attention and backend policy.
+
+---
 
 ## 1. Integration boundary
 
-The project patches ComfyUI's native MiniMax-H3 model rather than loading an independent
-Diffusers transformer.
+Kirei patches ComfyUI's native MiniMax-H3 model rather than loading a parallel Diffusers
+transformer.
 
-Reused from ComfyUI:
+Reused from current ComfyUI:
 
-- H3 base checkpoint and quantized loaders;
-- fused native QKV projection;
-- Q/K normalization and RoPE;
-- output projection;
-- text/audio/video packed layout;
-- sampler and conditioning;
-- VAE/audio pipeline;
-- model load/offload lifecycle.
+- H3 checkpoint and quantized loaders;
+- packed text/audio/video model layout;
+- native fused QKV projection;
+- Q/K RMSNorm + RoPE kernels;
+- native output projection and MLP paths;
+- ModelPatcher load/offload/requantization lifecycle;
+- model sampling / audio-video shift handling;
+- VAE/audio/conditioning pipeline.
 
-Added by this project:
+Added by Kirei:
 
-- VDN local-window attention semantics;
-- bidirectional linear recurrent branch;
-- softmax/output gates;
-- VDN branch checkpoint storage;
-- Diffusers-to-native LoRA target conversion;
-- pruned AdaLN curve injection;
-- memory/attention/kernel policies.
+- released VDN local-window semantics;
+- bidirectional recurrent linear branch;
+- softmax/linear gates;
+- VDN branch storage and placement policies;
+- upstream-to-native adapter conversion;
+- factorized adapter runtime / resident merge policy;
+- pruned AdaLN curve reinjection;
+- exact attention backends and calibration;
+- temporal/frame-statistics kernels;
+- block pointwise fusion;
+- profiling and recipe-aware benchmark infrastructure.
 
 No ComfyUI core file is modified.
+
+The benchmark infrastructure owns sampler/sigmas when measuring canonical release
+recipes, but normal model application deliberately remains independent from the user's
+sampler graph.
 
 ---
 
 ## 2. Mathematical contract
 
-For a frame `t`, after the checkpoint's feature transforms:
+For one latent video frame after the trained K/V feature transform:
 
 ```text
 A_t = K_t^T diag(beta_t) K_t
 B_t = V_t^T diag(beta_t) K_t
 ```
 
-The VDN solve produces a per-frame affine recurrence pair. The implementation retains
-the released `vdn_solve` Cholesky formulation and executes forward and reverse scans.
+The released `vdn_solve` transition is built around the SPD system `I + A_t`. Kirei
+retains the Cholesky-based formulation and runs one recurrence forward and one backward.
 
-The branch readout for a frame gathers recurrent state representing context outside the
-frame's local softmax window.
+The linear readout for frame `t` gathers recurrent state corresponding to context outside
+that frame's local-softmax coverage.
 
-The following values remain FP32 even when the H3 compute path is BF16:
+Precision-sensitive values remain FP32 even when H3 compute is BF16:
 
 - `alpha.A_log`;
 - `alpha.dt_bias`;
-- frame-statistic matrix A;
-- Cholesky factorization / inverse construction;
-- recurrence state banks.
+- A statistics;
+- Cholesky/inverse construction;
+- recurrent state banks.
 
-The local softmax path remains an exact attention operation unless an explicitly chosen
-compatibility/experimental backend says otherwise.
+### Released structural invariants
 
-### Anchor handling
+Checkpoint-declared values are authoritative. The released lineage includes:
 
-The trained first/last dense anchors are represented in two ways:
+- `chunk=5`;
+- `radius=1`;
+- anchor mode `both`;
+- `vdn_solve`;
+- alpha bridge;
+- K/V short convolution;
+- text-state initialization;
+- softmax and linear gates;
+- `a_fp32=true`.
 
-- local attention gives them the configured dense row/column behavior;
-- the linear branch skips their output rows when the trained mode is `both`.
-
-The optimized path removes those rows before the large output projection rather than
-projecting zeros.
+The current native port shares raw H3 Q/K/V with the VDN branch. Therefore released
+`linear_head_dim` must equal H3 attention `head_dim` (128 on the published geometry).
+Different state size requires a separately trained checkpoint.
 
 ---
 
 ## 3. Packed layout
 
-ComfyUI's `PackedLayout` is adapted into an immutable `VDNLayout` published through a
-`ContextVar` for one diffusion-model forward.
+ComfyUI's packed H3 request is translated into an immutable `VDNLayout` and published
+for one diffusion-model forward through a `ContextVar`.
 
-The layout records:
+It records:
 
-- packed sequence length;
+- total packed sequence length;
 - video start/end rows;
 - latent frame count;
 - tokens per frame;
-- spatial token grid;
+- spatial frame grid;
 - text segment;
-- exact frame window bounds;
-- full-cover flag;
-- anchor mode.
+- exact per-frame window bounds;
+- anchor mode;
+- full-cover status.
 
-The request-local `ContextVar` prevents layout state from leaking between nested or
-concurrent model executions.
+Request-local publication avoids leaking layout state between nested/concurrent forwards.
 
 ---
 
 ## 4. Attention dataflow
 
-### Inference path
+### Tuned serial inference
 
 ```text
 x
 │
 ├─ native fused qkv_proj
 │      │
-│      ├─ raw Q/K/V views ─────────────────────────────┐
-│      │                                                │
-│      │                         VDN linear branch      │
-│      │                         ├─ stats / scan        │
-│      │                         ├─ gather / gate       │
-│      │                         └─ output projection   │
-│      │                                                │
-│      └─ native Q/K norm + RoPE                        │
-│                │                                      │
-│                └─ local softmax ── softmax gate       │
-│                                   └─ H3 out_proj       │
-│                                                          
-└─────────────────────────────────────────────── add linear delta
+│      ├─ raw Q/K/V views ─────── VDN branch ───── projected linear delta
+│      │
+│      └─ Q/K norm + RoPE ─────── local exact softmax ───── H3 out_proj
+│                                                        │
+└────────────────────────────────────────────────────────┴── add VDN delta
 ```
 
-The important ordering is that the linear branch consumes raw Q/K/V **before** the
-native in-place inference RMSNorm+RoPE mutates Q/K storage.
-
-Once the projected linear delta has been produced, only that H3-hidden-size tensor must
-survive through softmax. Complete raw video Q/K/V copies are not needed.
+The linear branch runs before native in-place Q/K normalization/RoPE. Once the branch is
+projected into H3 hidden size, raw video Q/K/V no longer need to remain live through
+softmax.
 
 ### Reference/autograd path
 
-The reference path deliberately remains conservative:
+The reference path remains intentionally conservative:
 
-- compact raw video/text Q/K/V copies are made;
-- native attention runs;
-- the autograd-safe list/stack recurrence is used;
-- no inference-only in-place scan buffers are required.
-
-This separates correctness/reference semantics from memory optimization.
+- compact raw video/text copies are allowed;
+- exact grouped SDPA is used;
+- reference recurrence is autograd-safe;
+- quantized VDN projection is disabled;
+- inference-only block fusion/shortcuts are disabled.
 
 ---
 
 ## 5. Linear branch execution
 
-### Untiled inference
+### Untiled
 
-1. Build Q/K/V features.
-2. Form alpha, A and B for all frames.
-3. Run shared preallocated forward/reverse scans.
-4. Gather complementary state for all frames.
-5. Apply output gate and RMSNorm.
-6. Project only non-anchor rows.
+1. prepare Q/K/V features;
+2. compute beta, alpha, A and B;
+3. factor transitions in batch;
+4. fill preallocated prefix/suffix banks;
+5. gather complementary state;
+6. read out and apply RMSNorm/output gate;
+7. project only rows that can have non-zero VDN contribution.
 
-### Tiled inference
+### Tiled
 
-Tiling changes feature materialization but not the recurrence.
+Tiling changes activation materialization, not the recurrence.
 
 #### Statistics pass
 
-For each frame tile:
+For each K/V tile plus the required two-frame temporal halo:
 
 ```text
-K/V raw tile + temporal halo
- -> optional spatial depthwise conv
- -> 5-tap temporal conv
- -> SiLU / L2 normalization
+raw K/V
+ -> optional depthwise spatial conv
+ -> exact 5-tap temporal conv
+ -> SiLU / L2Norm
  -> beta
- -> A/B statistics
+ -> A/B
 ```
 
-Temporal halo is two frames on each side for the 5-tap kernel. The halo is feature
-context only; only the tile's center-frame statistics are retained.
+Only center-frame statistics are retained.
 
-#### Scan
+#### Global scan
 
-All per-frame A/B/alpha statistics are now compact. The exact bidirectional scan runs
-once across the complete frame sequence.
+After all compact frame statistics exist, the complete bidirectional recurrence runs
+across the sequence.
 
 #### Readout pass
 
@@ -178,267 +182,342 @@ For each Q/x tile:
 
 ```text
 Q feature
- -> gather prefix/suffix state for the tile's frame range
- -> matrix readout
- -> output gate / RMSNorm
- -> to_out_linear
- -> write final delta slice
+ -> complementary-state gather
+ -> readout
+ -> RMSNorm/output gate
+ -> BF16/INT8/FP8 to_out_linear
+ -> output slice
 ```
 
-Tiling therefore removes complete prepared Q/K/V, gate and readout tensors from the
-long-lived working set.
+This removes full prepared Q/K/V, gate and readout tensors from the long-lived working
+set.
 
 ---
 
-## 6. Shared runtime caches
+## 6. Recurrence design
 
-One `SharedBranchRuntime` belongs to one `VDNState` and is reused by all transformed
-DiT blocks.
+The tuned scan keeps the same strategy as the optimized OpenVDN inference path:
 
-It owns:
+- transition/injection factorization outside the dependent recurrence;
+- preallocated prefix/suffix state banks;
+- one `torch.baddbmm(..., out=...)` per frame and direction;
+- no GPU `.item()` synchronization in the loop.
 
-- gather-index cache;
-- static compiled-operation cache;
-- temporal kernel cache;
-- delta-backend cache.
+The dependent scan is deliberately **not** compiled as one huge Inductor graph. At the
+released 128-dimensional state, the recurrence is launch-bound and serial; a giant
+compiled graph increases startup/specialization complexity without an established
+steady-state win.
 
-This prevents 50 blocks from independently building equivalent compiler wrappers and
-shape caches.
-
-### Compile policy
-
-`SharedCompilerCache` uses static `torch.compile(dynamic=False)` callables and latches
-compile/runtime failures per operation/shape.
-
-Policies:
-
-- `off`;
-- `shared`;
-- `reduce_overhead`;
-- `max_autotune`.
-
-The scan compile path is an optimization only. Failure returns to the same preallocated
-`baddbmm(..., out=...)` recurrence.
+Associative/prefix-scan reformulations remain research experiments because they trade
+serial launches for additional matrix products and temporary storage.
 
 ---
 
-## 7. Temporal/spatial features
+## 7. Shared runtime caches
 
-Spatial short convolution remains PyTorch depthwise Conv2d so cuDNN can choose its
-native implementation.
+One `SharedBranchRuntime` belongs to one patched `VDNState` and is reused by all 50 H3
+blocks.
 
-Temporal short convolution dispatches through:
+It owns/reuses:
 
-1. Triton fused 5-tap conv + SiLU + optional L2Norm;
-2. compile spelling when requested/available;
-3. grouped depthwise Conv1d;
-4. eager shift reference.
+- gather indices;
+- compiled static operations;
+- temporal-kernel dispatch state;
+- failure latches.
 
-The optimized kernels can write directly as:
+The attention cache separately owns:
+
+- grouped/Flex mask data;
+- decomposed varlen plans;
+- Flex compiled call;
+- persistent calibration lookup;
+- backend failure latches.
+
+This prevents equivalent compiler wrappers/plans from being recreated 50 times.
+
+---
+
+## 8. Temporal and frame-statistics kernels
+
+Spatial short convolution stays on depthwise Conv2d so cuDNN can select its native
+kernel.
+
+Temporal short convolution dispatches through an exact fused Triton implementation of:
+
+```text
+5-tap temporal depthwise conv -> SiLU -> optional L2Norm
+```
+
+with exact Conv1d/eager fallbacks.
+
+Optimized feature output can be written directly as:
 
 ```text
 [F, H, S, D]
 ```
 
-for frame-statistic consumption, avoiding a complete post-kernel repack.
+which is the layout consumed by frame-statistics GEMMs.
+
+The shared frame-statistics prologue:
+
+- creates contiguous K in the needed layout;
+- forms K/A in FP32;
+- applies beta weighting;
+- scopes TF32 only around the A GEMM during inference;
+- symmetrizes A;
+- computes B and promotes recurrent values to FP32.
+
+Cholesky/recurrence are outside autocast.
 
 ---
 
-## 8. Branch weight memory
+## 9. Branch weight memory
 
-Branch storage is represented by real non-trainable `nn.Parameter` trees and attached
-to the base ModelPatcher through ComfyUI additional models.
+VDN branch weights are represented as real non-trainable module parameters and attached
+through Comfy additional ModelPatchers.
 
 ### Resident
 
-All branch weights load/offload through ComfyUI.
+All branch weights participate in Comfy load/offload accounting on GPU.
 
 ### Stream
 
-All branch weights remain CPU masters. Two CUDA buffers are reused.
+CPU masters feed two reusable CUDA staging slots.
 
 ### Hybrid
 
-Each block is partitioned into:
+Small branch tensors remain resident while the dominant output projection representation
+is streamed.
 
-- resident small branch tensors;
-- one streamable dominant projection representation.
+### Slot correctness
 
-The streamable representation may differ by block. This matters for the FP8 profile:
+A slot tracks independently:
 
-- edge blocks stream canonical BF16 `to_out_linear.weight`;
-- interior blocks stream `to_out_linear.weight_fp8`;
-- FP32 scale tensors are small and resident.
-
-### Streaming correctness
-
-A stream slot tracks independently:
-
-- allocated GPU buffers;
+- allocated buffers;
 - current block identity;
-- `valid_keys` for that block;
-- reusable `ready` event;
-- reusable `consumed` event.
+- `valid_keys` for that identity;
+- ready event;
+- consumed event.
 
-Switching blocks clears validity even if buffers with the same names/shapes are still
-allocated. This prevents a partial gate-only load from making stale tensors appear valid
-for a later full-block request.
+Changing block identity invalidates contents even when same-shaped buffers remain
+allocated. Allocation is never treated as proof of valid data.
 
-### Prefetch schedule
+### Prefetch
 
-- current block can be scheduled before native QKV;
-- N+1 is scheduled while N computes;
-- block 0 can be scheduled after block 49 for the next denoising step.
-
-Pinned memory respects ComfyUI's policy unless `pin_strategy=all` is explicitly chosen.
+- N+1 can be scheduled while N computes;
+- the last block can prefetch block 0 for the next NFE;
+- pinned memory respects Comfy's policy unless explicitly overridden.
 
 ---
 
-## 9. Adapter runtime
+## 10. Adapter runtime
 
-### Target mapping
+### Target conversion
 
-Upstream Diffusers names are mapped to native H3 names, including:
+Upstream adapter names are mapped to native H3, including:
 
-- transformer block prefix conversion;
+- block prefix conversion;
 - fused Q/K/V slices;
-- text refiner blocks;
-- SwiGLU half ordering;
+- text refiner;
+- SwiGLU half swap;
+- native `mlp.fc2` exception;
 - final/pruned AdaLN targets.
 
-### Factorized bypass
+PEFT `alpha/rank` scaling and mixed ranks are preserved.
 
-For each native module, all LoRA A/down matrices are concatenated into one down
-projection.
+### Composite low-rank bypass
 
-Terms are then grouped by output slice. Within a group, scaled B/up matrices are
-concatenated column-wise, so:
+All A/down terms targeting one native module are concatenated into one down projection.
+Terms sharing an output slice concatenate scaled B/up matrices column-wise:
 
 ```text
 [B1*s1 | B2*s2] @ [A1(x); A2(x)]
-== B1 A1(x) s1 + B2 A2(x) s2
+ = B1 A1(x) s1 + B2 A2(x) s2
 ```
 
-This produces one up GEMM per slice with the exact same low-rank model.
+Default+turbo fused QKV therefore needs one shared down GEMM and one up GEMM per Q/K/V
+slice instead of independent pairs for every adapter term.
 
-### Fused fc2 exception
+### Merge exception
 
-Native H3 can consume `mlp.fc2` through fused `linear_input_act` without invoking
-`fc2.forward`. Those factors cannot be implemented as an activation bypass and are
-therefore sent through native factorized merge.
+Native H3 may consume `mlp.fc2` through `linear_input_act` without calling its ordinary
+`forward`. Such factors must use the native weight patch path rather than an activation
+hook.
 
----
+### Runtime recipe metadata
 
-## 10. AdaLN curve factors
-
-Pruned curve factors are stored as another Comfy auxiliary model.
-
-The e-grid search order is:
-
-1. explicit path;
-2. checkpoint root;
-3. checkpoint `linear_branch` directory;
-4. checkpoint parent;
-5. configured VDN model roots;
-6. legacy sibling-node location.
-
-This allows new checkpoints to be self-contained while preserving old installations.
-
----
-
-## 11. Attention implementations
-
-### Grouped SDPA
-
-Frames with identical allowed-key sets are represented as contiguous query runs. Each
-run performs one exact dense SDPA against the selected global/video keys.
-
-### FlexAttention
-
-The exact mask is represented as a cached block mask. The compiled Flex call is model-
-owned and failures are latched.
-
-### Decomposed varlen attention
-
-A cached plan partitions query rows into:
-
-- dense globals / dense anchor rows;
-- local window groups.
-
-Dense rows use exact SDPA. Local groups are gathered into varlen batches and dispatched
-to:
-
-- FA2 (`flash2`), or
-- CuTe/FA4 (`decomposed`).
-
-The final output is scattered back to packed-row order.
-
-### Calibration
-
-`auto` checks a persistent calibration key before generic heuristics. The key contains
-both hardware/software identity and exact packed video geometry.
-
-No calibration benchmark runs during ordinary inference.
-
----
-
-## 12. Experimental FP8 projection
-
-Only the large linear-branch output projection is quantized.
-
-### Storage
-
-Interior block CPU master:
+After successful application `VDNState` records:
 
 ```text
-weight_fp8 + weight_scale_fp32
+adapters.active
+adapters.strengths
+adapters.lora_mode
+adapters.reports
 ```
 
-There is no hidden BF16 copy of that interior projection in the branch store.
-
-### Edge blocks
-
-By default first/last 4 transformed blocks retain BF16 projection weights.
-
-### Scaling
-
-- Blackwell-class: per-tensor activation and weight scale;
-- earlier supported path: rowwise activation scale + per-output-channel weight scale.
-
-### Dispatch
-
-1. actual-device `_scaled_mm` capability probe before model construction;
-2. FP8 activation quantization;
-3. `_scaled_mm`;
-4. if a particular shape/kernel fails, dequantize the already-quantized weight and use
-   ordinary F.linear rather than aborting the render.
-
-Under grad-enabled execution the dequantized F.linear spelling is used directly.
-
-FP8 is never selected silently by ordinary profiles.
+The benchmark recorder uses this metadata to enforce Stage-DMD `default=1 + turbo=1` and
+Stage-B `default=1`.
 
 ---
 
-## 13. Diagnostics
+## 11. Pruned / curve AdaLN
 
-CUDA stage timing uses recorded start/end events rather than synchronizing around every
-scope. Events are resolved together when a report is requested.
+Curve-mode H3 may collapse `adaln_proj.linear` onto a small shared coordinate basis.
+Detection uses either:
 
-Branch streaming maintains counters for H2D bytes, copies, prefetches, served requests,
-wait events, pinned CPU memory and allocated staging buffers.
+1. `use_adaln_curves`, or
+2. a structurally small input width on the first block's AdaLN projection.
 
-Diagnostics are observational only; they do not change backend selection except when an
-explicit calibration node is run and its result is persisted.
+The structural check handles converted checkpoints whose flag is missing/unreliable.
+
+Curve LoRA terms are **not skipped** in merge-oriented profiles. They remain a distinct
+runtime curve category and are re-injected using:
+
+- the model's `adaln_t_table`;
+- `h3_silu_temb_grid.safetensors`;
+- the original low-rank factors.
+
+The e-grid search prefers checkpoint-local/model-root locations and retains the legacy
+MiniMax-H3-Turbo sibling path only as a fallback.
 
 ---
 
-## 14. Single-GPU lifecycle
+## 12. Exact local attention
 
-Auxiliary branch/LoRA/curve models use ComfyUI load/offload accounting.
+VDN local windows are exact attention in normal/reference paths.
 
-A patched VDN model currently represents one compute device. `deepclone_multigpu` is
-rejected by the auxiliary factory because shallowly copied runtime closures/caches would
-not constitute a valid distributed VDN model.
+### Grouped exact SDPA
 
-A true Ulysses/distributed implementation needs explicit sharding/communication logic
-and is intentionally outside this runtime contract.
+Frames with identical allowed key sets become contiguous query runs. Each run performs
+one exact SDPA against its selected global/video keys.
+
+When available, Kirei calls `comfy.ops.scaled_dot_product_attention`. This preserves
+exact numerics while allowing current ComfyUI to prioritize the platform's exact
+PyTorch backend:
+
+```text
+Flash -> cuDNN -> efficient -> math
+```
+
+The grouped/reference path does **not** pass `transformer_options` into Comfy's
+`optimized_attention`, so Sage/kitchen quantized overrides cannot silently modify the
+trained VDN local window.
+
+`compat` is the explicit exception and exists for compatibility experiments.
+
+### Flex
+
+The exact pattern is represented by a cached block mask and a model-owned compiled Flex
+call.
+
+### FA2 / FA4 decomposition
+
+A cached plan separates:
+
+- dense global/anchor rows;
+- local window groups.
+
+Local groups run through varlen FA2 (`flash2`) or CuTe/FA4 (`decomposed`) and scatter back
+to packed row order. Dense rows remain exact SDPA.
+
+### Auto calibration
+
+`auto` checks a persistent calibration signature before heuristics. The signature
+contains GPU/software identity and exact packed geometry. Only exact candidates that pass
+parity against the grouped oracle can win.
+
+---
+
+## 13. Projection precision
+
+The dominant VDN output projection can be:
+
+```text
+bf16 | int8 | fp8
+```
+
+### INT8 / ConvRot
+
+Uses current Comfy quantized-tensor / comfy-kitchen execution where supported. Recurrent
+state and narrow/sensitive VDN operations stay BF16/FP32.
+
+### FP8
+
+Stores an actual quantized projection representation plus scale; it does not retain a
+hidden BF16 duplicate for quantized interior blocks. Actual-device scaled-matmul support
+is probed before installation.
+
+Precision policy may follow an explicitly selected scenario/profile or an already
+quantized base. Benchmark labels are validated against the **resolved** Runtime Report,
+so an INT8/FP8 fallback cannot be recorded under the wrong name.
+
+---
+
+## 14. H3 pointwise fusion
+
+For qualified resident inference, Kirei can compile shared block bodies for:
+
+```text
+RMSNorm + AdaLN modulation
+residual + gate * branch output
+```
+
+The same compiled shapes are reused across all 50 blocks.
+
+If a compiled body fails, block fusion is disabled/falls back to the native Comfy block
+from the original residual. There is no intentionally slower eager imitation of the
+fused path.
+
+---
+
+## 15. Parallel branch experiment
+
+The local softmax and recurrent branch are independent until their output sum. A
+large-VRAM experimental path can therefore copy compact raw Q/K/V and run the VDN branch
+on another CUDA stream.
+
+The path is exact but not assumed faster: concurrent tensor-core/attention workloads can
+compete for the same SM resources. Serial remains the control until target-device
+benchmarks prove otherwise.
+
+---
+
+## 16. Diagnostics and benchmark contract
+
+CUDA stage diagnostics use recorded events and resolve them at report time instead of
+synchronizing around every scope.
+
+The Runtime Report exposes:
+
+- checkpoint recipe;
+- adapter recipe;
+- profile/base/projection precision;
+- branch placement/execution;
+- attention/backend calibration/failures;
+- block fusion;
+- actual packed geometry;
+- branch streaming telemetry;
+- LoRA/curve storage;
+- stage timings and CUDA memory.
+
+Canonical benchmark sampling is generated from `benchmarks/scenarios.json` by
+`Kirei Benchmark Sampling`. Stage-DMD is therefore mechanically tied to:
+
+```text
+Euler / simple / 8 NFE / denoise 1.0 / shifts 12,3
+```
+
+and Stage-B to the same trajectory at 50 NFE. `Benchmark Start` requires the verified
+recipe token so a saved `res_multistep`/beta/six-step widget cannot silently contaminate
+a canonical result.
+
+---
+
+## 17. Single-GPU lifecycle
+
+Branch, LoRA and curve auxiliaries use Comfy load/offload accounting.
+
+A patched VDN runtime represents one selected compute GPU. MultiGPU shallow cloning is
+rejected because copied Python closures/caches would not constitute a valid distributed
+VDN execution. A real Ulysses/distributed port requires explicit sharding and
+communication logic.

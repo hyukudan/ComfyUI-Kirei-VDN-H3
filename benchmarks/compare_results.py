@@ -16,8 +16,10 @@ CORE_REQUIRED = {
     "height",
     "frames",
     "steps",
+    "sampler_name",
+    "scheduler_name",
+    "denoise",
     "seed",
-    "scheduler",
     "prompt_hash",
     "sampler_seconds",
 }
@@ -27,11 +29,15 @@ QUALITY_STATUSES = {"pending", "qualified", "failed", "diagnostic"}
 
 def _normalize(row: dict) -> dict:
     row = dict(row)
-    # v2 compatibility: old files had one comparison_group and a free-form recipe.
     row.setdefault("recipe_id", row.get("recipe", "legacy"))
     row.setdefault("product_group", None)
     row.setdefault("technical_group", row.get("comparison_group"))
-    row.setdefault("scheduler_family", row.get("scheduler", "unknown"))
+    # Historical v2/v3 rows predate verified sampling plans. They can still be
+    # summarized as diagnostics but cannot silently masquerade as the new recipe.
+    row.setdefault("sampler_name", row.get("sampler", "legacy_unknown"))
+    row.setdefault("scheduler_name", row.get("scheduler", "legacy_unknown"))
+    row.setdefault("denoise", 1.0)
+    row.setdefault("scheduler_family", row.get("scheduler_name", "unknown"))
     row.setdefault("video_shift", None)
     row.setdefault("audio_shift", None)
     return row
@@ -55,57 +61,50 @@ def load_jsonl(path: Path):
     return rows
 
 
+def _trajectory(row):
+    return (
+        int(row["steps"]),
+        str(row["sampler_name"]),
+        str(row["scheduler_name"]),
+        float(row["denoise"]),
+        str(row["scheduler_family"]),
+        row.get("video_shift"),
+        row.get("audio_shift"),
+    )
+
+
 def scenario_invariant(row):
     """Fields that must never vary between repeated runs of one scenario."""
     return (
         int(row["width"]),
         int(row["height"]),
         int(row["frames"]),
-        int(row["steps"]),
+        *_trajectory(row),
         int(row["seed"]),
-        str(row["scheduler"]),
-        str(row["scheduler_family"]),
         str(row["prompt_hash"]),
         str(row["quality_target"]),
         str(row["recipe_id"]),
-        row.get("video_shift"),
-        row.get("audio_shift"),
     )
 
 
 def product_invariant(item):
-    """Same output objective; each model is allowed to use its trained NFE recipe."""
+    """Same quality objective and same denoising trajectory; recipe/model may differ."""
     row = item["representative"]
     return (
         int(row["width"]),
         int(row["height"]),
         int(row["frames"]),
+        *_trajectory(row),
         int(row["seed"]),
-        str(row["scheduler_family"]),
         str(row["prompt_hash"]),
         str(row["quality_target"]),
-        row.get("video_shift"),
-        row.get("audio_shift"),
     )
 
 
 def technical_invariant(item):
-    """Strict same-work comparison used for BF16/INT8/max-speed engineering claims."""
+    """Strict same-work comparison for VDN precision/profile engineering changes."""
     row = item["representative"]
-    return (
-        int(row["width"]),
-        int(row["height"]),
-        int(row["frames"]),
-        int(row["steps"]),
-        int(row["seed"]),
-        str(row["scheduler"]),
-        str(row["scheduler_family"]),
-        str(row["prompt_hash"]),
-        str(row["quality_target"]),
-        str(row["recipe_id"]),
-        row.get("video_shift"),
-        row.get("audio_shift"),
-    )
+    return (*product_invariant(item), str(row["recipe_id"]))
 
 
 def summarize(rows):
@@ -133,6 +132,9 @@ def summarize(rows):
             "technical_group": representative.get("technical_group"),
             "recipe_id": representative["recipe_id"],
             "steps": int(representative["steps"]),
+            "sampler_name": representative["sampler_name"],
+            "scheduler_name": representative["scheduler_name"],
+            "denoise": float(representative["denoise"]),
             "comparable": bool(representative["comparable"]),
             "quality_gate_required": bool(representative["quality_gate_required"]),
             "quality_status": str(representative["quality_status"]),
@@ -159,7 +161,8 @@ def _comparison(summary, group_field: str, invariant_fn, mode: str):
         invariants = {invariant_fn(item) for _, item in items}
         if len(invariants) != 1:
             raise ValueError(
-                f"{mode} group {group!r} mixes incompatible benchmark objectives: {sorted(invariants)}"
+                f"{mode} group {group!r} mixes incompatible geometry/sampler/scheduler/NFE/"
+                f"denoise/seed/prompt/quality objectives: {sorted(invariants)}"
             )
         ranked = sorted(items, key=lambda pair: pair[1]["sampler_median"])
         best = ranked[0][1]["sampler_median"]
@@ -169,6 +172,12 @@ def _comparison(summary, group_field: str, invariant_fn, mode: str):
         )
         out[group] = {
             "mode": mode,
+            "trajectory": {
+                "steps": ranked[0][1]["steps"],
+                "sampler_name": ranked[0][1]["sampler_name"],
+                "scheduler_name": ranked[0][1]["scheduler_name"],
+                "denoise": ranked[0][1]["denoise"],
+            },
             "speed_claim_eligible": claim_eligible,
             "quality_statuses": {scenario: item["quality_status"] for scenario, item in ranked},
             "ranking": [
@@ -176,6 +185,9 @@ def _comparison(summary, group_field: str, invariant_fn, mode: str):
                     "scenario_id": scenario,
                     "recipe_id": item["recipe_id"],
                     "steps": item["steps"],
+                    "sampler_name": item["sampler_name"],
+                    "scheduler_name": item["scheduler_name"],
+                    "denoise": item["denoise"],
                     "sampler_median": item["sampler_median"],
                     "relative_to_fastest": item["sampler_median"] / best,
                     "runs": item["runs"],
@@ -192,27 +204,22 @@ def _comparison(summary, group_field: str, invariant_fn, mode: str):
 
 
 def product_comparisons(summary):
-    return _comparison(summary, "product_group", product_invariant, "recipe_faithful_product")
+    return _comparison(summary, "product_group", product_invariant, "same_objective_product")
 
 
 def technical_comparisons(summary):
-    return _comparison(summary, "technical_group", technical_invariant, "same_nfe_technical")
+    return _comparison(summary, "technical_group", technical_invariant, "same_recipe_technical")
 
 
 def comparisons(summary):
-    """Compatibility wrapper for callers that only need both comparison classes."""
-    return {
-        "product": product_comparisons(summary),
-        "technical": technical_comparisons(summary),
-    }
+    return {"product": product_comparisons(summary), "technical": technical_comparisons(summary)}
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Summarize VDN-H3 benchmark JSONL. Product rankings compare each model at its "
-            "intended recipe (Turbo 4 NFE vs VDN-DMD 8 NFE). Technical rankings compare "
-            "VDN execution variants at identical NFE. Quality gates control speed claims."
+            "Summarize verified VDN-H3 benchmark JSONL. Comparable rows must share the exact "
+            "sampler trajectory (including Euler/simple/NFE/denoise); quality gates control claims."
         )
     )
     parser.add_argument("results", type=Path)

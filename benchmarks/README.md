@@ -1,338 +1,422 @@
 # VDN-H3 benchmark protocol
 
-The benchmark suite compares **execution paths that target the same generation objective**.
-Matching resolution and frame count is not enough: step recipe, conditioning, schedule and
-output quality target are part of benchmark identity.
+This benchmark suite has two different jobs and keeps them deliberately separate:
 
-## Checkpoint recipe: 8 denoising steps
+1. **product / recipe-faithful comparison** — compare systems that target the same output
+   objective while allowing each system to run the recipe it was actually trained for;
+2. **technical / same-NFE comparison** — isolate runtime implementation changes inside
+   VDN by holding NFE and the VDN recipe fixed.
 
-The currently qualified VDN checkpoint declares:
+This distinction is essential for MiniMax-H3 Turbo vs VDN-H3.
+
+## The released recipes are different
+
+The conventional community/Comfy Turbo LoRA is a **4-step** recipe.
+
+The released OpenVDN `stage-dmd-step-250` checkpoint is **not** that same 4-step LoRA
+simply attached to VDN. OpenVDN initializes its `turbo` adapter from the external Turbo
+LoRA and then DMD2-trains it inside the VDN manifold as a **50 -> 8 NFE** student.
+
+The released Stage-DMD generator is therefore:
 
 ```text
-turbo_num_steps = 8
+H3 base
++ VDN linear branch
++ adapters/default
++ adapters/turbo
++ 8 NFE
++ video shift 12.0
++ audio shift 3.0
 ```
 
-Therefore the main Turbo/VDN comparison uses **8 steps**. Earlier 4-step measurements
-were under-stepped relative to the checkpoint recipe and are retained only as historical
-diagnostics.
+The Stage-B fidelity/reference recipe is:
 
-This matters for both performance and image quality. A 4-step VDN or Turbo run may be
-faster, but it is not the intended recipe for this checkpoint and can lose fine detail.
-It must not be used as the production control for the 8-step model.
+```text
+H3 base
++ VDN linear branch
++ adapters/default
++ turbo OFF
++ 50 NFE
++ video shift 12.0
++ audio shift 3.0
+```
 
-The benchmark protocol also does **not** assume that VDN quality equals Turbo quality just
-because both run 8 steps. The available VDN/DMD checkpoint is earlier in training than
-the Turbo adapter, so quality must be qualified explicitly before a speed result is
-promoted as a same-quality speedup.
+The benchmark must never force conventional Turbo to 8 steps merely to match VDN, and
+must never run Stage-DMD VDN at 4 steps and call that its production recipe.
+
+`benchmarks/scenarios.json` is the source of truth for these recipes.
 
 ---
 
-## Comparability rule
+# Two comparison classes
 
-Two results may be used for a speedup/slowdown claim only when all of these match:
+## A. Product comparison: same objective, intended recipe
 
-- `comparison_group`;
-- `quality_target`;
-- `recipe`;
-- width and height;
+A product group asks:
+
+> For the same prompt, seed, resolution, frame count and quality objective, how fast is
+> each system when each one uses the recipe it was actually trained for?
+
+Typical group:
+
+```text
+Turbo conventional        4 NFE
+VDN Stage-DMD BF16         8 NFE
+VDN Stage-DMD INT8         8 NFE, only after quality qualification
+VDN Stage-DMD max_speed    8 NFE, only after quality qualification
+```
+
+Different NFE counts are **allowed** here. They are part of the model recipe, not a
+benchmarking cheat.
+
+A product comparison requires the following to match:
+
+- output width/height;
 - output frame count;
-- denoising steps / NFE;
-- seed;
-- scheduler and schedule/shifts;
 - prompt/conditioning payload;
-- model objective.
+- seed;
+- H3 scheduler family;
+- video shift 12.0;
+- audio shift 3.0;
+- declared quality target.
 
-For the current VDN/Turbo checkpoint, the comparable distilled recipe is:
+Each path may have a different `recipe_id` and NFE count.
+
+The comparator emits these under:
 
 ```text
-steps = 8
-recipe = turbo_num_steps_8_same_prompt_seed_scheduler
+product_comparisons
 ```
 
-A 4-step base-model diagnostic, an under-stepped 4-step Turbo/VDN run and a normal
-20-step native run are all separate objectives.
+A product speed claim is enabled only when all paths requiring a visual quality gate are
+marked `qualified`.
 
-`compare_results.py` enforces the structural part of this rule. It refuses to rank rows
-inside one comparison group if any required benchmark invariant differs.
+## B. Technical comparison: same NFE and same VDN recipe
+
+A technical group asks a different question:
+
+> Is this implementation change actually faster when the model, schedule and amount of
+> denoising work are unchanged?
+
+Examples:
+
+```text
+VDN Stage-DMD BF16
+vs VDN Stage-DMD INT8/ConvRot
+vs VDN Stage-DMD max_speed
+```
+
+All entries in a technical group must match:
+
+- resolution;
+- frames;
+- NFE;
+- seed;
+- exact scheduler name/settings;
+- scheduler family;
+- prompt hash;
+- VDN recipe id;
+- video/audio shifts;
+- quality target.
+
+The comparator emits these under:
+
+```text
+technical_comparisons
+```
+
+This is the correct place to answer questions such as “does INT8 make VDN faster than
+BF16?”
 
 ---
 
-# Quality gate
+# Canonical recipes
 
-A benchmark can be technically comparable but still fail the same-quality requirement.
-Each result therefore carries:
+The scenario file currently defines:
 
-```text
-quality_status = pending | qualified | failed | diagnostic
-```
+| Recipe | NFE | Video shift | Audio shift | Intended use |
+| --- | ---: | ---: | ---: | --- |
+| `turbo_conventional_4` | 4 | 12.0 | 3.0 | Conventional MiniMax-H3 Turbo control |
+| `vdn_stage_dmd_8` | 8 | 12.0 | 3.0 | Released VDN Stage-DMD (`default + turbo`) |
+| `vdn_stage_b_50` | 50 | 12.0 | 3.0 | VDN port-fidelity / teacher-quality diagnostic |
+| `native_standard_20` | 20 | 12.0 | 3.0 | Existing local native-quality reference |
 
-Use the statuses as follows:
-
-- `pending`: timing is valid, but no same-quality speed claim may be made yet;
-- `qualified`: output passed the agreed A/B quality check and is eligible for a speed claim;
-- `failed`: output is visibly below the control target; timing may be useful for engineering,
-  but it is not a same-quality optimization;
-- `diagnostic`: deliberately non-production configuration such as the historical 4-step
-  under-stepped runs.
-
-For visual A/B qualification, keep prompt, seed, scheduler and all conditioning fixed and
-inspect at least:
-
-- fine texture/detail and local sharpness;
-- subject/identity consistency;
-- motion quality and temporal continuity;
-- small-object/facial/hand stability where relevant;
-- edge ringing, smearing, flicker and repeated-pattern artifacts;
-- overall contrast and micro-detail, not only global composition.
-
-A speed optimization is not considered product-qualified until the target VDN profile
-passes this gate against the control path.
+The native 20-step baseline is useful as a product reference but is not a same-NFE
+control for a distilled model.
 
 ---
 
 # Benchmark tiers
 
-## 1. Short regression: 608×352, 121 frames, 8 steps
+## 1. Quick regression — 608×352, 121 frames
 
-Use for frequent iteration and regression checks.
-
-Comparable group:
+Product group:
 
 ```text
-distilled8_608x352_121
-```
-
-Run at minimum:
-
-- Turbo conventional, 8 steps;
-- VDN `auto`, BF16 projection, 8 steps;
-- VDN `auto`, INT8/ConvRot projection, 8 steps.
-
-This is no longer the final performance verdict; it is the quick feedback loop.
-
-## 2. Primary visual-detail A/B: 960×544, 121 frames, 8 steps
-
-This is the main quality-oriented A/B because the higher spatial load exposes softness,
-loss of texture and small-detail degradation much more clearly than 608×352.
-
-Comparable group:
-
-```text
-quality8_960x544_121
-```
-
-Recommended order:
-
-1. Turbo conventional 8-step control;
-2. VDN `auto` BF16 8-step;
-3. only after BF16 quality is understood, VDN INT8/ConvRot 8-step.
-
-Do not interpret INT8-vs-BF16 timing before checking whether quantization changes the
-visual result enough to matter.
-
-If 960×544 remains too soft to distinguish the quality ceiling clearly, escalate the
-quality A/B to approximately **1360×768 / 121 frames / 8 steps** while keeping the same
-prompt, seed and scheduler. That is a conditional quality stress test, not the routine
-performance benchmark.
-
-## 3. Primary long-video performance benchmark: 608×352, 241 frames, 8 steps
-
-This is the main end-to-end performance target. It is long enough for the local-window /
-linear-memory trade to become meaningful while remaining practical for repeated runs.
-
-Comparable group:
-
-```text
-distilled8_608x352_241
+fewstep_product_608x352_121
 ```
 
 Run:
 
-- Turbo conventional 8-step control;
-- VDN `auto` BF16;
-- VDN `auto` INT8/ConvRot;
-- VDN `max_speed` after the quality path is qualified.
+- conventional Turbo at **4 NFE**;
+- VDN Stage-DMD BF16 at **8 NFE**;
+- VDN Stage-DMD INT8 at **8 NFE** after BF16 quality is understood.
 
-This group should be used for normal optimization decisions.
-
-## 4. Stress/crossover benchmark: 608×352, 401 frames, 8 steps
-
-Comparable group:
+The VDN BF16/INT8 runs also belong to a strict technical group:
 
 ```text
-distilled8_608x352_401
+vdn_dmd8_608x352_121
 ```
 
-This is required before claiming improved long-video scaling. It answers the important
-question: if VDN is close to or behind Turbo at 121 frames, does its asymptotic advantage
-actually appear at 241/401 frames?
+This is the fast feedback loop, not the final quality verdict.
 
-At minimum compare:
+## 2. Higher-detail A/B — 960×544, 121 frames
 
-- Turbo conventional 8-step;
-- VDN `auto` BF16;
-- VDN `auto` INT8/ConvRot if it already passed the quality gate.
+Product group:
 
-If VDN still loses materially at 401 frames, treat that as an implementation/hot-path
-problem rather than explaining it away as a short-sequence crossover.
+```text
+fewstep_product_960x544_121
+```
+
+This is useful for seeing softness, micro-detail loss, edge artifacts and quantization
+changes more clearly than 608×352.
+
+Again:
+
+```text
+Turbo = 4 NFE
+VDN-DMD = 8 NFE
+```
+
+Do not force either model onto the other's step count.
+
+## 3. Primary long-video benchmark — 608×352, 241 frames
+
+Product group:
+
+```text
+fewstep_product_608x352_241
+```
+
+This is the **primary repeated performance benchmark** because it is long enough for the
+VDN local-window/linear-memory trade to matter without making every iteration extremely
+expensive.
+
+Run:
+
+- Turbo conventional, 4 NFE;
+- VDN Stage-DMD `auto` BF16, 8 NFE;
+- VDN Stage-DMD `auto` INT8, 8 NFE after quality gate;
+- VDN Stage-DMD `max_speed`, 8 NFE after its own quality gate.
+
+The VDN variants also share:
+
+```text
+vdn_dmd8_608x352_241
+```
+
+for same-NFE engineering comparisons.
+
+## 4. Stress/crossover — 608×352, 401 frames
+
+Product group:
+
+```text
+fewstep_product_608x352_401
+```
+
+This is required before making claims about long-sequence scaling. If VDN remains slower
+at 401 frames, treat that as an implementation/hot-path problem rather than explaining
+it away as a short-sequence crossover.
+
+## 5. Canonical OpenVDN quality/fidelity geometry — 1344×768, 345 frames
+
+OpenVDN trains/evaluates around latent `48×84`, which corresponds to the 768p-class
+`1344×768` geometry, and its released few-step model uses 345 output frames / 8 NFE.
+
+### Stage-B port-fidelity gate
+
+Run:
+
+```text
+vdn_stage_b_bf16_50step_1344x768_345
+```
+
+with:
+
+```text
+Stage-B checkpoint
+default adapter = 1.0
+turbo adapter = OFF
+projection = BF16
+50 NFE
+video shift = 12.0
+audio shift = 3.0
+```
+
+This test answers whether the VDN architecture + Stage-B adapter port itself preserves
+quality before Turbo is involved.
+
+### Stage-DMD canonical quality gate
+
+Product group:
+
+```text
+fewstep_product_release_1344x768_345
+```
+
+Run:
+
+- conventional Turbo: 4 NFE;
+- VDN Stage-DMD BF16: 8 NFE;
+- VDN Stage-DMD INT8: 8 NFE only after BF16 passes.
+
+For the VDN release path the required adapter recipe is:
+
+```text
+default = 1.0
+turbo   = 1.0
+```
+
+This is the most important quality benchmark in the suite.
 
 ---
 
-# Native-quality baseline
+# Quality gate
 
-A normal native MiniMax-H3 generation at 20 steps remains useful, but it belongs to its
-own comparison group:
+Timing alone cannot turn a numerically different path into an optimization.
+
+Each result carries:
 
 ```text
-native20_608x352_121
+quality_status = pending | qualified | failed | diagnostic
 ```
 
-It answers a product-level question such as "how long does normal native generation take
-versus the accelerated distilled workflow?" It must not be used as the control for a
-VDN kernel/runtime speedup.
+Use:
 
-Likewise, a base H3 run forced to 4 steps is only a backbone-overhead diagnostic and is
-not normal native quality.
+- `pending` — timing valid, output not yet approved;
+- `qualified` — output meets the target for that product group;
+- `failed` — output visibly below the target; timing remains engineering information;
+- `diagnostic` — intentionally non-production or historical setup.
+
+For A/B qualification inspect at least:
+
+- subject/identity consistency;
+- texture and micro-detail;
+- temporal coherence and motion;
+- facial/hand/small-object stability where applicable;
+- flicker, repeated patterns, ringing and smearing;
+- prompt following and composition;
+- audio/video behavior when audio is part of the workflow.
+
+Keep prompt, seed and conditioning identical within the product group.
 
 ---
 
 # Measurement protocol
 
-For each scenario:
+For each active scenario:
 
-1. use the exact scenario recipe from `benchmarks/scenarios.json`;
-2. keep prompt, seed, conditioning, scheduler and shifts fixed across one comparison group;
-3. record the first execution separately as `cold`;
-4. run at least one warm-up after compilation/autotune;
-5. collect **five warm measured executions** by default;
-6. report **median sampler time** as the primary performance number;
-7. also record end-to-end time and peak VRAM;
-8. save the Kirei Runtime Report for every VDN scenario;
-9. record `quality_status` independently of timing;
-10. never mix the cold compile/autotune run into steady-state timing.
+1. select the scenario directly in **Kirei Benchmark Start**;
+2. use the recipe from `scenarios.json` exactly;
+3. connect Start MODEL directly to the sampler;
+4. connect sampler LATENT directly to **Kirei Benchmark End.after**;
+5. for VDN, connect the same patched MODEL to Benchmark End so Runtime Report is embedded;
+6. record the cold run separately;
+7. perform at least one warm-up after compilation/autotune;
+8. collect five warm measured executions by default;
+9. use median `sampler_seconds` as the primary number;
+10. also record peak VRAM and, when useful, end-to-end time.
 
-## In-graph sampler timing
-
-Use the two benchmark nodes so Turbo, VDN and native are timed over exactly the same
-segment:
+The Start node now records the model's actual H3 sampling metadata:
 
 ```text
-model
-  -> Kirei Benchmark Start
-       -> MODEL -> sampler -> LATENT -> Kirei Benchmark End.after
-       -> benchmark_token ------------> Kirei Benchmark End.benchmark_token
+sampling.class
+sampling.video_shift
+sampling.audio_shift
 ```
 
-Set `scenario_id` on **Kirei Benchmark Start** to an id from `scenarios.json`.
+`record_result.py` rejects a result if the measured shifts do not match the scenario
+recipe.
 
-The Start node synchronizes the model CUDA device before opening the interval and can
-reset peak-memory statistics. The End node synchronizes before closing it and outputs:
+For VDN Stage-DMD it also requires a VDN Runtime Report and checks the checkpoint's
+`turbo_num_steps=8` declaration. If a newer Runtime Report exposes named adapters and
+strengths, the recorder additionally verifies the expected adapter inventory.
 
-- `sampler_seconds`;
-- peak allocated/reserved VRAM;
-- run kind (`cold` or `warm`);
-- optional embedded VDN Runtime Report when the patched model is connected.
+---
 
-Connect the sampler LATENT directly to `End.after`. If you connect a decoded video or a
-post-VAE node instead, the measurement intentionally includes that extra work and is no
-longer the standard sampler benchmark.
+# Recording and summarizing
 
-Both benchmark nodes invalidate ComfyUI's execution cache on every prompt so repeated
-warm measurements really execute.
-
-## Recording a measurement
-
-Save the JSON emitted by **Kirei Benchmark End**, then merge it with the scenario metadata:
+Save the JSON emitted by **Kirei Benchmark End** and normalize it with:
 
 ```bash
 python benchmarks/record_result.py measurement.json \
   --seed 1234 \
-  --scheduler "fixed-name-and-settings" \
+  --scheduler "euler/minimax-h3" \
   --prompt-hash "<hash>" \
   --quality-status pending
 ```
 
-`record_result.py` appends a normalized row to `benchmarks/results.jsonl` by default.
-For VDN measurements it also inspects `runtime_report.checkpoint_recipe.turbo_num_steps`.
-If the checkpoint reports 8 but the selected scenario requests another step count, the
-result is rejected rather than recorded.
-
-Recommended normalized result row:
-
-```json
-{
-  "scenario_id": "vdn_auto_int8_8step_608x352_241",
-  "comparison_group": "distilled8_608x352_241",
-  "quality_target": "checkpoint_declared_distilled8",
-  "recipe": "turbo_num_steps_8_same_prompt_seed_scheduler",
-  "quality_status": "pending",
-  "quality_gate_required": true,
-  "comparable": true,
-  "width": 608,
-  "height": 352,
-  "frames": 241,
-  "steps": 8,
-  "seed": 1234,
-  "scheduler": "fixed-name-and-settings",
-  "prompt_hash": "...",
-  "checkpoint_turbo_num_steps": 8,
-  "run_kind": "warm",
-  "sampler_seconds": 12.34,
-  "peak_vram_bytes": 123456789,
-  "runtime_report": {}
-}
-```
-
-The results file is JSONL: one execution per line.
-
-Summarize it with:
+Then summarize:
 
 ```bash
 python benchmarks/compare_results.py benchmarks/results.jsonl
 ```
 
-The comparator still shows a technical ranking when the structure matches, but
-`speed_claim_eligible` becomes `true` only after every path that requires a quality gate
-is marked `qualified`.
-
----
-
-# Historical 4-step measurements
-
-These measurements used 608×352 and 121 output frames, but **not** the checkpoint's
-8-step recipe:
-
-| Configuration | Steps | Time | Interpretation |
-| --- | ---: | ---: | --- |
-| Base without LoRA | 4 | 9.37 s | diagnostic only; not normal native quality |
-| Turbo conventional | 4 | 10.02 s | historical under-stepped Turbo result |
-| VDN `auto`, BF16 | 4 | 11.32 s | historical under-stepped VDN result |
-| VDN `auto`, INT8 | 4 | 11.90 s | historical under-stepped VDN result |
-| Native standard | 20 | 24.54 s | normal native-quality baseline, different objective |
-
-These numbers predate later runtime changes and are no longer the active VDN/Turbo
-benchmark. They remain useful only to explain earlier observations and to verify that a
-future result is not accidentally being compared against the wrong recipe.
-
----
-
-# What constitutes an optimization
-
-A change can be called a same-quality speed optimization only when:
-
-- it beats the previous qualified path in the **same comparison group**;
-- it uses the checkpoint-declared 8-step recipe for the current distilled VDN/Turbo model;
-- its `quality_status` is `qualified` against the control target;
-- the gain is measured from warm median sampler time;
-- peak VRAM remains acceptable for the intended hardware profile;
-- no gain comes solely from fewer steps, lower resolution, fewer frames or changed
-  conditioning.
-
-The current engineering sequence is therefore:
+The output contains two independent sections:
 
 ```text
-608×352 / 121f / 8-step  -> quick regression
-960×544 / 121f / 8-step  -> detail/quality gate
-608×352 / 241f / 8-step  -> primary performance decision
-608×352 / 401f / 8-step  -> long-video scaling/crossover proof
+product_comparisons
+technical_comparisons
+```
+
+A product group can legitimately contain 4-step Turbo and 8-step VDN because that is the
+trained recipe comparison. A technical VDN group cannot mix 4 and 8 NFE.
+
+---
+
+# Historical measurements
+
+The earlier 608×352 / 121-frame measurements remain stored for context:
+
+| Configuration | NFE | Time | Correct interpretation |
+| --- | ---: | ---: | --- |
+| Base without LoRA | 4 | 9.37 s | diagnostic only; native base was under-stepped |
+| Turbo conventional | 4 | 10.02 s | Turbo was using its intended 4-step recipe |
+| VDN `auto`, BF16 | 4 | 11.32 s | VDN Stage-DMD was incorrectly run at 4 instead of 8 |
+| VDN `auto`, INT8 | 4 | 11.90 s | same under-stepped VDN issue, plus older runtime |
+| Native standard | 20 | 24.54 s | local native-quality baseline, different recipe |
+
+These are not mixed into current speed claims because prompt/seed/scheduler metadata was
+not fully recorded and the VDN runs were outside the released Stage-DMD recipe.
+
+---
+
+# What counts as an optimization
+
+For a **technical VDN optimization**:
+
+- same `technical_group`;
+- same 8-NFE Stage-DMD recipe;
+- same prompt/seed/scheduler/shifts;
+- quality gate passes when the change is numerically different;
+- warm median sampler time improves.
+
+For a **product-level acceleration claim**:
+
+- same `product_group` and output objective;
+- each model uses its own intended recipe;
+- Turbo remains 4 NFE;
+- VDN-DMD remains 8 NFE;
+- every required output is quality-qualified;
+- warm median sampler time is compared end to end over the same sampler segment.
+
+The main sequence is therefore:
+
+```text
+608×352 / 121f  -> quick product + technical regression
+960×544 / 121f  -> detail/quality A/B
+608×352 / 241f  -> primary long-video performance decision
+608×352 / 401f  -> long-sequence scaling proof
+1344×768 / 345f -> canonical Stage-B / Stage-DMD quality-fidelity gate
 ```

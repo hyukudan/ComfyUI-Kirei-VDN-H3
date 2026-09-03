@@ -11,9 +11,9 @@ def _reject_multigpu_auxiliary(label: str):
     raise RuntimeError(
         "Kirei VDN-H3 currently supports one compute device per patched H3 model. "
         f"ComfyUI attempted to deep-clone the {label} auxiliary model for MultiGPU. "
-        "Use the RTX PRO 6000 as the selected model device (or another single GPU) "
-        "until VDN's distributed/Ulysses branch is ported; sharing these runtime "
-        "closures across independent model clones would be incorrect."
+        "Select one GPU for the patched H3 model until VDN's distributed/Ulysses "
+        "execution is implemented; sharing runtime closures across independent model "
+        "clones would be incorrect."
     )
 
 
@@ -40,10 +40,34 @@ def create_auxiliary_patcher(
         size=int(size),
     )
     # ModelPatcher.deepclone_multigpu requires cached_patcher_init. Supplying an
-    # intentional rejecting factory turns an otherwise obscure factory error (or,
-    # worse, a shallow closure bound to the wrong model) into a deterministic guard.
+    # intentional rejecting factory turns an obscure clone error (or a shallow closure
+    # bound to the wrong model) into a deterministic guard.
     patcher.cached_patcher_init = (_reject_multigpu_auxiliary, (str(label),))
     return patcher
 
 
-__all__ = ["create_auxiliary_patcher"]
+def unload_auxiliary(patcher: Any, module: Any) -> bool:
+    """Unload an auxiliary through ComfyUI first, with a CPU fallback.
+
+    Direct ``module.to('cpu')`` can leave ComfyUI's loaded-model bookkeeping stale.
+    This helper keeps the lifecycle coherent whenever the active ComfyUI exposes the
+    normal unload API, while remaining usable in dependency-light tests.
+    """
+    if patcher is not None:
+        try:
+            import comfy.model_management as model_management
+
+            model_management.unload_model_and_clones(
+                patcher, unload_additional_models=False
+            )
+            return True
+        except Exception:
+            pass
+    try:
+        module.to(device="cpu")
+        return True
+    except Exception:
+        return False
+
+
+__all__ = ["create_auxiliary_patcher", "unload_auxiliary"]

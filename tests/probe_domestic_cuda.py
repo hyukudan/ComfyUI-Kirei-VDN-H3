@@ -11,6 +11,7 @@ policy and the quantized VDN projection families on the selected GPU.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, is_dataclass
 import json
 import time
 from pathlib import Path
@@ -100,12 +101,8 @@ def probe_tiled(device, quick=False):
     v = torch.randn_like(q)
     bounds = window.window_bounds(frames, 1, 5)
 
-    untiled_runtime = SharedBranchRuntime(
-        kernel_backend="auto", compile_policy="off", tile_frames=0
-    )
-    tiled_runtime = SharedBranchRuntime(
-        kernel_backend="auto", compile_policy="off", tile_frames=5
-    )
+    untiled_runtime = SharedBranchRuntime(kernel_backend="auto", compile_policy="off", tile_frames=0)
+    tiled_runtime = SharedBranchRuntime(kernel_backend="auto", compile_policy="off", tile_frames=5)
     untiled = OptimizedLinearBranch(
         weights, heads, dim, short_conv=("k", "v"), enable_text_state=False,
         kernel_backend="auto", compile_policy="off", tile_frames=0,
@@ -162,6 +159,20 @@ def probe_hybrid_stream(device, quick=False):
     }
 
 
+def _info_dict(info):
+    if is_dataclass(info):
+        raw = asdict(info)
+    elif hasattr(info, "__dict__"):
+        raw = dict(info.__dict__)
+    else:
+        raw = {"value": str(info)}
+    return {
+        key: value
+        for key, value in raw.items()
+        if isinstance(value, (str, int, float, bool))
+    }
+
+
 def _probe_quantized_projection(device, precision, quick=False):
     torch.manual_seed(1203 if precision == "fp8" else 1204)
     available = fp8_supported(device, probe=True) if precision == "fp8" else int8_supported(device, probe=True)
@@ -204,11 +215,7 @@ def _probe_quantized_projection(device, precision, quick=False):
         "original_bytes": info.original_bytes,
         "quantized_bytes": info.quantized_bytes,
         "storage_ratio": info.quantized_bytes / info.original_bytes if info.original_bytes else None,
-        "info": {
-            key: value
-            for key, value in vars(info).items()
-            if isinstance(value, (str, int, float, bool))
-        },
+        "info": _info_dict(info),
     }
 
 

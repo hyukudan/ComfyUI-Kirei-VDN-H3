@@ -108,6 +108,31 @@ def _layout_snapshot(state):
     return result
 
 
+def _checkpoint_recipe(state):
+    """Expose checkpoint-declared inference recipe fields without inventing defaults."""
+    config = getattr(state, "config", {}) or {}
+    if not isinstance(config, dict):
+        try:
+            config = dict(config)
+        except Exception:
+            return {}
+    keys = (
+        "turbo_num_steps",
+        "chunk",
+        "radius",
+        "anchor_frames",
+        "linear_head_dim",
+        "delta_rule",
+        "bridge",
+    )
+    result = {}
+    for key in keys:
+        value = config.get(key)
+        if value is not None and isinstance(value, (str, int, float, bool)):
+            result[key] = value
+    return result
+
+
 def _stage_total(stages: dict, name: str) -> float:
     value = stages.get(name)
     if not isinstance(value, dict):
@@ -180,6 +205,12 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
             "The H3 block pointwise fusion fell back to native ComfyUI; inspect block_fusion_error "
             "before comparing against the fully tuned upstream path."
         )
+    declared_steps = _checkpoint_recipe(state).get("turbo_num_steps")
+    if declared_steps is not None:
+        recommendations.append(
+            f"Checkpoint declares turbo_num_steps={declared_steps}; benchmark Turbo/VDN with that "
+            "step recipe unless intentionally running a diagnostic ablation."
+        )
 
     return {
         "forward_total_ms": forward_ms,
@@ -216,6 +247,7 @@ def runtime_snapshot(model_patcher: Any) -> dict:
     cuda = _cuda_snapshot(model_patcher)
     return {
         "checkpoint": state.name,
+        "checkpoint_recipe": _checkpoint_recipe(state),
         "profile": getattr(state, "profile", None),
         "forwards": int(state.forwards),
         "base_precision": getattr(state, "base_precision", "bf16"),

@@ -116,6 +116,7 @@ class SharedBranchRuntime:
 
 
 def _scan_recurrence_body(transitions, injections, initial):
+    """Official forward-only recurrence: one baddbmm launch per frame/direction."""
     frames = transitions.shape[0]
     prefix = torch.empty((frames, *initial.shape), dtype=injections.dtype, device=injections.device)
     suffix = torch.empty_like(prefix)
@@ -131,25 +132,21 @@ def _scan_recurrence_body(transitions, injections, initial):
 
 
 def _run_scans_shared(backend, alpha, matrix_a, matrix_b, text_state, cache: SharedBranchRuntime):
+    """Factor all frames in batch, then run the launch-light serial recurrence.
+
+    The upstream tuned implementation deliberately does *not* hand the whole Python
+    recurrence to Inductor. Static-compiling 2*F dependent baddbmm calls produces a
+    large graph, adds first-run/re-specialisation cost and has not shown a steady-state
+    advantage over the preallocated one-launch-per-frame loop. Compilation remains on
+    the wide pointwise/gather/prologue work where fusion actually removes HBM passes.
+    """
+    del cache
     if torch.is_grad_enabled():
         raise RuntimeError("VDN inference scan requires torch.no_grad()/inference_mode()")
     with torch.autocast(device_type=matrix_a.device.type, enabled=False):
         transitions, injections, initial = reference._scan_inputs(  # noqa: SLF001
             backend, alpha, matrix_a, matrix_b, text_state
         )
-        if transitions.is_cuda and cache.compile_policy != "off":
-            key = (
-                reference._device_key(transitions.device),  # noqa: SLF001
-                transitions.dtype,
-                tuple(transitions.shape),
-                injections.dtype,
-                tuple(injections.shape),
-            )
-            result = cache.compiler.call(
-                "scan", _scan_recurrence_body, (transitions, injections, initial), key
-            )
-            if result is not None:
-                return result
         return _scan_recurrence_body(transitions, injections, initial)
 
 
@@ -575,7 +572,6 @@ class OptimizedLinearBranch(reference.LinearBranch):
         if projector is None:
             weight = weights["to_out_linear.weight"]
             projector = lambda value: F.linear(value, weight)
-        original_frames = num_frames
         original_rows = num_frames * tokens_per_frame
         row_offset = 0
         if skip_ends:

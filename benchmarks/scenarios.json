@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "rules": {
+    "speedup_requires_same_comparison_group": true,
+    "same_group_requires_same_resolution_frames_steps_seed_scheduler": true,
+    "warmup_runs": 1,
+    "measured_runs": 5,
+    "summary_statistic": "median",
+    "primary_metric": "sampler_seconds",
+    "secondary_metrics": ["end_to_end_seconds", "peak_vram_bytes"]
+  },
+  "scenarios": [
+    {
+      "id": "diagnostic_base4_608x352_121",
+      "comparison_group": "diagnostic_base4_608x352_121",
+      "comparable": false,
+      "purpose": "Backbone overhead diagnostic only; not a native-quality baseline",
+      "width": 608,
+      "height": 352,
+      "frames": 121,
+      "steps": 4,
+      "model_variant": "base_no_lora"
+    },
+    {
+      "id": "turbo4_608x352_121",
+      "comparison_group": "distilled4_608x352_121",
+      "comparable": true,
+      "purpose": "Short production baseline",
+      "width": 608,
+      "height": 352,
+      "frames": 121,
+      "steps": 4,
+      "model_variant": "turbo_conventional"
+    },
+    {
+      "id": "vdn_auto_bf16_608x352_121",
+      "comparison_group": "distilled4_608x352_121",
+      "comparable": true,
+      "width": 608,
+      "height": 352,
+      "frames": 121,
+      "steps": 4,
+      "model_variant": "vdn_auto",
+      "projection_precision": "bf16"
+    },
+    {
+      "id": "vdn_auto_int8_608x352_121",
+      "comparison_group": "distilled4_608x352_121",
+      "comparable": true,
+      "width": 608,
+      "height": 352,
+      "frames": 121,
+      "steps": 4,
+      "model_variant": "vdn_auto",
+      "projection_precision": "int8"
+    },
+    {
+      "id": "native20_608x352_121",
+      "comparison_group": "native20_608x352_121",
+      "comparable": true,
+      "purpose": "Normal native-quality baseline; do not use for 4-step kernel speedups",
+      "width": 608,
+      "height": 352,
+      "frames": 121,
+      "steps": 20,
+      "model_variant": "native_standard"
+    },
+    {
+      "id": "turbo4_608x352_241",
+      "comparison_group": "distilled4_608x352_241",
+      "comparable": true,
+      "purpose": "PRIMARY long-video performance baseline",
+      "width": 608,
+      "height": 352,
+      "frames": 241,
+      "steps": 4,
+      "model_variant": "turbo_conventional"
+    },
+    {
+      "id": "vdn_auto_bf16_608x352_241",
+      "comparison_group": "distilled4_608x352_241",
+      "comparable": true,
+      "purpose": "PRIMARY VDN long-video BF16 comparison",
+      "width": 608,
+      "height": 352,
+      "frames": 241,
+      "steps": 4,
+      "model_variant": "vdn_auto",
+      "projection_precision": "bf16"
+    },
+    {
+      "id": "vdn_auto_int8_608x352_241",
+      "comparison_group": "distilled4_608x352_241",
+      "comparable": true,
+      "purpose": "PRIMARY VDN long-video INT8/ConvRot comparison",
+      "width": 608,
+      "height": 352,
+      "frames": 241,
+      "steps": 4,
+      "model_variant": "vdn_auto",
+      "projection_precision": "int8"
+    },
+    {
+      "id": "vdn_max_speed_608x352_241",
+      "comparison_group": "distilled4_608x352_241",
+      "comparable": true,
+      "purpose": "PRIMARY tuned ceiling comparison",
+      "width": 608,
+      "height": 352,
+      "frames": 241,
+      "steps": 4,
+      "model_variant": "vdn_max_speed"
+    },
+    {
+      "id": "turbo4_608x352_401",
+      "comparison_group": "distilled4_608x352_401",
+      "comparable": true,
+      "purpose": "Stress/crossover baseline near the long-video regime used by upstream VDN work",
+      "width": 608,
+      "height": 352,
+      "frames": 401,
+      "steps": 4,
+      "model_variant": "turbo_conventional"
+    },
+    {
+      "id": "vdn_auto_int8_608x352_401",
+      "comparison_group": "distilled4_608x352_401",
+      "comparable": true,
+      "purpose": "Stress/crossover VDN comparison",
+      "width": 608,
+      "height": 352,
+      "frames": 401,
+      "steps": 4,
+      "model_variant": "vdn_auto",
+      "projection_precision": "int8"
+    }
+  ]
+}

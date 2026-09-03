@@ -18,7 +18,7 @@ def _module():
     return module
 
 
-def _vdn_scenario(steps=8):
+def _vdn_scenario(steps=8, precision="bf16"):
     return {
         "id": "vdn",
         "active": True,
@@ -32,6 +32,8 @@ def _vdn_scenario(steps=8):
         "height": 352,
         "frames": 241,
         "steps": steps,
+        "model_variant": "vdn_auto",
+        "projection_precision": precision,
     }
 
 
@@ -49,14 +51,18 @@ def _vdn_recipe():
     }
 
 
-def _measurement():
+def _measurement(precision="bf16", profile="auto"):
     return {
         "scenario_id": "vdn",
         "run_kind": "warm",
         "sampler_seconds": 10.0,
         "peak_vram_bytes": 123,
         "sampling": {"video_shift": 12.0, "audio_shift": 3.0},
-        "runtime_report": {"checkpoint_recipe": {"turbo_num_steps": 8}},
+        "runtime_report": {
+            "profile": profile,
+            "projection": {"precision": precision},
+            "checkpoint_recipe": {"turbo_num_steps": 8},
+        },
     }
 
 
@@ -99,6 +105,36 @@ def test_record_result_rejects_wrong_sampling_shift():
         module.build_result(
             measurement,
             _vdn_scenario(8),
+            _vdn_recipe(),
+            seed=1,
+            scheduler="euler",
+            prompt_hash="p",
+            quality_status="pending",
+        )
+
+
+def test_record_result_rejects_precision_fallback_under_wrong_label():
+    module = _module()
+    with pytest.raises(ValueError, match="projection_precision='int8'"):
+        module.build_result(
+            _measurement(precision="bf16"),
+            _vdn_scenario(8, precision="int8"),
+            _vdn_recipe(),
+            seed=1,
+            scheduler="euler",
+            prompt_hash="p",
+            quality_status="pending",
+        )
+
+
+def test_record_result_rejects_wrong_profile_label():
+    module = _module()
+    scenario = _vdn_scenario(8)
+    scenario["model_variant"] = "vdn_max_speed"
+    with pytest.raises(ValueError, match="profile='max_speed'"):
+        module.build_result(
+            _measurement(profile="auto"),
+            scenario,
             _vdn_recipe(),
             seed=1,
             scheduler="euler",

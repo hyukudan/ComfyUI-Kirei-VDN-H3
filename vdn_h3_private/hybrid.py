@@ -168,6 +168,7 @@ class VDNState(nn.Module):
                 raise TypeError(f"branch {index} does not expose a weight mapping as .w")
             maps.append(mapping)
         self.weight_store = ManagedBranchWeights(maps, mode=weight_mode)
+        self.curve_adapter = None
         self.forwards = 0
 
     def weights_on(
@@ -187,6 +188,8 @@ class VDNState(nn.Module):
             release = getattr(branch, "release", None)
             if release is not None:
                 release()
+        if self.curve_adapter is not None:
+            self.curve_adapter.release()
         return self
 
     def close(self) -> None:
@@ -210,7 +213,12 @@ def make_layout_wrapper(state: VDNState):
         layout = layout_from_payload(kwargs.get("minimax_payload"), x, context, state.config)
         state.forwards += 1
         with publish_layout(layout):
-            return executor(*args, **kwargs)
+            if state.curve_adapter is None:
+                return executor(*args, **kwargs)
+            from .curve import curve_runtime_scope
+
+            with curve_runtime_scope():
+                return executor(*args, **kwargs)
 
     wrapper._vdn_h3_private_layout_wrapper = True
     return wrapper

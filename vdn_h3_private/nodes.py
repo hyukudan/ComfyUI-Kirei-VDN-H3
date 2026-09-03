@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from .apply import apply_delta_patches
+from .apply import apply_factor_patches
 from .hybrid import VDNState, apply_vdn, validate_h3_model
 
 
@@ -149,23 +149,31 @@ def apply_checkpoint(
             f"VDN checkpoint {checkpoint_name!r} is missing required adapter(s) "
             f"{missing}; refusing a partial model"
         )
-    from .adapters import convert_adapter
+    from .adapters import convert_adapter_factors
 
     target_shapes = {key: tuple(value.shape) for key, value in cloned.model_state_dict().items()}
     reports = []
+    curve_terms = []
     try:
         for name in wanted:
             adapter_state, adapter_spec = _adapter_parts(adapters[name])
-            deltas = convert_adapter(
+            factors = convert_adapter_factors(
                 adapter_state,
                 adapter_spec,
                 target_shapes=target_shapes,
                 target_prefix="diffusion_model.",
             )
-            count = apply_delta_patches(cloned, deltas, strength=strength)
-            if count == 0:
-                raise RuntimeError(f"VDN adapter {name!r} contained no applicable deltas")
-            reports.append(f"{name}:{count}")
+            regular = [patch for patch in factors if not patch.curve_adaln]
+            curve = [patch for patch in factors if patch.curve_adaln]
+            count = apply_factor_patches(cloned, regular, strength=strength)
+            curve_terms.extend((patch, strength) for patch in curve)
+            if count + len(curve) == 0:
+                raise RuntimeError(f"VDN adapter {name!r} contained no applicable factors")
+            reports.append(f"{name}:{count}+{len(curve)}curve")
+        if curve_terms:
+            from .curve import apply_curve_adapters
+
+            apply_curve_adapters(cloned, state, curve_terms)
     except Exception:
         state.close()
         raise

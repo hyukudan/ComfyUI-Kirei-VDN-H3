@@ -3,6 +3,7 @@ import torch
 
 from vdn_h3_private.adapters import (
     convert_adapter,
+    convert_adapter_factors,
     map_lora_target,
     parse_adapter_state,
     patches_by_target,
@@ -111,3 +112,27 @@ def test_conversion_validates_native_shapes_and_rejects_odd_swiglu():
     with pytest.raises(ValueError, match="not even"):
         convert_adapter(odd, _spec([ff]))
 
+
+def test_factor_conversion_keeps_lora_low_rank_and_qkv_offset():
+    module = "transformer_blocks.0.attn.orig.to_k"
+    down, up = torch.randn(2, 3), torch.randn(4, 2)
+    (patch,) = convert_adapter_factors(
+        {_key(module, "A"): down, _key(module, "B"): up},
+        _spec([module], exact_targets=True),
+        target_shapes={"blocks.0.attn.qkv_proj.weight": (12, 3)},
+    )
+    assert patch.down.data_ptr() == down.data_ptr()
+    assert patch.up.data_ptr() == up.data_ptr()
+    assert patch.offset == (4, 4)
+    assert not patch.curve_adaln
+
+
+def test_factor_conversion_marks_pruned_adaln_for_runtime_injection():
+    module = "norm_out.linear"
+    (patch,) = convert_adapter_factors(
+        {_key(module, "A"): torch.randn(2, 2688), _key(module, "B"): torch.randn(12, 2)},
+        _spec([module], exact_targets=True),
+        target_shapes={"final_layer.adaln_proj.linear.weight": (12, 8)},
+    )
+    assert patch.curve_adaln
+    assert patch.output_shape == (12, 2688)

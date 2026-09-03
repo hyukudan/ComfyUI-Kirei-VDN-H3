@@ -199,6 +199,43 @@ def apply_delta_patches(
     return len(applied)
 
 
+def apply_factor_patches(
+    model_patcher: Any,
+    patches: Iterable[Any],
+    *,
+    strength: float = 1.0,
+) -> int:
+    """Register compact LoRA factors with ComfyUI's native weight patcher."""
+
+    from comfy.weight_adapter import LoRAAdapter
+
+    native = {}
+    for patch in patches:
+        if getattr(patch, "curve_adaln", False):
+            raise ValueError(f"curve AdaLN term {patch.source!r} needs runtime injection")
+        rank = int(patch.down.shape[0])
+        alpha = float(patch.scale) * rank
+        adapter = LoRAAdapter(
+            set(),
+            (patch.up, patch.down, alpha, None, None, None),
+        )
+        key = patch.key
+        if patch.offset is not None:
+            start, length = patch.offset
+            key = (patch.key, (0, int(start), int(length)))
+        if key in native:
+            raise ValueError(f"duplicate compact LoRA target {key!r}")
+        native[key] = adapter
+    if not native:
+        return 0
+    applied = model_patcher.add_patches(native, float(strength))
+    if len(applied) != len(native):
+        raise RuntimeError(
+            f"ComfyUI accepted only {len(applied)}/{len(native)} compact LoRA patches"
+        )
+    return len(applied)
+
+
 def clone_and_apply(
     model: Any,
     state: VDNState,
@@ -220,6 +257,7 @@ def clone_and_apply(
 __all__ = [
     "DeltaPatch",
     "apply_delta_patches",
+    "apply_factor_patches",
     "clone_and_apply",
     "normalise_delta_patches",
     "validate_delta_patches",

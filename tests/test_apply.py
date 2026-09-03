@@ -4,7 +4,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vdn_h3_private.apply import DeltaPatch, apply_delta_patches, clone_and_apply
+from vdn_h3_private.adapters import FactorPatch
+from vdn_h3_private.apply import (
+    DeltaPatch,
+    apply_delta_patches,
+    apply_factor_patches,
+    clone_and_apply,
+)
 from vdn_h3_private.hybrid import VDNState, apply_vdn
 
 
@@ -117,3 +123,21 @@ def test_missing_or_bad_shape_adapter_target_fails_before_application():
     with pytest.raises(ValueError, match="exceeds"):
         apply_delta_patches(model, [DeltaPatch(key, torch.ones(3, 2), (5, 0))])
     assert model.patches == {}
+
+
+def test_factor_patch_uses_native_lora_adapter_and_offset():
+    model = FakePatcher()
+    key = "diffusion_model.blocks.0.attn.qkv_proj.weight"
+    patch = FactorPatch(
+        key=key,
+        up=torch.ones(2, 1),
+        down=torch.ones(1, 2),
+        offset=(2, 2),
+        source="to_k",
+        scale=0.5,
+    )
+    assert apply_factor_patches(model, [patch], strength=0.75) == 1
+    ((native_key, adapter),) = model.patches.items()
+    assert native_key == (key, (0, 2, 2))
+    assert adapter.name == "lora"
+    assert adapter.weights[2] == 0.5

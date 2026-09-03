@@ -65,6 +65,23 @@ class DeltaPatch:
         return self
 
 
+@dataclass(frozen=True)
+class FactorPatch:
+    """A compact native LoRA patch; no dense ``B @ A`` tensor is materialized."""
+
+    key: str
+    up: torch.Tensor
+    down: torch.Tensor
+    offset: tuple[int, int] | None
+    source: str
+    scale: float
+    curve_adaln: bool = False
+
+    @property
+    def output_shape(self) -> tuple[int, int]:
+        return int(self.up.shape[0]), int(self.down.shape[1])
+
+
 def _strip_known_prefix(module: str) -> str:
     for prefix in _KNOWN_PREFIXES:
         if module.startswith(prefix):
@@ -310,6 +327,80 @@ def convert_adapter(
     return tuple(patches)
 
 
+def convert_adapter_factors(
+    state: Mapping[str, torch.Tensor],
+    adapter_spec: Mapping[str, Any],
+    *,
+    target_shapes: Mapping[str, Sequence[int]],
+    target_prefix: str = "",
+) -> tuple[FactorPatch, ...]:
+    """Convert an adapter without expanding any low-rank pair.
+
+    A mismatched AdaLN input width is accepted only when its output width matches;
+    it denotes ComfyUI's pruned curve representation and is returned as a runtime
+    ``curve_adaln`` term. All other mismatches fail before the model is patched.
+    """
+
+    parsed = parse_adapter_state(state, adapter_spec)
+    patches: list[FactorPatch] = []
+    occupied: set[tuple[str, int | None]] = set()
+    for module in sorted(parsed):
+        down, up = parsed[module]["A"], parsed[module]["B"]
+        target = map_lora_target(module)
+        if target.swap_swiglu_halves:
+            if up.shape[0] % 2:
+                raise ValueError(f"{module}: SwiGLU lora_B output {up.shape[0]} is not even")
+            value, gate = up.chunk(2, dim=0)
+            up = torch.cat((gate, value), dim=0)
+        key = f"{target_prefix}{target.key}.weight"
+        shape = _lookup_target_shape(target_shapes, key)
+        assert shape is not None
+        output_shape = (int(up.shape[0]), int(down.shape[1]))
+        curve_adaln = False
+        offset = None
+        slice_index = None
+        if target.qkv_slice is not None:
+            slice_index = _QKV_ORDER[target.qkv_slice]
+            if (
+                len(shape) != 2
+                or shape[0] % 3
+                or shape[0] // 3 != output_shape[0]
+                or shape[1] != output_shape[1]
+            ):
+                raise ValueError(
+                    f"{module}: LoRA factors {output_shape} are incompatible with "
+                    f"native fused QKV target {shape}"
+                )
+            offset = (slice_index * output_shape[0], output_shape[0])
+        elif tuple(shape) != output_shape:
+            if (
+                key.endswith(".adaln_proj.linear.weight")
+                and len(shape) == 2
+                and shape[0] == output_shape[0]
+            ):
+                curve_adaln = True
+            else:
+                raise ValueError(
+                    f"{module}: LoRA factors produce {output_shape}, native target is {shape}"
+                )
+        collision = (key, slice_index)
+        if collision in occupied:
+            raise ValueError(f"duplicate compact LoRA destination {collision!r}")
+        occupied.add(collision)
+        patches.append(
+            FactorPatch(
+                key=key,
+                up=up.detach().contiguous(),
+                down=down.detach().contiguous(),
+                offset=offset,
+                source=module,
+                scale=per_module_scale(adapter_spec, module),
+                curve_adaln=curve_adaln,
+            )
+        )
+    return tuple(sorted(patches, key=lambda item: (item.key, item.offset or (-1, -1))))
+
+
 def patches_by_target(patches: Sequence[DeltaPatch]) -> dict[str, tuple[DeltaPatch, ...]]:
     """Group patches for application while rejecting overlap and shape ambiguity."""
     grouped: dict[str, list[DeltaPatch]] = {}
@@ -328,7 +419,8 @@ def patches_by_target(patches: Sequence[DeltaPatch]) -> dict[str, tuple[DeltaPat
 
 
 __all__ = [
-    "BranchTarget", "DeltaPatch", "convert_adapter", "map_branch_key",
+    "BranchTarget", "DeltaPatch", "FactorPatch", "convert_adapter",
+    "convert_adapter_factors", "map_branch_key",
     "map_lora_target", "parse_adapter_state", "patches_by_target",
     "per_module_scale",
 ]

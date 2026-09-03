@@ -82,6 +82,28 @@ def _projection_info(state):
     return data
 
 
+def _adapter_snapshot(state) -> dict:
+    """Expose the exact adapter recipe that survived checkpoint application."""
+    value = getattr(state, "adapters", None)
+    if not isinstance(value, dict):
+        return {}
+    active = value.get("active")
+    strengths = value.get("strengths")
+    reports = value.get("reports")
+    result = {
+        "active": [str(name) for name in active] if isinstance(active, (list, tuple)) else [],
+        "strengths": {},
+        "lora_mode": value.get("lora_mode"),
+    }
+    if isinstance(strengths, dict):
+        result["strengths"] = {
+            str(name): float(strength) for name, strength in strengths.items()
+        }
+    if isinstance(reports, (list, tuple)):
+        result["reports"] = [str(item) for item in reports]
+    return result
+
+
 def _layout_snapshot(state):
     layout = getattr(state, "last_layout", None)
     if layout is None:
@@ -178,7 +200,7 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
     if precision == "bf16" and linear_ms > 0 and linear_ms >= max(softmax_ms * 0.65, 1.0):
         recommendations.append(
             "The VDN linear branch is a large share of runtime and its projection is BF16; "
-            "benchmark a supported INT8/ConvRot or FP8 projection as a separate quality-gated path."
+            "benchmark INT8/ConvRot and FP8 as separate quality-gated paths."
         )
     if attention == "grouped" and calibration_hit is None:
         recommendations.append(
@@ -208,9 +230,10 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
     declared_steps = _checkpoint_recipe(state).get("turbo_num_steps")
     if declared_steps is not None:
         recommendations.append(
-            f"This VDN checkpoint declares turbo_num_steps={declared_steps}; benchmark the Stage-DMD "
-            "VDN path at that NFE unless intentionally running an ablation. Conventional external "
-            "MiniMax-H3 Turbo has its own 4-step recipe and must not be forced to match this value."
+            f"This VDN checkpoint declares turbo_num_steps={declared_steps}. For the canonical "
+            "Stage-DMD benchmark use Kirei Benchmark Sampling so the actual trajectory is "
+            "Euler + simple + that NFE count + denoise 1.0 + shifts 12/3. Do not inherit a "
+            "base-model res_multistep widget."
         )
 
     return {
@@ -233,7 +256,7 @@ def _performance_analysis(state, diagnostics: dict, projection: dict, cuda: dict
 
 
 def runtime_snapshot(model_patcher: Any) -> dict:
-    """Return resolved runtime, fallback state and diagnostics without mutation."""
+    """Return resolved runtime, adapter recipe, fallback state and diagnostics."""
     state = getattr(model_patcher, "object_patches", {}).get("diffusion_model._vdn_h3_state")
     if state is None:
         raise RuntimeError("MODEL does not carry Kirei VDN-H3 state")
@@ -247,6 +270,7 @@ def runtime_snapshot(model_patcher: Any) -> dict:
     return {
         "checkpoint": state.name,
         "checkpoint_recipe": _checkpoint_recipe(state),
+        "adapters": _adapter_snapshot(state),
         "profile": getattr(state, "profile", None),
         "forwards": int(state.forwards),
         "base_precision": getattr(state, "base_precision", "bf16"),

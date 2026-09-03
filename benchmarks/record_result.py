@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 QUALITY_STATUSES = {"pending", "qualified", "failed", "diagnostic"}
@@ -15,7 +16,7 @@ def load_scenarios(path: Path):
 
 
 def _close(a, b, tol=1e-6):
-    return a is not None and b is not None and abs(float(a) - float(b)) <= tol
+    return a is not None and b is not None and math.isclose(float(a), float(b), abs_tol=tol, rel_tol=0.0)
 
 
 def _runtime_adapters(runtime):
@@ -33,12 +34,6 @@ def _runtime_adapters(runtime):
 
 
 def _expected_vdn_runtime(scenario: dict) -> dict:
-    """Expected resolved runtime implied by one scenario id/model variant.
-
-    These expectations are deliberately narrower than the normal node's `auto` policy:
-    a benchmark named BF16/INT8/reference/max_speed must actually execute that path or
-    the measurement is mislabeled and cannot enter the result set.
-    """
     variant = str(scenario.get("model_variant", ""))
     expected = {}
     if variant == "vdn_max_speed":
@@ -46,7 +41,7 @@ def _expected_vdn_runtime(scenario: dict) -> dict:
     elif variant == "vdn_stage_b_reference":
         expected["profile"] = "reference"
     elif variant.startswith("vdn_"):
-        expected["profile"] = "auto"
+        expected["profile"] = str(scenario.get("profile", "auto"))
     precision = scenario.get("projection_precision")
     if precision:
         expected["projection_precision"] = str(precision)
@@ -72,6 +67,47 @@ def _validate_vdn_runtime_label(runtime: dict, scenario: dict):
             )
 
 
+def _expected_sampling_plan(scenario: dict, recipe: dict) -> dict:
+    return {
+        "scenario_id": str(scenario["id"]),
+        "recipe_id": str(scenario["recipe_id"]),
+        "sampler_name": str(recipe["sampler_name"]),
+        "scheduler_name": str(recipe["scheduler_name"]),
+        "steps": int(recipe["steps"]),
+        "denoise": float(recipe.get("denoise", 1.0)),
+        "video_shift": float(recipe["video_shift"]),
+        "audio_shift": float(recipe["audio_shift"]),
+    }
+
+
+def _validate_sampling_plan(measurement: dict, scenario: dict, recipe: dict) -> dict:
+    plan = measurement.get("sampling_plan")
+    if not isinstance(plan, dict) or plan.get("verified") is not True:
+        raise ValueError(
+            "measurement has no verified Kirei Benchmark Sampling plan; the benchmark must "
+            "generate SAMPLER/SIGMAS from scenarios.json instead of reusing workflow widgets"
+        )
+    expected = _expected_sampling_plan(scenario, recipe)
+    for key, value in expected.items():
+        got = plan.get(key)
+        if isinstance(value, float):
+            matches = _close(got, value)
+        else:
+            matches = got == value
+        if not matches:
+            raise ValueError(
+                f"sampling plan mismatch for {key}: measured {got!r}, expected {value!r} "
+                f"for scenario {scenario['id']!r}"
+            )
+
+    if recipe.get("expects_vdn_runtime") and plan.get("sampler_name") == "res_multistep":
+        raise ValueError(
+            "res_multistep is a base-model sampler and is not valid for the OpenVDN "
+            "Stage-DMD/Stage-B benchmark; use Euler + simple"
+        )
+    return plan
+
+
 def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
     expected_steps = int(recipe["steps"])
     if int(scenario["steps"]) != expected_steps:
@@ -81,6 +117,7 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
                 f"but recipe {scenario['recipe_id']!r} requires {expected_steps}"
             )
 
+    plan = _validate_sampling_plan(measurement, scenario, recipe)
     runtime = measurement.get("runtime_report")
     expects_vdn = bool(recipe.get("expects_vdn_runtime", False))
     if expects_vdn and not isinstance(runtime, dict):
@@ -105,8 +142,6 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
                     f"for recipe {scenario['recipe_id']!r}"
                 )
 
-        # Newer Runtime Reports may expose exact named-adapter state. Validate it when
-        # available, while remaining compatible with older installed reports.
         adapter_state = _runtime_adapters(runtime)
         required = list(recipe.get("required_adapters", []))
         if required and expects_vdn and adapter_state is not None and adapter_state["active"] is not None:
@@ -127,18 +162,14 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
 
     sampling = measurement.get("sampling")
     if not isinstance(sampling, dict):
-        raise ValueError(
-            "benchmark measurement does not expose model sampling shifts; update/reload the "
-            "Kirei Benchmark Start node before recording this result"
-        )
-    expected_v = float(recipe["video_shift"])
-    expected_a = float(recipe["audio_shift"])
+        raise ValueError("benchmark measurement does not expose the model's MiniMax-H3 shifts")
     got_v, got_a = sampling.get("video_shift"), sampling.get("audio_shift")
-    if not _close(got_v, expected_v) or not _close(got_a, expected_a):
+    if not _close(got_v, plan["video_shift"]) or not _close(got_a, plan["audio_shift"]):
         raise ValueError(
-            f"sampling shifts video/audio={got_v}/{got_a}, expected {expected_v}/{expected_a} "
-            f"for recipe {scenario['recipe_id']!r}"
+            f"model sampling shifts video/audio={got_v}/{got_a}, expected "
+            f"{plan['video_shift']}/{plan['audio_shift']} for recipe {scenario['recipe_id']!r}"
         )
+    return plan
 
 
 def build_result(
@@ -147,9 +178,9 @@ def build_result(
     recipe: dict,
     *,
     seed: int,
-    scheduler: str,
     prompt_hash: str,
     quality_status: str,
+    scheduler_label: str | None = None,
     end_to_end_seconds: float | None = None,
 ):
     if quality_status not in QUALITY_STATUSES:
@@ -159,7 +190,7 @@ def build_result(
         raise ValueError(
             f"measurement scenario_id={scenario_id!r} does not match selected scenario {scenario['id']!r}"
         )
-    _validate_recipe(measurement, scenario, recipe)
+    plan = _validate_recipe(measurement, scenario, recipe)
 
     row = {
         "scenario_id": scenario["id"],
@@ -174,16 +205,20 @@ def build_result(
         "width": int(scenario["width"]),
         "height": int(scenario["height"]),
         "frames": int(scenario["frames"]),
-        "steps": int(scenario["steps"]),
+        "steps": int(plan["steps"]),
+        "sampler_name": plan["sampler_name"],
+        "scheduler_name": plan["scheduler_name"],
+        "denoise": float(plan["denoise"]),
         "seed": int(seed),
-        "scheduler": str(scheduler),
+        "scheduler_label": str(scheduler_label or f"{plan['sampler_name']}/{plan['scheduler_name']}"),
         "scheduler_family": str(recipe["scheduler_family"]),
-        "video_shift": float(recipe["video_shift"]),
-        "audio_shift": float(recipe["audio_shift"]),
+        "video_shift": float(plan["video_shift"]),
+        "audio_shift": float(plan["audio_shift"]),
         "prompt_hash": str(prompt_hash),
         "run_kind": str(measurement.get("run_kind", "warm")),
         "sampler_seconds": float(measurement["sampler_seconds"]),
         "peak_vram_bytes": measurement.get("peak_vram_bytes"),
+        "sampling_plan": plan,
         "sampling": measurement.get("sampling"),
         "runtime_report": measurement.get("runtime_report"),
     }
@@ -194,14 +229,18 @@ def build_result(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge a Kirei Benchmark End measurement with a validated benchmark recipe."
+        description="Merge a verified Kirei benchmark measurement with its scenario recipe."
     )
     parser.add_argument("measurement", type=Path, help="JSON emitted by Kirei Benchmark End")
     parser.add_argument("--scenarios", type=Path, default=Path(__file__).with_name("scenarios.json"))
     parser.add_argument("--results", type=Path, default=Path(__file__).with_name("results.jsonl"))
     parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--scheduler", required=True)
     parser.add_argument("--prompt-hash", required=True)
+    parser.add_argument(
+        "--scheduler",
+        dest="scheduler_label",
+        help="Optional human-readable label. Actual sampler/scheduler are read from the verified measurement.",
+    )
     parser.add_argument("--quality-status", choices=sorted(QUALITY_STATUSES), default="pending")
     parser.add_argument("--end-to-end-seconds", type=float)
     args = parser.parse_args()
@@ -220,9 +259,9 @@ def main():
         scenario,
         recipes[recipe_id],
         seed=args.seed,
-        scheduler=args.scheduler,
         prompt_hash=args.prompt_hash,
         quality_status=args.quality_status,
+        scheduler_label=args.scheduler_label,
         end_to_end_seconds=args.end_to_end_seconds,
     )
     args.results.parent.mkdir(parents=True, exist_ok=True)

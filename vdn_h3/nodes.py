@@ -246,8 +246,6 @@ def _resolve_runtime(
     if branch_execution != "auto":
         resolved_execution = branch_execution
     elif profile == "workstation_fp8":
-        # Explicit experimental profile only. The qualified upstream single-GPU tuned
-        # scheduler is serial, so auto/max_speed never assume two streams are faster.
         resolved_execution = _auto_execution_mode(model, resolved_branch)
     else:
         resolved_execution = "serial"
@@ -256,15 +254,15 @@ def _resolve_runtime(
 
     if lora_mode != "auto":
         resolved_lora = lora_mode
-    elif profile in {"reference", "compat_reference", "low_vram"}:
-        resolved_lora = "bypass"
     elif profile in {"max_speed", "workstation_fp8"}:
-        resolved_lora = "merge"
-    elif resolved_branch == "resident" and base_precision in {"int8", "fp8"}:
-        # Match the official tuned strategy: patch/requantize once at load time instead
-        # of paying the low-rank QKV/O GEMMs in all 50 blocks on every denoising step.
+        # Merge/requantization removes runtime low-rank GEMMs but can round away part of
+        # a small adapter update on an already quantized base. Keep it behind explicit
+        # speed-oriented profiles and their quality gate.
         resolved_lora = "merge"
     else:
+        # Auto/reference/balanced/low_vram are quality-first. The compact composite
+        # bypass preserves the released low-rank update in activation space even when
+        # the H3 base itself is INT8/FP8/pruned.
         resolved_lora = "bypass"
 
     if attention_backend != "auto":
@@ -290,7 +288,6 @@ def _resolve_runtime(
     elif profile == "max_speed":
         resolved_compile = "reduce_overhead"
     elif resolved_execution == "parallel":
-        # Avoid forcing CUDA graph capture across independent model streams.
         resolved_compile = "shared"
     else:
         resolved_compile = "shared"
@@ -315,7 +312,6 @@ def _resolve_runtime(
     elif profile == "max_speed":
         resolved_projection = base_precision if base_precision in {"int8", "fp8"} else "fp8"
     elif base_precision in {"int8", "fp8"}:
-        # A quantized H3 base should not acquire a new 7168->5376 BF16 GEMM in every block.
         resolved_projection = base_precision
     else:
         resolved_projection = "bf16"
@@ -430,9 +426,6 @@ def apply_checkpoint(
         try:
             if device is None:
                 raise RuntimeError("the loaded H3 model has no CUDA load device")
-            # Top-speed and native-INT8 profiles quantize every VDN projection, matching
-            # the official tuned rung (skip_end_blocks=0). The explicit experimental
-            # FP8 profile keeps the conservative FP8 helper default.
             skip_end = (
                 0
                 if runtime["projection_precision"] == "int8"

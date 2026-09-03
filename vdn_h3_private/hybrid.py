@@ -7,7 +7,7 @@ window implementations stay dependency-light in :mod:`branch` and :mod:`window`.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -67,7 +67,11 @@ class ManagedBranchWeights(nn.Module):
         return self._closed
 
     def weights_on(
-        self, block_index: int, device: torch.device | str, dtype: torch.dtype
+        self,
+        block_index: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        keys: Collection[str] | None = None,
     ) -> dict[str, torch.Tensor]:
         if self._closed:
             raise RuntimeError("VDN-H3 branch weights were released permanently")
@@ -81,6 +85,13 @@ class ManagedBranchWeights(nn.Module):
             }
         else:
             source = self._stream[block_index]
+        if keys is not None:
+            missing = sorted(set(keys) - set(source))
+            if missing:
+                raise KeyError(
+                    f"VDN-H3 branch block {block_index} is missing requested weights {missing}"
+                )
+            source = {key: source[key] for key in keys}
         # No result is cached: streaming copies die after the block, and resident
         # tensors are already managed buffers.  The full device identity is honored.
         return {
@@ -159,8 +170,14 @@ class VDNState(nn.Module):
         self.weight_store = ManagedBranchWeights(maps, mode=weight_mode)
         self.forwards = 0
 
-    def weights_on(self, index: int, device: torch.device | str, dtype: torch.dtype):
-        return self.weight_store.weights_on(index, device, dtype)
+    def weights_on(
+        self,
+        index: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        keys: Collection[str] | None = None,
+    ):
+        return self.weight_store.weights_on(index, device, dtype, keys)
 
     def release(self) -> "VDNState":
         self.weight_store.release()
@@ -372,8 +389,24 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                 f"{tuple(softmax_out.shape)}; expected {(layout.seq_len, heads, head_dim)}"
             )
 
-        weights = state.weights_on(block_index, x.device, x.dtype)
-        if bool(config.get("enable_softmax_gate", True)):
+        gate_enabled = bool(config.get("enable_softmax_gate", True))
+        if linear_active:
+            requested_weights = None
+        elif gate_enabled:
+            requested_weights = {
+                "softmax_gate.up.weight",
+                "softmax_gate.up.bias",
+            }
+        else:
+            requested_weights = set()
+        weights = (
+            state.weights_on(
+                block_index, x.device, x.dtype, keys=requested_weights or None
+            )
+            if requested_weights or linear_active
+            else {}
+        )
+        if gate_enabled:
             try:
                 gate = torch.sigmoid(
                     F.linear(

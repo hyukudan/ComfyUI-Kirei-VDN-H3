@@ -129,6 +129,13 @@ def test_transform_and_model_spec_validation_are_resolved_and_typed():
         validate_model_spec(spec)
 
 
+def test_transform_rejects_declared_but_unimplemented_delta_rule():
+    spec = _model_spec()
+    spec["transforms"][0]["config"]["linear_attention"]["delta_rule"] = "vdn_scaled"
+    with pytest.raises(ValueError, match="unsupported delta_rule"):
+        validate_model_spec(spec)
+
+
 def test_realpath_resolution_refuses_parent_traversal(tmp_path):
     root, ckpt, _ = _checkpoint(tmp_path)
     assert resolve_vdn_checkpoint("stage", roots=[root]) == str(ckpt)

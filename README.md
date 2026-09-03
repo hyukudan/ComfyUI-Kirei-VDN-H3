@@ -13,7 +13,7 @@
 - Native ComfyUI model-patch architecture: implemented for alpha testing.
 - Windowed softmax and VDN linear branch: implemented.
 - Strict checkpoint and adapter mapping: implemented.
-- Synthetic CPU tests: 48 passing.
+- Synthetic CPU tests: 50 passing.
 - RTX PRO 6000 CUDA validation: Flex/grouped smoke parity passed.
 - Real VDN checkpoint validation: blocked pending model-license authorization.
 - Output-quality and performance claims: none yet.
@@ -57,7 +57,7 @@ an isolated ComfyUI environment—not in the active installation.
 Validated on 2026-09-03 with Python 3.12.9, PyTorch 2.12.0+cu130 and an NVIDIA RTX
 PRO 6000 Blackwell Workstation Edition:
 
-- `48 passed` in the complete synthetic pytest suite.
+- `50 passed` in the complete synthetic pytest suite.
 - Plugin entrypoint imports against the installed ComfyUI source.
 - Registered nodes: `KireiApplyVDNH3Alpha` and `KireiReleaseVDNH3Weights`.
 - CUDA FlexAttention agrees with grouped SDPA within BF16 tolerance

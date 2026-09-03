@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 SPEC_FORMAT_VERSION = 2
 HYBRID_TRANSFORM_VERSION = 2
-SUPPORTED_DELTA_RULES = ("vdn_solve", "sana_scaled", "vdn_scaled")
+SUPPORTED_DELTA_RULES = ("vdn_solve", "sana_scaled")
 SUPPORTED_ANCHORS = ("none", "columns", "rows", "both")
 SUPPORTED_BRIDGES = ("alpha", "none")
 SHORT_CONV_TARGETS = ("q", "k", "v")

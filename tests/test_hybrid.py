@@ -77,26 +77,42 @@ def layout(frames, *, full):
     )
 
 
-def test_full_cover_gate_keeps_canonical_shape_and_scales_output():
+def test_full_cover_gate_keeps_canonical_shape_and_loads_only_gate(monkeypatch):
     torch.manual_seed(4)
     attn = TinyAttention()
     attn.out_proj.weight.data.copy_(torch.eye(4))
     x = torch.randn(4, 4)
     teacher = attn(x)
     state = VDNState("tiny", {"enable_softmax_gate": True}, [Branch()], 2, 2)
+    requested = []
+    original = state.weights_on
+
+    def recording_weights(index, device, dtype, keys=None):
+        requested.append(keys)
+        return original(index, device, dtype, keys)
+
+    monkeypatch.setattr(state, "weights_on", recording_weights)
     forward = make_vdn_forward(attn, state, 0)
     with publish_layout(layout(3, full=True)):
         result = forward(x)
     assert result.shape == (4, 4)
     torch.testing.assert_close(result, teacher * 0.5)
+    assert requested == [{"softmax_gate.up.weight", "softmax_gate.up.bias"}]
 
 
-def test_full_cover_without_gate_matches_dense_teacher():
+def test_full_cover_without_gate_matches_dense_teacher(monkeypatch):
     torch.manual_seed(8)
     attn = TinyAttention()
     x = torch.randn(3, 4)
     teacher = attn(x)
     state = VDNState("tiny", {"enable_softmax_gate": False}, [Branch(False)], 2, 2)
+    monkeypatch.setattr(
+        state,
+        "weights_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("full-cover without a gate must not transfer branch weights")
+        ),
+    )
     with publish_layout(layout(2, full=True)):
         result = make_vdn_forward(attn, state, 0)(x)
     torch.testing.assert_close(result, teacher)
@@ -132,3 +148,10 @@ def test_managed_store_is_per_instance_and_releasable():
     first.close()
     assert first.closed
 
+
+def test_managed_store_can_materialize_only_requested_weights():
+    store = ManagedBranchWeights(
+        [{"small": torch.ones(1), "large": torch.ones(1024)}], mode="stream"
+    )
+    selected = store.weights_on(0, "cpu", torch.float32, keys={"small"})
+    assert set(selected) == {"small"}

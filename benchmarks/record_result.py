@@ -30,6 +30,7 @@ def _runtime_adapters(runtime):
     return {
         "active": list(active) if isinstance(active, (list, tuple)) else None,
         "strengths": dict(strengths) if isinstance(strengths, dict) else {},
+        "lora_mode": adapters.get("lora_mode"),
     }
 
 
@@ -90,10 +91,7 @@ def _validate_sampling_plan(measurement: dict, scenario: dict, recipe: dict) -> 
     expected = _expected_sampling_plan(scenario, recipe)
     for key, value in expected.items():
         got = plan.get(key)
-        if isinstance(value, float):
-            matches = _close(got, value)
-        else:
-            matches = got == value
+        matches = _close(got, value) if isinstance(value, float) else got == value
         if not matches:
             raise ValueError(
                 f"sampling plan mismatch for {key}: measured {got!r}, expected {value!r} "
@@ -142,9 +140,14 @@ def _validate_recipe(measurement: dict, scenario: dict, recipe: dict):
                     f"for recipe {scenario['recipe_id']!r}"
                 )
 
-        adapter_state = _runtime_adapters(runtime)
         required = list(recipe.get("required_adapters", []))
-        if required and expects_vdn and adapter_state is not None and adapter_state["active"] is not None:
+        if required and expects_vdn:
+            adapter_state = _runtime_adapters(runtime)
+            if adapter_state is None or adapter_state["active"] is None:
+                raise ValueError(
+                    "VDN Runtime Report does not expose the active adapter recipe; update/reload "
+                    "Kirei VDN-H3 before recording canonical benchmark results"
+                )
             if set(adapter_state["active"]) != set(required):
                 raise ValueError(
                     f"runtime adapters {adapter_state['active']} != required {required} "

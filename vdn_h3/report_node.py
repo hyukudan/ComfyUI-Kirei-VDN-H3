@@ -216,6 +216,9 @@ class KireiVDNH3CalibrateAttention:
             bounds,
             anchors,
             groups=window_group_count(frames, bounds, anchors),
+            video_start=video_start,
+            video_end=video_end,
+            tokens_per_frame=per_frame,
         )
         cache.calibration.record(signature, winner=winner, results=results)
         cache.calibration.save()
@@ -223,6 +226,8 @@ class KireiVDNH3CalibrateAttention:
             "winner": winner,
             "gpu": torch.cuda.get_device_name(device),
             "sequence": sequence,
+            "video_start": video_start,
+            "video_end": video_end,
             "frames": frames,
             "tokens_per_frame": per_frame,
             "global_tokens": int(global_tokens),

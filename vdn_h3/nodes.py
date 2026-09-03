@@ -9,6 +9,7 @@ import torch
 
 from .apply import apply_factor_patches
 from .bypass import WeightedFactor, install_bypass, partition_factors
+from .fp8 import PROJECTION_PRECISIONS, prepare_projection_maps
 from .hybrid import VDNState, apply_vdn, validate_h3_model
 from .kernels import COMPILE_POLICIES, KERNEL_BACKENDS
 from .weights import BRANCH_MODES, PIN_STRATEGIES, STREAMED_PROJECTION_KEY
@@ -24,6 +25,7 @@ _PROFILES = (
     "low_vram",
     "reference",
     "compat_reference",
+    "experimental_fp8",
 )
 
 
@@ -174,6 +176,7 @@ def _resolve_runtime(
     compile_policy="auto",
     tile_frames=0,
     pin_strategy="auto",
+    projection_precision="auto",
     linear_kernels=None,
     legacy_branch_weights=None,
 ):
@@ -187,6 +190,8 @@ def _resolve_runtime(
         raise ValueError(f"unknown attention backend {attention_backend!r}")
     if pin_strategy not in PIN_STRATEGIES:
         raise ValueError(f"unknown pin strategy {pin_strategy!r}")
+    if projection_precision not in {"auto", *PROJECTION_PRECISIONS}:
+        raise ValueError(f"unknown projection precision {projection_precision!r}")
     if isinstance(tile_frames, bool) or not isinstance(tile_frames, int) or tile_frames < 0:
         raise ValueError("tile_frames must be a non-negative integer")
 
@@ -257,6 +262,18 @@ def _resolve_runtime(
     else:
         resolved_tile = _auto_tile_frames(model, resolved_branch)
 
+    if profile in {"reference", "compat_reference"}:
+        if projection_precision == "fp8":
+            raise ValueError("FP8 changes the numerical model and cannot be used as a reference profile")
+        resolved_projection = "bf16"
+    elif projection_precision != "auto":
+        resolved_projection = projection_precision
+    elif profile == "experimental_fp8":
+        resolved_projection = "fp8"
+    else:
+        # Precision changes are never silently selected by auto/balanced profiles.
+        resolved_projection = "bf16"
+
     return {
         "profile": profile,
         "branch_mode": resolved_branch,
@@ -266,6 +283,7 @@ def _resolve_runtime(
         "compile_policy": resolved_compile,
         "tile_frames": int(resolved_tile),
         "pin_strategy": pin_strategy,
+        "projection_precision": resolved_projection,
         "inference": profile not in {"reference", "compat_reference"},
     }
 
@@ -292,6 +310,7 @@ def apply_checkpoint(
     compile_policy: str = "auto",
     tile_frames: int = 0,
     pin_strategy: str = "auto",
+    projection_precision: str = "auto",
     strict_validation: bool = True,
     diagnostics: bool = False,
     linear_kernels: str | None = None,
@@ -337,20 +356,32 @@ def apply_checkpoint(
         )
 
     runtime = _resolve_runtime(
-        model,
-        branch_maps,
-        profile=profile,
-        branch_mode=branch_mode,
-        lora_mode=lora_mode,
-        attention_backend=attention_backend,
-        kernel_backend=kernel_backend,
-        compile_policy=compile_policy,
-        tile_frames=tile_frames,
-        pin_strategy=pin_strategy,
-        linear_kernels=linear_kernels,
+        model, branch_maps, profile=profile, branch_mode=branch_mode, lora_mode=lora_mode,
+        attention_backend=attention_backend, kernel_backend=kernel_backend,
+        compile_policy=compile_policy, tile_frames=tile_frames, pin_strategy=pin_strategy,
+        projection_precision=projection_precision, linear_kernels=linear_kernels,
         legacy_branch_weights=branch_weights,
     )
+    # Branch modules retain the original mapping only until VDNState detaches it. The
+    # storage mapping can therefore be FP8 without changing the trained branch math.
     branches = _make_branches(branch_maps, config, heads, head_dim, runtime)
+    storage_maps = branch_maps
+    projection_info = None
+    if runtime["projection_precision"] == "fp8":
+        device = _model_cuda_device(model)
+        try:
+            if device is None:
+                raise RuntimeError("the loaded H3 model has no CUDA load device")
+            storage_maps, projection_info = prepare_projection_maps(branch_maps, device)
+        except Exception as exc:
+            _LOG.warning(
+                "VDN-H3 FP8 projection unavailable (%s); falling back to BF16 before model construction",
+                exc,
+            )
+            runtime["projection_precision"] = "bf16"
+            storage_maps = branch_maps
+            projection_info = None
+
     state = VDNState(
         checkpoint_name,
         config,
@@ -360,12 +391,14 @@ def apply_checkpoint(
         weight_mode=runtime["branch_mode"],
         pin_strategy=runtime["pin_strategy"],
         attention_backend=runtime["attention_backend"],
-        weight_maps=branch_maps,
+        weight_maps=storage_maps,
         inference=runtime["inference"],
         kernel_backend=runtime["kernel_backend"],
         compile_policy=runtime["compile_policy"],
         tile_frames=runtime["tile_frames"],
         checkpoint_root=path,
+        projection_precision=runtime["projection_precision"],
+        projection_info=projection_info,
         diagnostics=diagnostics,
     )
     cloned = model.clone()
@@ -394,10 +427,8 @@ def apply_checkpoint(
         for name in wanted:
             adapter_state, adapter_spec = _adapter_parts(adapters[name])
             factors = convert_adapter_factors(
-                adapter_state,
-                adapter_spec,
-                target_shapes=target_shapes,
-                target_prefix="diffusion_model.",
+                adapter_state, adapter_spec,
+                target_shapes=target_shapes, target_prefix="diffusion_model.",
             )
             adapter_strength = per_adapter_strength.get(name, global_strength)
             weighted = [WeightedFactor(patch, adapter_strength) for patch in factors]
@@ -424,12 +455,11 @@ def apply_checkpoint(
 
     _LOG.info(
         "VDN-H3 %s applied: profile=%s branch=%s lora=%s attention=%s kernel=%s "
-        "compile=%s tile_frames=%d pin=%s; %d blocks, %.2f GiB branch; adapters %s",
-        checkpoint_name,
-        runtime["profile"], runtime["branch_mode"], runtime["lora_mode"],
+        "compile=%s tile_frames=%d pin=%s projection=%s; %d blocks, %.2f GiB branch; adapters %s",
+        checkpoint_name, runtime["profile"], runtime["branch_mode"], runtime["lora_mode"],
         runtime["attention_backend"], runtime["kernel_backend"], runtime["compile_policy"],
-        runtime["tile_frames"], runtime["pin_strategy"], len(blocks),
-        state.weight_store.nbytes / 1024**3, ", ".join(reports),
+        runtime["tile_frames"], runtime["pin_strategy"], runtime["projection_precision"],
+        len(blocks), state.weight_store.nbytes / 1024**3, ", ".join(reports),
     )
     return cloned
 
@@ -464,6 +494,9 @@ class KireiApplyVDNH3:
                     "INT", {"default": 0, "min": 0, "max": 64, "step": 1, **advanced}
                 ),
                 "pin_strategy": (list(PIN_STRATEGIES), {"default": "auto", **advanced}),
+                "projection_precision": (
+                    ["auto", *PROJECTION_PRECISIONS], {"default": "auto", **advanced}
+                ),
                 "strict_validation": ("BOOLEAN", {"default": True, **advanced}),
                 "diagnostics": ("BOOLEAN", {"default": False, **advanced}),
             },
@@ -482,7 +515,8 @@ class KireiApplyVDNH3:
         default_adapter_strength=-1.0, turbo_adapter_strength=-1.0,
         branch_mode="auto", lora_mode="auto", attention_backend="auto",
         kernel_backend="auto", compile_policy="auto", tile_frames=0,
-        pin_strategy="auto", strict_validation=True, diagnostics=False,
+        pin_strategy="auto", projection_precision="auto",
+        strict_validation=True, diagnostics=False,
     ):
         return (
             apply_checkpoint(
@@ -491,8 +525,8 @@ class KireiApplyVDNH3:
                 profile=profile, branch_mode=branch_mode, lora_mode=lora_mode,
                 attention_backend=attention_backend, kernel_backend=kernel_backend,
                 compile_policy=compile_policy, tile_frames=tile_frames,
-                pin_strategy=pin_strategy, strict_validation=strict_validation,
-                diagnostics=diagnostics,
+                pin_strategy=pin_strategy, projection_precision=projection_precision,
+                strict_validation=strict_validation, diagnostics=diagnostics,
             ),
         )
 

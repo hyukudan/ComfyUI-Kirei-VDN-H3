@@ -136,6 +136,22 @@ def _validate_layout(sequence_length, video_start, video_end, num_frames, tokens
             raise ValueError(f"bounds[{frame}]={pair!r} does not contain its query frame")
 
 
+def _exact_sdpa(q, k, v, *, scale):
+    """Exact SDPA with Comfy's backend-priority dispatch when available.
+
+    This deliberately does *not* route through ``optimized_attention`` or any model
+    ``transformer_options`` override, so Sage/kitchen quantized attention cannot soften
+    VDN's trained local windows.  On current ComfyUI, however, ``comfy.ops`` still
+    selects the fastest exact PyTorch backend for the platform (Flash/cuDNN/efficient),
+    which matters especially on Windows builds.
+    """
+    try:
+        from comfy.ops import scaled_dot_product_attention as sdpa
+    except ImportError:
+        sdpa = F.scaled_dot_product_attention
+    return sdpa(q, k, v, scale=scale)
+
+
 def _sdpa(q_rows, k_rows, v_rows, scale, transformer_options=None):
     if transformer_options is not None:
         from comfy.ldm.modules import attention as comfy_attention
@@ -149,7 +165,7 @@ def _sdpa(q_rows, k_rows, v_rows, scale, transformer_options=None):
             transformer_options=transformer_options,
         )
         return result.reshape(rows, heads, head_dim)
-    result = F.scaled_dot_product_attention(
+    result = _exact_sdpa(
         q_rows.permute(1, 0, 2).unsqueeze(0),
         k_rows.permute(1, 0, 2).unsqueeze(0),
         v_rows.permute(1, 0, 2).unsqueeze(0),

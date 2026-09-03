@@ -21,6 +21,7 @@ _PLACEHOLDER = "<place an authorized VDN checkpoint under models/vdn>"
 _PROFILES = (
     "auto",
     "max_speed",
+    "workstation_fp8",
     "balanced",
     "low_vram",
     "reference",
@@ -217,7 +218,7 @@ def _resolve_runtime(
         resolved_branch = legacy_branch_weights
     elif branch_mode != "auto":
         resolved_branch = branch_mode
-    elif profile == "max_speed":
+    elif profile in {"max_speed", "workstation_fp8"}:
         resolved_branch = "resident"
     elif profile == "low_vram":
         resolved_branch = "hybrid"
@@ -248,7 +249,7 @@ def _resolve_runtime(
         resolved_compile = compile_policy
     elif profile in {"reference", "compat_reference"}:
         resolved_compile = "off"
-    elif profile == "max_speed":
+    elif profile in {"max_speed", "workstation_fp8"}:
         resolved_compile = "reduce_overhead"
     else:
         resolved_compile = "shared"
@@ -257,7 +258,7 @@ def _resolve_runtime(
         resolved_tile = tile_frames
     elif profile == "low_vram":
         resolved_tile = 5
-    elif profile in {"reference", "compat_reference", "max_speed"}:
+    elif profile in {"reference", "compat_reference", "max_speed", "workstation_fp8"}:
         resolved_tile = 0
     else:
         resolved_tile = _auto_tile_frames(model, resolved_branch)
@@ -268,7 +269,7 @@ def _resolve_runtime(
         resolved_projection = "bf16"
     elif projection_precision != "auto":
         resolved_projection = projection_precision
-    elif profile == "experimental_fp8":
+    elif profile in {"experimental_fp8", "workstation_fp8"}:
         resolved_projection = "fp8"
     else:
         # Precision changes are never silently selected by auto/balanced profiles.
@@ -362,8 +363,6 @@ def apply_checkpoint(
         projection_precision=projection_precision, linear_kernels=linear_kernels,
         legacy_branch_weights=branch_weights,
     )
-    # Branch modules retain the original mapping only until VDNState detaches it. The
-    # storage mapping can therefore be FP8 without changing the trained branch math.
     branches = _make_branches(branch_maps, config, heads, head_dim, runtime)
     storage_maps = branch_maps
     projection_info = None

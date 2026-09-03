@@ -1,4 +1,4 @@
-"""Window-attention backends for VDN-H3: grouped, Flex and Blackwell decomposition."""
+"""Window-attention backends for VDN-H3: grouped, Flex, FA2 and Blackwell FA4."""
 
 from __future__ import annotations
 
@@ -10,9 +10,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .calibration import CalibrationStore, calibration_signature
+
 
 ANCHOR_FRAME_MODES = ("none", "columns", "rows", "both")
-ATTENTION_BACKENDS = ("auto", "grouped", "flex", "decomposed", "reference")
+ATTENTION_BACKENDS = (
+    "auto",
+    "grouped",
+    "flex",
+    "flash2",
+    "decomposed",
+    "reference",
+    "compat",
+)
 
 
 def _cache_put(cache: OrderedDict, key, value, limit):
@@ -23,7 +33,7 @@ def _cache_put(cache: OrderedDict, key, value, limit):
 
 
 class WindowAttentionCache:
-    """All device masks/plans/compiled calls belong to one patched VDN model."""
+    """All masks/plans/compiled calls and calibration belong to one patched model."""
 
     def __init__(self, limit: int = 16):
         if limit <= 0:
@@ -33,6 +43,8 @@ class WindowAttentionCache:
         self._plans: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._compiled = None
         self._broken: dict[str, str] = {}
+        self.calibration = CalibrationStore()
+        self.last_calibration_hit: str | None = None
 
     def get(self, key):
         value = self._masks.get(key)
@@ -71,6 +83,7 @@ class WindowAttentionCache:
         self._plans.clear()
         self._compiled = None
         self._broken.clear()
+        self.last_calibration_hit = None
 
     release = clear
 
@@ -280,6 +293,16 @@ def flex_available(cache: WindowAttentionCache | None = None) -> bool:
         return False
 
 
+def flash2_available(cache: WindowAttentionCache | None = None) -> bool:
+    if cache is not None and cache.is_broken("flash2"):
+        return False
+    try:
+        from flash_attn import flash_attn_varlen_func  # noqa:F401
+        return True
+    except Exception:
+        return False
+
+
 def decomposed_available(cache: WindowAttentionCache | None = None) -> bool:
     if cache is not None and cache.is_broken("decomposed"):
         return False
@@ -288,6 +311,18 @@ def decomposed_available(cache: WindowAttentionCache | None = None) -> bool:
         return True
     except Exception:
         return False
+
+
+def _backend_available(backend: str, cache: WindowAttentionCache | None):
+    if backend == "grouped":
+        return True
+    if backend == "flex":
+        return flex_available(cache)
+    if backend == "flash2":
+        return flash2_available(cache)
+    if backend == "decomposed":
+        return decomposed_available(cache)
+    return False
 
 
 def resolve_attention_backend(
@@ -302,15 +337,26 @@ def resolve_attention_backend(
         raise ValueError(f"unsupported attention backend {requested!r}")
     if requested != "auto":
         return requested
+    groups = window_group_count(num_frames, bounds, anchor_frames)
+    if cache is not None:
+        signature = calibration_signature(
+            query, num_frames, bounds, anchor_frames, groups=groups
+        )
+        calibrated = cache.calibration.lookup(signature)
+        if calibrated and _backend_available(calibrated, cache):
+            cache.last_calibration_hit = calibrated
+            return calibrated
+        cache.last_calibration_hit = None
     if query.is_cuda and torch.cuda.is_available():
         capability = torch.cuda.get_device_capability(query.device)
         if capability[0] >= 10 and decomposed_available(cache):
             return "decomposed"
-    groups = window_group_count(num_frames, bounds, anchor_frames)
     if groups <= 8:
         return "grouped"
     if query.is_cuda and query.shape[0] >= 8192 and flex_available(cache):
         return "flex"
+    # FA2 is deliberately calibration-only by default. On Ada the gather cost can be
+    # larger than the kernel win, so auto never assumes it is faster.
     return "grouped"
 
 
@@ -420,40 +466,41 @@ def _decomposed_plan(cache, sequence_length, video_start, video_end, num_frames,
     return plan
 
 
-def window_softmax_decomposed(
+def _dense_decomposed_rows(query, key, value, plan, scale, out):
+    if not len(plan.dense_q):
+        return
+    qd = query[plan.dense_q]
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        context = sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+    except Exception:
+        context = nullcontext()
+    with context:
+        od = F.scaled_dot_product_attention(
+            qd.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0), scale=scale,
+        )
+    out[plan.dense_q] = od[0].transpose(0, 1)
+
+
+def _window_softmax_varlen(
     query, key, value, video_start, video_end, num_frames, tokens_per_frame,
-    bounds, scale, anchor_frames="none", cache: WindowAttentionCache | None = None,
+    bounds, scale, anchor_frames, cache, flash_func,
 ):
     if not query.is_cuda:
-        raise RuntimeError("decomposed FA4 attention requires CUDA")
-    from flash_attn.cute.interface import flash_attn_varlen_func
-
+        raise RuntimeError("varlen flash attention requires CUDA")
     plan = _decomposed_plan(
         cache, query.shape[0], video_start, video_end, num_frames, tokens_per_frame,
         bounds, anchor_frames, query.device,
     )
-    if not key.is_contiguous():
-        key = key.contiguous()
-    if not value.is_contiguous():
-        value = value.contiguous()
+    key = key if key.is_contiguous() else key.contiguous()
+    value = value if value.is_contiguous() else value.contiguous()
     out = torch.empty_like(query)
-    if len(plan.dense_q):
-        qd = query[plan.dense_q]
-        try:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-            context = sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
-        except Exception:
-            context = nullcontext()
-        with context:
-            od = F.scaled_dot_product_attention(
-                qd.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
-                value.transpose(0, 1).unsqueeze(0), scale=scale,
-            )
-        out[plan.dense_q] = od[0].transpose(0, 1)
+    _dense_decomposed_rows(query, key, value, plan, scale, out)
     if plan.has_windows:
         kw = key[plan.kv_gather]
         vw = value[plan.kv_gather]
-        ow = flash_attn_varlen_func(
+        ow = flash_func(
             query[plan.win_q], kw, vw,
             cu_seqlens_q=plan.cu_q, cu_seqlens_k=plan.cu_k,
             max_seqlen_q=plan.max_q, max_seqlen_k=plan.max_k,
@@ -465,17 +512,44 @@ def window_softmax_decomposed(
     return out
 
 
+def window_softmax_decomposed(
+    query, key, value, video_start, video_end, num_frames, tokens_per_frame,
+    bounds, scale, anchor_frames="none", cache: WindowAttentionCache | None = None,
+):
+    from flash_attn.cute.interface import flash_attn_varlen_func
+
+    return _window_softmax_varlen(
+        query, key, value, video_start, video_end, num_frames, tokens_per_frame,
+        bounds, scale, anchor_frames, cache, flash_attn_varlen_func,
+    )
+
+
+def window_softmax_flash2(
+    query, key, value, video_start, video_end, num_frames, tokens_per_frame,
+    bounds, scale, anchor_frames="none", cache: WindowAttentionCache | None = None,
+):
+    """FA2 varlen decomposition for Ada/Ampere-class cards; opt-in or calibrated."""
+    from flash_attn import flash_attn_varlen_func
+
+    return _window_softmax_varlen(
+        query, key, value, video_start, video_end, num_frames, tokens_per_frame,
+        bounds, scale, anchor_frames, cache, flash_attn_varlen_func,
+    )
+
+
 __all__ = [
     "ANCHOR_FRAME_MODES",
     "ATTENTION_BACKENDS",
     "WindowAttentionCache",
     "decomposed_available",
+    "flash2_available",
     "flex_available",
     "full_coverage",
     "resolve_attention_backend",
     "window_bounds",
     "window_group_count",
     "window_softmax_decomposed",
+    "window_softmax_flash2",
     "window_softmax_flex",
     "window_softmax_grouped",
 ]

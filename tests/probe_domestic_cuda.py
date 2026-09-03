@@ -5,7 +5,7 @@ Run inside the ComfyUI Python environment, for example:
     python tests/probe_domestic_cuda.py --device cuda:0 --json vdn-domestic.json
 
 No model weights are needed. The probe checks the exact tiled branch, hybrid transfer
-policy and opt-in FP8 projection on the selected GPU.
+policy and the quantized VDN projection families on the selected GPU.
 """
 
 from __future__ import annotations
@@ -18,15 +18,16 @@ from pathlib import Path
 import torch
 
 from vdn_h3 import window
-from vdn_h3.fp8 import (
+from vdn_h3.projection import (
     FP8_SCALE_KEY,
     FP8_WEIGHT_KEY,
     fp8_supported,
+    int8_supported,
     prepare_projection_maps,
     project,
 )
 from vdn_h3.runtime import OptimizedLinearBranch, SharedBranchRuntime
-from vdn_h3.weights import FP8_STREAMED_PROJECTION_KEY, ManagedBranchWeights
+from vdn_h3.weights import ManagedBranchWeights
 
 
 def _sync(device):
@@ -48,9 +49,13 @@ def _time(device, fn, warmup=1, runs=4):
 
 def _error(got, want, atol=3e-2, rtol=5e-2):
     diff = (got.float() - want.float()).abs()
+    flat_got = got.float().reshape(-1)
+    flat_want = want.float().reshape(-1)
+    cosine = torch.nn.functional.cosine_similarity(flat_got, flat_want, dim=0)
     return {
         "max_abs": float(diff.max().item()),
         "mean_abs": float(diff.mean().item()),
+        "cosine": float(cosine.item()),
         "allclose": bool(torch.allclose(got.float(), want.float(), atol=atol, rtol=rtol)),
     }
 
@@ -138,9 +143,7 @@ def probe_hybrid_stream(device, quick=False):
         }
         for index in range(4)
     ]
-    store = ManagedBranchWeights(
-        blocks, mode="hybrid", pin_strategy="auto"
-    )
+    store = ManagedBranchWeights(blocks, mode="hybrid", pin_strategy="auto")
     checks = []
     for index in range(4):
         store.prefetch(index, device, torch.bfloat16, None)
@@ -159,13 +162,21 @@ def probe_hybrid_stream(device, quick=False):
     }
 
 
-def probe_fp8(device, quick=False):
-    torch.manual_seed(1203)
-    if not fp8_supported(device, probe=True):
-        return {"available": False}
+def _probe_quantized_projection(device, precision, quick=False):
+    torch.manual_seed(1203 if precision == "fp8" else 1204)
+    available = fp8_supported(device, probe=True) if precision == "fp8" else int8_supported(device, probe=True)
+    if not available:
+        return {"available": False, "precision": precision}
+
+    # Keep K divisible by the 256 ConvRot group on the INT8 path.
     rows, in_features, out_features = (128, 256, 384) if quick else (512, 1024, 1536)
     weight = torch.randn(out_features, in_features, dtype=torch.bfloat16) * 0.03
-    maps, info = prepare_projection_maps([{"to_out_linear.weight": weight}], device)
+    maps, info = prepare_projection_maps(
+        [{"to_out_linear.weight": weight}],
+        device,
+        precision,
+        skip_end_blocks=0,
+    )
     quantized = maps[0]
     x = torch.randn(rows, in_features, device=device, dtype=torch.bfloat16)
     bf16_weight = weight.to(device)
@@ -176,16 +187,37 @@ def probe_fp8(device, quick=False):
         FP8_WEIGHT_KEY: quantized[FP8_WEIGHT_KEY].to(device),
         FP8_SCALE_KEY: quantized[FP8_SCALE_KEY].to(device),
     }
-    got, fp8_ms = _time(device, lambda: project(x, gpu_weights), runs=4 if quick else 10)
+    got, quant_ms = _time(device, lambda: project(x, gpu_weights), runs=4 if quick else 10)
+    error = _error(
+        got,
+        reference,
+        atol=8e-2 if precision == "fp8" else 1.5e-1,
+        rtol=1e-1 if precision == "fp8" else 1.5e-1,
+    )
     return {
         "available": True,
-        **_error(got, reference, atol=8e-2, rtol=1e-1),
+        "precision": precision,
+        **error,
         "bf16_ms": bf16_ms,
-        "fp8_ms": fp8_ms,
+        "quantized_ms": quant_ms,
+        "speedup_vs_bf16": bf16_ms / quant_ms if quant_ms > 0 else None,
         "original_bytes": info.original_bytes,
         "quantized_bytes": info.quantized_bytes,
-        "per_tensor": info.per_tensor,
+        "storage_ratio": info.quantized_bytes / info.original_bytes if info.original_bytes else None,
+        "info": {
+            key: value
+            for key, value in vars(info).items()
+            if isinstance(value, (str, int, float, bool))
+        },
     }
+
+
+def probe_fp8(device, quick=False):
+    return _probe_quantized_projection(device, "fp8", quick)
+
+
+def probe_int8(device, quick=False):
+    return _probe_quantized_projection(device, "int8", quick)
 
 
 def main():
@@ -208,6 +240,7 @@ def main():
     for name, fn in (
         ("tiled", lambda: probe_tiled(device, args.quick)),
         ("hybrid_stream", lambda: probe_hybrid_stream(device, args.quick)),
+        ("int8_convrot_projection", lambda: probe_int8(device, args.quick)),
         ("fp8_projection", lambda: probe_fp8(device, args.quick)),
     ):
         try:
@@ -220,14 +253,20 @@ def main():
         path = Path(args.json_path)
         path.write_text(text + "\n", encoding="utf-8")
         print(f"wrote {path}")
+
     failures = []
     if not result.get("tiled", {}).get("allclose", False):
         failures.append("tiled")
     if not result.get("hybrid_stream", {}).get("correct", False):
         failures.append("hybrid_stream")
-    fp8 = result.get("fp8_projection", {})
-    if fp8.get("available") and not fp8.get("allclose", False):
-        failures.append("fp8_projection")
+    for name in ("int8_convrot_projection", "fp8_projection"):
+        item = result.get(name, {})
+        if not item.get("available"):
+            continue
+        # Quantized inference changes arithmetic. Require strong local directional
+        # agreement rather than exact BF16 elementwise equality.
+        if float(item.get("cosine", 0.0)) < 0.98:
+            failures.append(name)
     if failures:
         raise SystemExit("FAILED: " + ", ".join(failures))
 

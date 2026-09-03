@@ -91,6 +91,28 @@ def _compute_dtype(model_patcher):
     return dtype if dtype in {torch.float16, torch.bfloat16} else torch.bfloat16
 
 
+def is_curve_h3_base(dm) -> bool:
+    """Detect pruned/curve H3 bases by flag or collapsed AdaLN input width.
+
+    Some converted/pruned checkpoints do not reliably expose ``use_adaln_curves`` even
+    though ``adaln_proj.linear`` has already been collapsed onto the small shared curve
+    coordinate.  The structural weight shape is therefore used as a second, independent
+    signal.  Unlike ports that simply skip those LoRA terms, Kirei keeps the exact
+    e-grid reinjection path and only uses this helper to select it reliably.
+    """
+    if bool(getattr(dm, "use_adaln_curves", False)):
+        return True
+    blocks = getattr(dm, "blocks", None)
+    if blocks is None:
+        blocks = getattr(dm, "transformer_blocks", None)
+    try:
+        block = blocks[0]
+        weight = block.adaln_proj.linear.weight
+        return bool(weight.ndim == 2 and int(weight.shape[-1]) < 64)
+    except (AttributeError, IndexError, TypeError):
+        return False
+
+
 class CurveAdapterState(nn.Module):
     """Per-model low-rank AdaLN terms exposed as an auxiliary Comfy model."""
 
@@ -220,8 +242,12 @@ def apply_curve_adapters(model_patcher, vdn_state, terms, *, egrid_path: str | N
     if not terms:
         return 0
     dm = model_patcher.get_model_object("diffusion_model")
-    if not getattr(dm, "use_adaln_curves", False):
+    if not is_curve_h3_base(dm):
         raise RuntimeError("curve AdaLN factors were produced for a non-curve H3 base")
+    if getattr(dm, "adaln_t_table", None) is None:
+        raise RuntimeError(
+            "pruned H3 AdaLN structure was detected but the shared adaln_t_table is missing"
+        )
     curve_state = CurveAdapterState(
         load_egrid(egrid_path, checkpoint_root=getattr(vdn_state, "checkpoint_root", None)),
         terms,
@@ -263,5 +289,6 @@ __all__ = [
     "CurveAdapterState",
     "apply_curve_adapters",
     "curve_runtime_scope",
+    "is_curve_h3_base",
     "load_egrid",
 ]

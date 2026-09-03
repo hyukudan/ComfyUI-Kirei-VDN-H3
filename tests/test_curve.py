@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 
 from vdn_h3.adapters import FactorPatch
-from vdn_h3.curve import CurveAdapterState, curve_runtime_scope, make_curve_adaln_forward
+from vdn_h3.curve import (
+    CurveAdapterState,
+    curve_runtime_scope,
+    is_curve_h3_base,
+    make_curve_adaln_forward,
+)
 
 
 class TinyAdaln(nn.Module):
@@ -52,3 +57,21 @@ def test_curve_forward_adds_low_rank_delta_before_chunking():
         first, second = forward(torch.tensor([[0.5, 0.5]]))
     torch.testing.assert_close(first, torch.full((1, 2), 2.0))
     torch.testing.assert_close(second, torch.full((1, 2), 2.0))
+
+
+def test_curve_base_detection_uses_flag_or_collapsed_adaln_shape():
+    flagged = nn.Module()
+    flagged.use_adaln_curves = True
+    assert is_curve_h3_base(flagged)
+
+    structural = nn.Module()
+    structural.blocks = nn.ModuleList([nn.Module()])
+    structural.blocks[0].adaln_proj = nn.Module()
+    structural.blocks[0].adaln_proj.linear = nn.Linear(8, 32, bias=False)
+    assert is_curve_h3_base(structural)
+
+    dense = nn.Module()
+    dense.blocks = nn.ModuleList([nn.Module()])
+    dense.blocks[0].adaln_proj = nn.Module()
+    dense.blocks[0].adaln_proj.linear = nn.Linear(2688, 32, bias=False)
+    assert not is_curve_h3_base(dense)

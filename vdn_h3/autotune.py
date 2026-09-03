@@ -1,10 +1,8 @@
-"""One-time exact attention autotuning for a real VDN render geometry.
+"""One-time exact attention autotuning for a VDN render geometry.
 
-Unlike a fixed heuristic, this module benchmarks only backends that are actually
-available on the active GPU and stores the fastest numerically-valid result in the same
-persistent calibration store used by the explicit calibration node. The cost is paid
-once per exact hardware/PyTorch/geometry signature; subsequent renders do no hidden
-benchmark work.
+Only exact backends installed on the active GPU are considered. The fastest
+numerically-valid result is persisted by hardware/PyTorch/geometry, so normal warm
+renders pay no benchmarking overhead.
 """
 
 from __future__ import annotations
@@ -20,10 +18,10 @@ from .calibration import calibration_signature
 _LOG = logging.getLogger("comfy.vdn_h3")
 
 
-def _timed(fn, device: torch.device, runs: int = 2):
-    # First call absorbs lazy library/kernel compilation and allocator setup. We time
-    # only the steady-state calls because this calibration is used to choose the stable
-    # render path, not to minimize one-off startup latency.
+def _timed(fn, device: torch.device, runs: int = 1):
+    # One warm call absorbs lazy kernel/library compilation. One timed steady call is
+    # enough to rank these large kernels and avoids turning first render into a benchmark
+    # suite. The explicit calibration node remains available for multi-run measurements.
     warm = fn()
     del warm
     start = torch.cuda.Event(enable_timing=True)
@@ -38,6 +36,7 @@ def _timed(fn, device: torch.device, runs: int = 2):
 
 
 def _signature(query, layout, cache):
+    del cache
     from .window import window_group_count
 
     return calibration_signature(
@@ -45,9 +44,7 @@ def _signature(query, layout, cache):
         layout.num_frames,
         layout.bounds,
         layout.anchor_frames,
-        groups=window_group_count(
-            layout.num_frames, layout.bounds, layout.anchor_frames
-        ),
+        groups=window_group_count(layout.num_frames, layout.bounds, layout.anchor_frames),
         video_start=layout.video_start,
         video_end=layout.video_end,
         tokens_per_frame=layout.tokens_per_frame,
@@ -62,14 +59,9 @@ def runtime_autotune_attention(
     scale: float,
     cache: Any,
     *,
-    runs: int = 2,
+    runs: int = 1,
 ) -> str | None:
-    """Return/persist the fastest exact backend for the current real tensors.
-
-    The benchmark deliberately excludes ``reference``/``compat`` and any approximate
-    attention implementation. Failure of the autotuner never prevents rendering: the
-    caller can fall back to the conservative built-in dispatch.
-    """
+    """Return/persist the fastest exact backend for the current geometry."""
 
     if not query.is_cuda or not torch.cuda.is_available():
         return None
@@ -101,42 +93,16 @@ def runtime_autotune_attention(
 
     def grouped():
         return window_softmax_grouped(
-            query,
-            key,
-            value,
-            **common,
-            transformer_options=None,
+            query, key, value, **common, transformer_options=None
         )
 
     candidates: list[tuple[str, Any]] = [("grouped", grouped)]
     if flex_available(cache):
-        candidates.append(
-            (
-                "flex",
-                lambda: window_softmax_flex(
-                    query, key, value, **common, cache=cache
-                ),
-            )
-        )
+        candidates.append(("flex", lambda: window_softmax_flex(query, key, value, **common, cache=cache)))
     if flash2_available(cache):
-        candidates.append(
-            (
-                "flash2",
-                lambda: window_softmax_flash2(
-                    query, key, value, **common, cache=cache
-                ),
-            )
-        )
+        candidates.append(("flash2", lambda: window_softmax_flash2(query, key, value, **common, cache=cache)))
     if decomposed_available(cache):
-        candidates.append(
-            (
-                "decomposed",
-                lambda: window_softmax_decomposed(
-                    query, key, value, **common, cache=cache
-                ),
-            )
-        )
-
+        candidates.append(("decomposed", lambda: window_softmax_decomposed(query, key, value, **common, cache=cache)))
     if len(candidates) == 1:
         return None
 
@@ -165,11 +131,7 @@ def runtime_autotune_attention(
         try:
             got, elapsed = _timed(fn, query.device, runs=runs)
             diff = (got.float() - reference.float()).abs()
-            close = bool(
-                torch.allclose(
-                    got.float(), reference.float(), atol=2e-2, rtol=4e-2
-                )
-            )
+            close = bool(torch.allclose(got.float(), reference.float(), atol=2e-2, rtol=4e-2))
             results[name] = {
                 "available": True,
                 "allclose": close,
@@ -196,8 +158,6 @@ def runtime_autotune_attention(
         cache.calibration.save()
         cache.last_calibration_hit = winner
     except Exception as exc:
-        # Selection remains useful for the current model even if a read-only install
-        # prevents persistence.
         _LOG.warning("VDN-H3 could not persist attention calibration: %s", exc)
     finally:
         del reference

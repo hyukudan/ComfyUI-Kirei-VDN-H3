@@ -108,16 +108,18 @@ class VDNState:
             maps = list(weight_maps)
             if len(maps) != len(self.branches):
                 raise ValueError("weight_maps must match branch count")
-        streamed_key = (
-            FP8_STREAMED_PROJECTION_KEY
-            if projection_precision == "fp8"
-            else STREAMED_PROJECTION_KEY
-        )
+        if projection_precision == "fp8":
+            # FP8 mode deliberately keeps edge blocks BF16. Hybrid storage therefore
+            # treats both possible representations as streamable and each block owns
+            # exactly one of them.
+            streamed_keys = (STREAMED_PROJECTION_KEY, FP8_STREAMED_PROJECTION_KEY)
+        else:
+            streamed_keys = (STREAMED_PROJECTION_KEY,)
         self.weight_store = ManagedBranchWeights(
             maps,
             mode=weight_mode,
             pin_strategy=pin_strategy,
-            streamed_keys=(streamed_key,),
+            streamed_keys=streamed_keys,
         )
         for branch in self.branches:
             detach = getattr(branch, "detach_weights", None)
@@ -125,13 +127,17 @@ class VDNState:
                 detach()
             set_runtime = getattr(branch, "set_runtime", None)
             if set_runtime is not None:
-                set_runtime(
-                    runtime_cache=self.branch_runtime,
-                    kernel_backend=kernel_backend,
-                    compile_policy=compile_policy,
-                    tile_frames=tile_frames,
-                    diagnostics=self.diagnostics,
-                )
+                try:
+                    set_runtime(
+                        runtime_cache=self.branch_runtime,
+                        kernel_backend=kernel_backend,
+                        compile_policy=compile_policy,
+                        tile_frames=tile_frames,
+                        diagnostics=self.diagnostics,
+                    )
+                except TypeError:
+                    # Compatibility with the base/reference LinearBranch API.
+                    set_runtime(linear_kernels=kernel_backend, diagnostics=self.diagnostics)
 
     @property
     def weight_mode(self):
@@ -150,15 +156,18 @@ class VDNState:
         self.weight_store.mark_consumed(index, device, dtype)
 
     def projection_view(self, weights):
-        """Return branch-visible metadata plus the actual projection callable."""
-        if self.projection_precision == "bf16":
+        """Return branch-visible metadata plus the actual projection callable.
+
+        FP8 mode is heterogeneous by block: edge blocks contain the canonical BF16
+        weight, while interior blocks contain FP8 weight + scale. The dispatch is based
+        on the block's actual inventory rather than a global precision assumption.
+        """
+        if STREAMED_PROJECTION_KEY in weights:
             return weights, lambda value: F.linear(value, weights[STREAMED_PROJECTION_KEY])
         from .fp8 import FP8_WEIGHT_KEY, project
 
         if FP8_WEIGHT_KEY not in weights:
-            raise RuntimeError("FP8 projection state is missing its quantized weight")
-        # OptimizedLinearBranch only needs `.shape` from the canonical key to allocate
-        # output/zero anchors; the GEMM itself is supplied by the projector callback.
+            raise RuntimeError("VDN projection state contains neither BF16 nor FP8 weight")
         branch_weights = dict(weights)
         branch_weights[STREAMED_PROJECTION_KEY] = _ShapeOnlyWeight(
             tuple(int(x) for x in weights[FP8_WEIGHT_KEY].shape)
@@ -280,7 +289,15 @@ def _window_softmax(q, k, v, layout, scale, requested, transformer_options, cach
     )
 
     backend = resolve_attention_backend(
-        requested, q, layout.num_frames, layout.bounds, layout.anchor_frames, cache
+        requested,
+        q,
+        layout.num_frames,
+        layout.bounds,
+        layout.anchor_frames,
+        cache,
+        video_start=layout.video_start,
+        video_end=layout.video_end,
+        tokens_per_frame=layout.tokens_per_frame,
     )
     if backend == "reference":
         return (
@@ -395,10 +412,9 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                 with state.diagnostics.scope("attention.linear_branch", x.device):
                     projected = getattr(branch, "projected_delta", None)
                     if projected is None:
-                        if state.projection_precision != "bf16":
-                            raise RuntimeError("FP8 projection requires the optimized VDN branch runtime")
+                        branch_weights, projector = state.projection_view(weights)
                         readout = branch.readout(
-                            weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
+                            branch_weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
                             layout.num_frames, layout.tokens_per_frame, layout.bounds,
                             frame_size=layout.frame_size,
                             text_x=x[ta:tb] if text_enabled else None,
@@ -406,9 +422,7 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                             text_v_raw=value[ta:tb] if text_enabled else None,
                             skip_ends=(layout.anchor_frames == "both"), inference=True,
                         )
-                        linear_delta = F.linear(
-                            readout.to(dtype=x.dtype), weights[STREAMED_PROJECTION_KEY]
-                        )
+                        linear_delta = projector(readout.to(dtype=x.dtype))
                     else:
                         branch_weights, projector = state.projection_view(weights)
                         linear_delta = projected(
@@ -458,9 +472,7 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
 
             if not weights_loaded and (requested_weights is None or requested_weights):
                 with state.diagnostics.scope("weights.transfer", x.device):
-                    weights = state.weights_on(
-                        block_index, x.device, x.dtype, keys=requested_weights
-                    )
+                    weights = state.weights_on(block_index, x.device, x.dtype, keys=requested_weights)
                 weights_loaded = bool(weights)
 
             if gate_enabled:
@@ -492,19 +504,19 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                     weights_loaded = True
                 q_video, k_video, v_video, text_x, text_k, text_v = deferred_reference
                 with state.diagnostics.scope("attention.linear_branch", x.device):
+                    branch_weights, projector = state.projection_view(weights)
                     projected = getattr(branch, "projected_delta", None)
                     if projected is None:
                         readout = branch.readout(
-                            weights, x[layout.video_start : layout.video_end],
+                            branch_weights, x[layout.video_start : layout.video_end],
                             q_video, k_video, v_video,
                             layout.num_frames, layout.tokens_per_frame, layout.bounds,
                             frame_size=layout.frame_size,
                             text_x=text_x, text_k_raw=text_k, text_v_raw=text_v,
                             skip_ends=(layout.anchor_frames == "both"), inference=False,
                         )
-                        delta = F.linear(readout.to(dtype=x.dtype), weights[STREAMED_PROJECTION_KEY])
+                        delta = projector(readout.to(dtype=x.dtype))
                     else:
-                        branch_weights, projector = state.projection_view(weights)
                         delta = projected(
                             branch_weights, x[layout.video_start : layout.video_end],
                             q_video, k_video, v_video,

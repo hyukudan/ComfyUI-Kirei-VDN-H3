@@ -332,6 +332,10 @@ def resolve_attention_backend(
     bounds,
     anchor_frames: str,
     cache: WindowAttentionCache | None = None,
+    *,
+    video_start: int | None = None,
+    video_end: int | None = None,
+    tokens_per_frame: int | None = None,
 ) -> str:
     if requested not in ATTENTION_BACKENDS:
         raise ValueError(f"unsupported attention backend {requested!r}")
@@ -340,7 +344,14 @@ def resolve_attention_backend(
     groups = window_group_count(num_frames, bounds, anchor_frames)
     if cache is not None:
         signature = calibration_signature(
-            query, num_frames, bounds, anchor_frames, groups=groups
+            query,
+            num_frames,
+            bounds,
+            anchor_frames,
+            groups=groups,
+            video_start=video_start,
+            video_end=video_end,
+            tokens_per_frame=tokens_per_frame,
         )
         calibrated = cache.calibration.lookup(signature)
         if calibrated and _backend_available(calibrated, cache):

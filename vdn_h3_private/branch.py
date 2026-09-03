@@ -1,9 +1,9 @@
-"""Eager PyTorch implementation of the VDN bidirectional linear branch.
+"""PyTorch implementation of the VDN bidirectional linear branch.
 
 The equations follow the Apache-2.0 OpenVDN reference and the independently
-licensed Saganaki22 ComfyUI integration listed in ``THIRD_PARTY.md``.  The code
-here is an independent correctness-first implementation: no custom kernels,
-checkpoint weights, or live ComfyUI imports are required.
+licensed Saganaki22 ComfyUI integration listed in ``THIRD_PARTY.md``.  The module
+keeps a differentiable eager path and adds allocation-conscious inference paths;
+no custom CUDA extension or live ComfyUI import is required.
 """
 
 from __future__ import annotations
@@ -130,31 +130,53 @@ def frame_statistics(
     """Collapse frame tokens into weighted key/key and value/key matrices.
 
     Inputs use ``[frames, heads, tokens, dim]`` and beta uses
-    ``[frames, heads, tokens]``.  Both returned matrices are fp32 to keep the
-    subsequent solve well-conditioned.
+    ``[frames, heads, tokens]``. Both returned matrices are fp32 to keep the
+    subsequent solve well-conditioned. K is repacked once and reused by both
+    GEMMs; this avoids a hidden second repack of the non-contiguous frame view.
     """
     if key_by_frame.ndim != 4 or value_by_frame.shape != key_by_frame.shape:
         raise ValueError("key and value must share shape [frames, heads, tokens, dim]")
     if beta.shape != key_by_frame.shape[:-1]:
         raise ValueError("beta must have shape [frames, heads, tokens]")
     with torch.autocast(device_type=key_by_frame.device.type, enabled=False):
-        key32 = key_by_frame.float().contiguous()
+        key_compute = key_by_frame.contiguous()
+        key32 = key_compute.float()
         weighted_key32 = (key32 * beta.float().unsqueeze(-1)).contiguous()
         if a_fp32:
             with _tf32_matmul(key_by_frame.device):
                 matrix_a = weighted_key32.transpose(-1, -2) @ key32
         else:
             weighted_key = (
-                key_by_frame * beta.to(key_by_frame.dtype).unsqueeze(-1)
+                key_compute * beta.to(key_compute.dtype).unsqueeze(-1)
             ).contiguous()
-            matrix_a = (weighted_key.transpose(-1, -2) @ key_by_frame).float()
+            matrix_a = (weighted_key.transpose(-1, -2) @ key_compute).float()
         # Roundoff can break symmetry enough to bother Cholesky.
         matrix_a = 0.5 * (matrix_a + matrix_a.transpose(-1, -2))
         weighted_value = (
             value_by_frame * beta.to(value_by_frame.dtype).unsqueeze(-1)
         ).contiguous()
-        matrix_b = (weighted_value.transpose(-1, -2) @ key_by_frame).float()
+        matrix_b = (weighted_value.transpose(-1, -2) @ key_compute).float()
     return matrix_a, matrix_b
+
+
+def _scan_inputs(
+    backend: VdnDelta | SanaDelta,
+    alpha: torch.Tensor,
+    a_raw: torch.Tensor,
+    b_raw: torch.Tensor,
+    text_state: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if a_raw.ndim != 4 or a_raw.shape != b_raw.shape or a_raw.shape[0] == 0:
+        raise ValueError("A and B must share non-empty [frames, heads, D, D] shape")
+    transitions, injections = backend.factor_apply(alpha, a_raw, b_raw)
+    initial = (
+        torch.zeros_like(injections[0])
+        if text_state is None
+        else text_state.to(device=injections.device, dtype=injections.dtype)
+    )
+    if initial.shape != injections.shape[1:]:
+        raise ValueError("text_state must have shape [heads, D, D]")
+    return transitions, injections, initial
 
 
 def run_scans(
@@ -164,19 +186,11 @@ def run_scans(
     b_raw: torch.Tensor,
     text_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute inclusive forward and reverse recurrence state banks."""
-    if a_raw.ndim != 4 or a_raw.shape != b_raw.shape or a_raw.shape[0] == 0:
-        raise ValueError("A and B must share non-empty [frames, heads, D, D] shape")
+    """Differentiable inclusive forward and reverse recurrence state banks."""
     with torch.autocast(device_type=a_raw.device.type, enabled=False):
-        transitions, injections = backend.factor_apply(alpha, a_raw, b_raw)
-        initial = (
-            torch.zeros_like(injections[0])
-            if text_state is None
-            else text_state.to(device=injections.device, dtype=injections.dtype)
+        transitions, injections, initial = _scan_inputs(
+            backend, alpha, a_raw, b_raw, text_state
         )
-        if initial.shape != injections.shape[1:]:
-            raise ValueError("text_state must have shape [heads, D, D]")
-
         forward_states: list[torch.Tensor] = []
         state = initial
         for frame in range(transitions.shape[0]):
@@ -189,6 +203,49 @@ def run_scans(
             state = torch.baddbmm(injections[frame], state, transitions[frame])
             reverse_states[frame] = state
         return torch.stack(forward_states), torch.stack(reverse_states)
+
+
+def run_scans_inference(
+    backend: VdnDelta | SanaDelta,
+    alpha: torch.Tensor,
+    a_raw: torch.Tensor,
+    b_raw: torch.Tensor,
+    text_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocation-conscious scan used only when gradients are disabled.
+
+    Banks are allocated once and each ``baddbmm`` writes directly into its final
+    slot. The eager training path above intentionally retains list/stack semantics
+    because ``out=`` operations do not participate in autograd.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("run_scans_inference requires gradients to be disabled")
+    with torch.autocast(device_type=a_raw.device.type, enabled=False):
+        transitions, injections, initial = _scan_inputs(
+            backend, alpha, a_raw, b_raw, text_state
+        )
+        num_frames = transitions.shape[0]
+        prefix = torch.empty(
+            (num_frames, *initial.shape),
+            dtype=injections.dtype,
+            device=injections.device,
+        )
+        suffix = torch.empty_like(prefix)
+
+        state = initial
+        for frame in range(num_frames):
+            torch.baddbmm(
+                injections[frame], state, transitions[frame], out=prefix[frame]
+            )
+            state = prefix[frame]
+
+        state = initial
+        for frame in range(num_frames - 1, -1, -1):
+            torch.baddbmm(
+                injections[frame], state, transitions[frame], out=suffix[frame]
+            )
+            state = suffix[frame]
+        return prefix, suffix
 
 
 def _device_key(device: torch.device | str) -> tuple[str, int | None]:
@@ -304,11 +361,13 @@ def _temporal_shift(
     if kernel <= 0 or kernel % 2 == 0 or weight.shape[-1] != kernel:
         raise ValueError("temporal kernel must be positive, odd and match its weight")
     padded = F.pad(frames, (0, 0, 0, 0, kernel // 2, kernel // 2))
-    result = torch.zeros_like(frames)
+    result = None
     for offset in range(kernel):
-        result = result + padded[offset:offset + frames.shape[0]] * weight[:, offset].view(
+        part = padded[offset:offset + frames.shape[0]] * weight[:, offset].view(
             1, 1, -1
         )
+        result = part if result is None else result + part
+    assert result is not None
     return result
 
 
@@ -340,8 +399,10 @@ def conv_features(
         num_frames, grid_height, grid_width, channels
     ).permute(0, 3, 1, 2)
     volume = F.conv2d(
-        volume, spatial_weight,
-        padding=(kernel_h // 2, kernel_w // 2), groups=channels,
+        volume,
+        spatial_weight,
+        padding=(kernel_h // 2, kernel_w // 2),
+        groups=channels,
     )
     flattened = volume.permute(0, 2, 3, 1).reshape(
         num_frames, grid_height * grid_width, channels
@@ -410,7 +471,7 @@ class EpilogueCompilerCache:
         try:
             compiled = self._compiled.get(key)
             if compiled is None:
-                compiled = torch.compile(_linear_epilogue_body)
+                compiled = torch.compile(_linear_epilogue_body, dynamic=False)
                 self._compiled[key] = compiled
                 while len(self._compiled) > self.limit:
                     self._compiled.popitem(last=False)
@@ -465,7 +526,9 @@ class LinearBranch:
         if bridge not in ("alpha", "none"):
             raise ValueError("bridge must be 'alpha' or 'none'")
         targets = tuple(short_conv)
-        if len(set(targets)) != len(targets) or any(target not in ("q", "k", "v") for target in targets):
+        if len(set(targets)) != len(targets) or any(
+            target not in ("q", "k", "v") for target in targets
+        ):
             raise ValueError("short_conv must be a distinct subset of ('q', 'k', 'v')")
         if num_heads <= 0 or head_dim <= 0:
             raise ValueError("head geometry must be positive")
@@ -563,8 +626,11 @@ class LinearBranch:
         beta = beta.reshape(1, length, self.num_heads).permute(0, 2, 1)
         matrix_a, matrix_b = frame_statistics(key, value, beta, self.a_fp32)
         ones = torch.ones(
-            1, self.num_heads, self.head_dim,
-            device=matrix_a.device, dtype=matrix_a.dtype,
+            1,
+            self.num_heads,
+            self.head_dim,
+            device=matrix_a.device,
+            dtype=matrix_a.dtype,
         )
         _, injection = self._delta_backend(length).factor_apply(ones, matrix_a, matrix_b)
         return TEXT_STATE_SCALE * injection[0]
@@ -590,7 +656,11 @@ class LinearBranch:
         if xv.ndim != 2 or xv.shape[0] != expected_rows:
             raise ValueError("xv rows must equal num_frames * tokens_per_frame")
         expected_qkv = (expected_rows, self.num_heads, self.head_dim)
-        if q_raw.shape != expected_qkv or k_raw.shape != expected_qkv or v_raw.shape != expected_qkv:
+        if (
+            q_raw.shape != expected_qkv
+            or k_raw.shape != expected_qkv
+            or v_raw.shape != expected_qkv
+        ):
             raise ValueError("raw q/k/v have incompatible video row/head geometry")
         if len(bounds) != num_frames:
             raise ValueError("bounds must contain one entry per frame")
@@ -600,20 +670,35 @@ class LinearBranch:
                 return xv.new_zeros(expected_rows, self.num_heads * self.head_dim)
             inner = slice(tokens_per_frame, (num_frames - 1) * tokens_per_frame)
             inner_readout = self._readout(
-                weights, xv[inner], (q_raw[inner], k_raw[inner], v_raw[inner]),
-                num_frames - 2, tokens_per_frame,
+                weights,
+                xv[inner],
+                (q_raw[inner], k_raw[inner], v_raw[inner]),
+                num_frames - 2,
+                tokens_per_frame,
                 [(lo - 1, hi - 1) for lo, hi in bounds[1:-1]],
-                frame_size, text_x, text_k_raw, text_v_raw,
+                frame_size,
+                text_x,
+                text_k_raw,
+                text_v_raw,
             )
-            output = inner_readout.new_zeros(
-                expected_rows, inner_readout.shape[-1]
-            )
+            # Only the two anchor-frame spans are zero. Avoid clearing the full
+            # video-sized output before copying the already computed middle.
+            output = inner_readout.new_empty(expected_rows, inner_readout.shape[-1])
+            output[:tokens_per_frame].zero_()
             output[inner] = inner_readout
+            output[(num_frames - 1) * tokens_per_frame :].zero_()
             return output
         return self._readout(
-            weights, xv, (q_raw, k_raw, v_raw), num_frames,
-            tokens_per_frame, bounds, frame_size,
-            text_x, text_k_raw, text_v_raw,
+            weights,
+            xv,
+            (q_raw, k_raw, v_raw),
+            num_frames,
+            tokens_per_frame,
+            bounds,
+            frame_size,
+            text_x,
+            text_k_raw,
+            text_v_raw,
         )
 
     def _readout(
@@ -657,10 +742,16 @@ class LinearBranch:
         text_state = self._text_state(
             weights, text_x, text_k_raw, text_v_raw
         )
-        prefix, suffix = run_scans(
-            self._delta_backend(tokens_per_frame), alpha, matrix_a, matrix_b,
+        scan = run_scans if torch.is_grad_enabled() else run_scans_inference
+        prefix, suffix = scan(
+            self._delta_backend(tokens_per_frame),
+            alpha,
+            matrix_a,
+            matrix_b,
             text_state=text_state,
         )
+        del matrix_a, matrix_b
+
         hidden_gate = F.linear(xv, weights["output_gate.down.weight"])
         gate = torch.sigmoid(
             F.linear(
@@ -669,14 +760,28 @@ class LinearBranch:
                 weights.get("output_gate.up.bias"),
             )
         )
+        del hidden_gate
+
         linear_state = gather_linear_state(
-            prefix, suffix, alpha, bounds, bridge=self.bridge,
-            text_state=text_state, out_dtype=gate.dtype, cache=self._gather_cache,
+            prefix,
+            suffix,
+            alpha,
+            bounds,
+            bridge=self.bridge,
+            text_state=text_state,
+            out_dtype=gate.dtype,
+            cache=self._gather_cache,
         )
+        del prefix, suffix
         readout = torch.matmul(query_by_frame, linear_state.transpose(-1, -2))
+        del linear_state
         return linear_epilogue(
-            readout, weights["norm.weight"], gate, 1e-6,
-            fuse=self.fuse_epilogue, compiler_cache=self._epilogue_cache,
+            readout,
+            weights["norm.weight"],
+            gate,
+            1e-6,
+            fuse=self.fuse_epilogue,
+            compiler_cache=self._epilogue_cache,
         ).reshape(rows, self.num_heads * self.head_dim)
 
 
@@ -696,4 +801,5 @@ __all__ = [
     "linear_epilogue",
     "rms_norm",
     "run_scans",
+    "run_scans_inference",
 ]

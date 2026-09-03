@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .diagnostics import DiagnosticsRecorder
 from .layout import current_layout, layout_from_payload, publish_layout
+from .runtime import SharedBranchRuntime
 from .weights import ManagedBranchWeights
 
 
@@ -21,11 +22,7 @@ _WRAPPER_KEY = "vdn_h3.layout"
 
 
 class VDNState:
-    """Independent runtime state for one patched ModelPatcher.
-
-    Branch weights live in their own additional ModelPatcher, so attaching this state
-    to diffusion_model does not make Comfy move/account the same storage twice.
-    """
+    """Independent runtime state for one patched ModelPatcher."""
 
     def __init__(
         self,
@@ -36,26 +33,50 @@ class VDNState:
         head_dim: int,
         *,
         weight_mode: str = "stream",
+        pin_strategy: str = "auto",
         attention_backend: str = "grouped",
         weight_maps: Sequence[Mapping[str, torch.Tensor]] | None = None,
         inference: bool = False,
-        linear_kernels: str = "auto",
+        kernel_backend: str = "auto",
+        compile_policy: str = "shared",
+        tile_frames: int = 0,
+        checkpoint_root: str | None = None,
         diagnostics: bool = False,
+        # compatibility spelling used by older callers/tests
+        linear_kernels: str | None = None,
     ):
         from .window import ATTENTION_BACKENDS, WindowAttentionCache
 
+        if linear_kernels is not None:
+            if linear_kernels == "eager":
+                kernel_backend = "eager"
+                compile_policy = "off"
+            elif linear_kernels == "compile":
+                kernel_backend = "auto"
+                compile_policy = "shared"
+            else:
+                kernel_backend = linear_kernels
         if attention_backend not in ATTENTION_BACKENDS:
             raise ValueError(f"unsupported attention backend {attention_backend!r}")
         self.name = str(name)
+        self.checkpoint_root = checkpoint_root
         self.config = dict(config)
         self.cfg = self.config
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim)
         self.attention_backend = attention_backend
         self.inference = bool(inference)
-        self.linear_kernels = linear_kernels
+        self.kernel_backend = kernel_backend
+        self.compile_policy = compile_policy
+        self.linear_kernels = kernel_backend  # compatibility/report field
+        self.tile_frames = int(tile_frames)
         self.branches = list(branches)
-        self.window_cache = WindowAttentionCache(limit=16)
+        self.window_cache = WindowAttentionCache(limit=24)
+        self.branch_runtime = SharedBranchRuntime(
+            kernel_backend=kernel_backend,
+            compile_policy=compile_policy,
+            tile_frames=tile_frames,
+        )
         self.curve_adapter = None
         self.lora_runtime = None
         self.forwards = 0
@@ -75,14 +96,22 @@ class VDNState:
             maps = list(weight_maps)
             if len(maps) != len(self.branches):
                 raise ValueError("weight_maps must match branch count")
-        self.weight_store = ManagedBranchWeights(maps, mode=weight_mode)
+        self.weight_store = ManagedBranchWeights(
+            maps, mode=weight_mode, pin_strategy=pin_strategy
+        )
         for branch in self.branches:
             detach = getattr(branch, "detach_weights", None)
             if detach is not None:
                 detach()
             set_runtime = getattr(branch, "set_runtime", None)
             if set_runtime is not None:
-                set_runtime(linear_kernels=linear_kernels, diagnostics=self.diagnostics)
+                set_runtime(
+                    runtime_cache=self.branch_runtime,
+                    kernel_backend=kernel_backend,
+                    compile_policy=compile_policy,
+                    tile_frames=tile_frames,
+                    diagnostics=self.diagnostics,
+                )
 
     @property
     def weight_mode(self):
@@ -90,6 +119,9 @@ class VDNState:
 
     def attach_weights(self, model_patcher):
         return self.weight_store.attach_to(model_patcher)
+
+    def prefetch_weights(self, index, device, dtype, keys: Collection[str] | None = None):
+        return self.weight_store.prefetch(index, device, dtype, keys)
 
     def weights_on(self, index, device, dtype, keys: Collection[str] | None = None):
         return self.weight_store.weights_on(index, device, dtype, keys)
@@ -100,6 +132,7 @@ class VDNState:
     def release(self):
         self.weight_store.release()
         self.window_cache.release()
+        self.branch_runtime.release()
         for branch in self.branches:
             release = getattr(branch, "release", None)
             if release is not None:
@@ -109,10 +142,9 @@ class VDNState:
             if release is not None:
                 release()
         if self.lora_runtime is not None:
-            try:
-                self.lora_runtime.to(device="cpu")
-            except Exception:
-                pass
+            release = getattr(self.lora_runtime, "release", None)
+            if release is not None:
+                release()
         self.diagnostics.clear()
         return self
 
@@ -137,10 +169,7 @@ def make_layout_wrapper(state: VDNState):
         sample = x[0] if isinstance(x, (tuple, list)) and x else x
         device = getattr(sample, "device", None)
         with publish_layout(layout), curve_scope, state.diagnostics.scope("forward.total", device):
-            result = executor(*args, **kwargs)
-        if state.diagnostics.enabled and (state.forwards <= 2 or state.forwards % 10 == 0):
-            state.diagnostics.log(prefix=f"VDN-H3 {state.name} forward {state.forwards}")
-        return result
+            return executor(*args, **kwargs)
 
     wrapper._vdn_h3_layout_wrapper = True
     return wrapper
@@ -181,16 +210,18 @@ def _normalise_and_rope(attn: Any, q: torch.Tensor, k: torch.Tensor, rope_freqs)
     return q4[0], k4[0]
 
 
-def _dense_softmax(query, key, value, transformer_options):
+def _dense_softmax(query, key, value, transformer_options, *, exact=False):
     seq, heads, dim = query.shape
-    try:
-        from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
-    except ImportError:
+    if exact:
         attended = F.scaled_dot_product_attention(
             query.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
             value.transpose(0, 1).unsqueeze(0), scale=dim**-0.5,
         )
         return attended.squeeze(0).transpose(0, 1)
+    try:
+        from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+    except ImportError:
+        return _dense_softmax(query, key, value, transformer_options, exact=True)
     q = AttentionTensorContainer(query.transpose(0, 1).unsqueeze(0))
     k = AttentionTensorContainer(key.transpose(0, 1).unsqueeze(0))
     v = AttentionTensorContainer(value.transpose(0, 1).unsqueeze(0))
@@ -207,6 +238,7 @@ def _window_softmax(q, k, v, layout, scale, requested, transformer_options, cach
     from .window import (
         resolve_attention_backend,
         window_softmax_decomposed,
+        window_softmax_flash2,
         window_softmax_flex,
         window_softmax_grouped,
     )
@@ -215,6 +247,15 @@ def _window_softmax(q, k, v, layout, scale, requested, transformer_options, cach
         requested, q, layout.num_frames, layout.bounds, layout.anchor_frames, cache
     )
     if backend == "reference":
+        return (
+            window_softmax_grouped(
+                q, k, v, layout.video_start, layout.video_end, layout.num_frames,
+                layout.tokens_per_frame, layout.bounds, scale,
+                anchor_frames=layout.anchor_frames, transformer_options=None,
+            ),
+            backend,
+        )
+    if backend == "compat":
         return (
             window_softmax_grouped(
                 q, k, v, layout.video_start, layout.video_end, layout.num_frames,
@@ -235,7 +276,20 @@ def _window_softmax(q, k, v, layout, scale, requested, transformer_options, cach
             )
         except Exception as exc:
             cache.mark_broken("decomposed", exc)
-            _LOG.warning("VDN-H3 decomposed attention unavailable; falling back to grouped: %s", exc)
+            _LOG.warning("VDN-H3 FA4 attention unavailable; falling back to grouped: %s", exc)
+    elif backend == "flash2":
+        try:
+            return (
+                window_softmax_flash2(
+                    q, k, v, layout.video_start, layout.video_end, layout.num_frames,
+                    layout.tokens_per_frame, layout.bounds, scale,
+                    anchor_frames=layout.anchor_frames, cache=cache,
+                ),
+                backend,
+            )
+        except Exception as exc:
+            cache.mark_broken("flash2", exc)
+            _LOG.warning("VDN-H3 FA2 attention unavailable; falling back to grouped: %s", exc)
     elif backend == "flex":
         try:
             return (
@@ -253,7 +307,7 @@ def _window_softmax(q, k, v, layout, scale, requested, transformer_options, cach
         window_softmax_grouped(
             q, k, v, layout.video_start, layout.video_end, layout.num_frames,
             layout.tokens_per_frame, layout.bounds, scale,
-            anchor_frames=layout.anchor_frames,
+            anchor_frames=layout.anchor_frames, transformer_options=None,
         ),
         "grouped",
     )
@@ -272,29 +326,88 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
         if int(x.shape[0]) != layout.seq_len:
             raise RuntimeError(f"VDN layout has {layout.seq_len} rows but attention received {x.shape[0]}")
 
+        linear_active = bool(config.get("linear_enabled", True)) and not layout.full_cover
+        gate_enabled = bool(config.get("enable_softmax_gate", True))
+        run_inference = state.inference and not torch.is_grad_enabled()
+        requested_weights: Collection[str] | None
+        if linear_active:
+            requested_weights = None
+        elif gate_enabled:
+            requested_weights = {"softmax_gate.up.weight", "softmax_gate.up.bias"}
+        else:
+            requested_weights = set()
+
+        # Schedule the current streamed projection before QKV so H2D can overlap with
+        # the native fused projection. Previous blocks normally already prefetched it.
+        if requested_weights is None or requested_weights:
+            state.prefetch_weights(block_index, x.device, x.dtype, requested_weights)
+
         weights_loaded = False
+        weights = {}
+        linear_delta = None
+        deferred_reference = None
         try:
             with state.diagnostics.scope("attention.qkv", x.device):
                 q_raw, k_raw, value = _qkv(attn, x)
-            linear_active = bool(config.get("linear_enabled", True)) and not layout.full_cover
-            text_x = text_k = text_v = None
-            if linear_active:
+
+            if linear_active and run_inference:
+                with state.diagnostics.scope("weights.transfer", x.device):
+                    weights = state.weights_on(block_index, x.device, x.dtype, keys=None)
+                weights_loaded = True
                 va, vb = layout.video_start, layout.video_end
-                q_video = q_raw[va:vb].clone()
-                k_video = k_raw[va:vb].clone()
-                v_video = value[va:vb].clone()
-                if bool(getattr(branch, "enable_text_state", config.get("enable_text_state", False))):
-                    ta, tb = layout.text_start, layout.text_start + layout.text_len
-                    text_x = x[ta:tb]
-                    text_k = k_raw[ta:tb].clone()
-                    text_v = value[ta:tb].clone()
+                ta, tb = layout.text_start, layout.text_start + layout.text_len
+                text_enabled = bool(
+                    getattr(branch, "enable_text_state", config.get("enable_text_state", False))
+                )
+                with state.diagnostics.scope("attention.linear_branch", x.device):
+                    projected = getattr(branch, "projected_delta", None)
+                    if projected is None:
+                        readout = branch.readout(
+                            weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            frame_size=layout.frame_size,
+                            text_x=x[ta:tb] if text_enabled else None,
+                            text_k_raw=k_raw[ta:tb] if text_enabled else None,
+                            text_v_raw=value[ta:tb] if text_enabled else None,
+                            skip_ends=(layout.anchor_frames == "both"), inference=True,
+                        )
+                        linear_delta = F.linear(
+                            readout.to(dtype=x.dtype), weights["to_out_linear.weight"]
+                        )
+                    else:
+                        linear_delta = projected(
+                            weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            frame_size=layout.frame_size,
+                            text_x=x[ta:tb] if text_enabled else None,
+                            text_k_raw=k_raw[ta:tb] if text_enabled else None,
+                            text_v_raw=value[ta:tb] if text_enabled else None,
+                            skip_ends=(layout.anchor_frames == "both"), inference=True,
+                        )
+            elif linear_active:
+                # Autograd/reference execution keeps compact copies because q/k may be
+                # modified in-place by the native fused RMSNorm+RoPE path afterwards.
+                va, vb = layout.video_start, layout.video_end
+                ta, tb = layout.text_start, layout.text_start + layout.text_len
+                text_enabled = bool(
+                    getattr(branch, "enable_text_state", config.get("enable_text_state", False))
+                )
+                deferred_reference = (
+                    q_raw[va:vb].clone(), k_raw[va:vb].clone(), value[va:vb].clone(),
+                    x[ta:tb] if text_enabled else None,
+                    k_raw[ta:tb].clone() if text_enabled else None,
+                    value[ta:tb].clone() if text_enabled else None,
+                )
 
             with state.diagnostics.scope("attention.rope_norm", x.device):
                 query, key = _normalise_and_rope(attn, q_raw, k_raw, rope_freqs)
+            exact_dense = state.attention_backend == "reference"
             with state.diagnostics.scope("attention.softmax", x.device):
                 if layout.full_cover:
-                    softmax_out = _dense_softmax(query, key, value, transformer_options)
-                    state.last_attention_backend = "dense"
+                    softmax_out = _dense_softmax(
+                        query, key, value, transformer_options, exact=exact_dense
+                    )
+                    state.last_attention_backend = "dense_exact" if exact_dense else "dense"
                 else:
                     softmax_out, used_backend = _window_softmax(
                         query, key, value, layout, head_dim**-0.5,
@@ -308,19 +421,12 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                 )
             del query, key, value, q_raw, k_raw
 
-            gate_enabled = bool(config.get("enable_softmax_gate", True))
-            if linear_active:
-                requested_weights = None
-            elif gate_enabled:
-                requested_weights = {"softmax_gate.up.weight", "softmax_gate.up.bias"}
-            else:
-                requested_weights = set()
-            with state.diagnostics.scope("weights.transfer", x.device):
-                weights = (
-                    state.weights_on(block_index, x.device, x.dtype, keys=requested_weights or None)
-                    if requested_weights or linear_active else {}
-                )
-            weights_loaded = bool(weights)
+            if not weights_loaded and (requested_weights is None or requested_weights):
+                with state.diagnostics.scope("weights.transfer", x.device):
+                    weights = state.weights_on(
+                        block_index, x.device, x.dtype, keys=requested_weights
+                    )
+                weights_loaded = bool(weights)
 
             if gate_enabled:
                 try:
@@ -331,7 +437,7 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                     raise RuntimeError(
                         f"VDN branch block {block_index} is missing softmax gate tensor {exc.args[0]!r}"
                     ) from exc
-                if state.inference and not torch.is_grad_enabled():
+                if run_inference:
                     softmax_out.mul_(gate.to(dtype=softmax_out.dtype))
                 else:
                     softmax_out = softmax_out * gate.to(dtype=softmax_out.dtype)
@@ -341,27 +447,40 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                 out = attn.out_proj(softmax_out.reshape(layout.seq_len, -1).to(dtype=x.dtype))
             del softmax_out
 
-            if linear_active:
-                run_inference = state.inference and not torch.is_grad_enabled()
+            if linear_delta is not None:
+                out[layout.video_start : layout.video_end].add_(linear_delta)
+                del linear_delta
+            elif deferred_reference is not None:
+                if not weights_loaded:
+                    with state.diagnostics.scope("weights.transfer", x.device):
+                        weights = state.weights_on(block_index, x.device, x.dtype, keys=None)
+                    weights_loaded = True
+                q_video, k_video, v_video, text_x, text_k, text_v = deferred_reference
                 with state.diagnostics.scope("attention.linear_branch", x.device):
-                    readout = branch.readout(
-                        weights,
-                        x[layout.video_start : layout.video_end],
-                        q_video, k_video, v_video,
-                        layout.num_frames, layout.tokens_per_frame, layout.bounds,
-                        frame_size=layout.frame_size,
-                        text_x=text_x, text_k_raw=text_k, text_v_raw=text_v,
-                        skip_ends=(layout.anchor_frames == "both"),
-                        inference=run_inference,
-                    )
-                    try:
+                    projected = getattr(branch, "projected_delta", None)
+                    if projected is None:
+                        readout = branch.readout(
+                            weights,
+                            x[layout.video_start : layout.video_end],
+                            q_video, k_video, v_video,
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            frame_size=layout.frame_size,
+                            text_x=text_x, text_k_raw=text_k, text_v_raw=text_v,
+                            skip_ends=(layout.anchor_frames == "both"), inference=False,
+                        )
                         delta = F.linear(readout.to(dtype=x.dtype), weights["to_out_linear.weight"])
-                    except KeyError as exc:
-                        raise RuntimeError(
-                            f"VDN branch block {block_index} is missing {exc.args[0]!r}"
-                        ) from exc
+                    else:
+                        delta = projected(
+                            weights,
+                            x[layout.video_start : layout.video_end],
+                            q_video, k_video, v_video,
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            frame_size=layout.frame_size,
+                            text_x=text_x, text_k_raw=text_k, text_v_raw=text_v,
+                            skip_ends=(layout.anchor_frames == "both"), inference=False,
+                        )
                     out[layout.video_start : layout.video_end].add_(delta)
-                    del readout, delta, q_video, k_video, v_video, text_k, text_v
+                    del delta
             return out
         finally:
             if weights_loaded:
@@ -384,7 +503,10 @@ def validate_h3_model(model_patcher: Any, block_count: int | None = None):
     required = ("qkv_proj", "q_norm", "k_norm", "out_proj", "heads", "head_dim")
     missing = [name for name in required if not hasattr(first, name)]
     if missing:
-        raise RuntimeError("loaded MODEL is not a compatible native MiniMax-H3 attention; missing " + ", ".join(missing))
+        raise RuntimeError(
+            "loaded MODEL is not a compatible native MiniMax-H3 attention; missing "
+            + ", ".join(missing)
+        )
     if block_count is not None and len(blocks) != block_count:
         raise RuntimeError(
             f"VDN checkpoint has {block_count} blocks but the loaded H3 model has {len(blocks)}; "

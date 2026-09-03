@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import json
 
+import pytest
 import torch
 
 from vdn_h3 import nodes
@@ -41,6 +42,10 @@ class _Patcher:
         state = SimpleNamespace(
             name="fixture",
             forwards=3,
+            profile="auto",
+            base_precision="bf16",
+            branch_execution="serial",
+            block_fusion=False,
             weight_mode="resident",
             weight_store=_WeightStore(),
             attention_backend="auto",
@@ -72,6 +77,8 @@ def _branch_maps():
 def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatch):
     monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
     monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 0)
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "serial")
+    monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "bf16")
     model = object()
 
     reference = nodes._resolve_runtime(
@@ -82,7 +89,9 @@ def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatc
     )
     assert reference == {
         "profile": "reference",
+        "base_precision": "bf16",
         "branch_mode": "stream",
+        "branch_execution": "serial",
         "lora_mode": "bypass",
         "attention_backend": "reference",
         "kernel_backend": "eager",
@@ -90,53 +99,77 @@ def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatc
         "tile_frames": 0,
         "pin_strategy": "auto",
         "projection_precision": "bf16",
+        "block_fusion": False,
         "inference": False,
     }
 
-    compat = nodes._resolve_runtime(
-        model,
-        _branch_maps(),
-        profile="compat_reference",
-    )
+    compat = nodes._resolve_runtime(model, _branch_maps(), profile="compat_reference")
     assert compat["attention_backend"] == "compat"
     assert compat["compile_policy"] == "off"
     assert compat["projection_precision"] == "bf16"
+    assert compat["branch_execution"] == "serial"
+    assert not compat["block_fusion"]
 
-    low = nodes._resolve_runtime(
-        model,
-        _branch_maps(),
-        profile="low_vram",
-    )
+    low = nodes._resolve_runtime(model, _branch_maps(), profile="low_vram")
     assert low["branch_mode"] == "hybrid"
+    assert low["branch_execution"] == "serial"
     assert low["tile_frames"] == 5
     assert low["lora_mode"] == "bypass"
     assert low["projection_precision"] == "bf16"
+    assert not low["block_fusion"]
     assert low["inference"]
 
-    fast = nodes._resolve_runtime(
-        model,
-        _branch_maps(),
-        profile="max_speed",
-    )
+    fast = nodes._resolve_runtime(model, _branch_maps(), profile="max_speed")
     assert fast["branch_mode"] == "resident"
+    assert fast["branch_execution"] == "serial"
+    assert fast["lora_mode"] == "merge"
     assert fast["compile_policy"] == "reduce_overhead"
     assert fast["tile_frames"] == 0
+    assert fast["projection_precision"] == "fp8"
+    assert fast["block_fusion"]
 
-    fp8 = nodes._resolve_runtime(
-        model,
-        _branch_maps(),
-        profile="experimental_fp8",
-    )
+    fp8 = nodes._resolve_runtime(model, _branch_maps(), profile="experimental_fp8")
     assert fp8["projection_precision"] == "fp8"
     assert fp8["inference"]
 
 
-def test_reference_rejects_fp8_precision():
-    import pytest
+def test_auto_int8_resident_matches_native_speed_family(monkeypatch):
+    monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
+    monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
+    monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 0)
 
+    runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
+    assert runtime["base_precision"] == "int8"
+    assert runtime["branch_mode"] == "resident"
+    assert runtime["branch_execution"] == "parallel"
+    assert runtime["lora_mode"] == "merge"
+    assert runtime["projection_precision"] == "int8"
+    assert runtime["compile_policy"] == "shared"
+    assert runtime["tile_frames"] == 0
+    assert runtime["block_fusion"]
+
+
+def test_auto_quantized_but_nonresident_keeps_factorized_lora(monkeypatch):
+    monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
+    monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "hybrid")
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "serial")
+    monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 5)
+
+    runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
+    assert runtime["projection_precision"] == "int8"
+    assert runtime["branch_mode"] == "hybrid"
+    assert runtime["branch_execution"] == "serial"
+    assert runtime["lora_mode"] == "bypass"
+    assert runtime["tile_frames"] == 5
+    assert not runtime["block_fusion"]
+
+
+@pytest.mark.parametrize("precision", ["fp8", "int8"])
+def test_reference_rejects_quantized_projection(precision):
     with pytest.raises(ValueError, match="cannot be used as a reference"):
         nodes._resolve_runtime(
-            object(), _branch_maps(), profile="reference", projection_precision="fp8"
+            object(), _branch_maps(), profile="reference", projection_precision=precision
         )
 
 
@@ -154,6 +187,7 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (20 * gib, 24 * gib))
     assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "hybrid"
     assert nodes._auto_tile_frames(model, "hybrid") == 5
+    assert nodes._auto_execution_mode(model, "hybrid") == "serial"
 
     monkeypatch.setattr(
         torch.cuda,
@@ -163,9 +197,11 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (70 * gib, 96 * gib))
     assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "resident"
     assert nodes._auto_tile_frames(model, "resident") == 0
+    assert nodes._auto_execution_mode(model, "resident") == "parallel"
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 * gib, 96 * gib))
     assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "stream"
+    assert nodes._auto_execution_mode(model, "stream") == "serial"
 
 
 def test_runtime_snapshot_and_node_are_machine_readable():

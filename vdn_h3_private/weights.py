@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ import torch
 import torch.nn as nn
 
 
+_LOG = logging.getLogger("comfy.vdn_h3_private")
 FP32_BRANCH_KEYS = frozenset({"alpha.A_log", "alpha.dt_bias"})
 
 
@@ -43,13 +45,15 @@ class BranchWeightsModel(nn.Module):
         super().__init__()
         if not weights:
             raise ValueError("VDN branch weights cannot be empty")
-        self.blocks = nn.ModuleList([_WeightBlock(block, index) for index, block in enumerate(weights)])
+        self.blocks = nn.ModuleList(
+            [_WeightBlock(block, index) for index, block in enumerate(weights)]
+        )
         self.device = torch.device("cpu")
 
     def block(self, index: int) -> _WeightBlock:
         return self.blocks[index]
 
-    def forward(self, *args, **kwargs):  # pragma: no cover
+    def forward(self, *args, **kwargs):  # pragma: no cover - storage-only module
         raise RuntimeError("BranchWeightsModel is storage-only and has no forward")
 
 
@@ -70,7 +74,13 @@ class _StreamContext:
 
 
 class ManagedBranchWeights(nn.Module):
-    """Own branch weights with either Comfy-managed residency or double-buffered stream."""
+    """Own branch weights with either Comfy-managed residency or double-buffered stream.
+
+    The storage is a child model whose parameters are visible to ComfyUI's model-size
+    accounting.  In stream mode that child stays on CPU and two reusable GPU slots are
+    filled on a dedicated CUDA stream.  `mark_consumed` records the compute-stream event
+    that makes a slot safe to reuse, preventing prefetch from overwriting live weights.
+    """
 
     def __init__(self, weights: Sequence[Mapping[str, torch.Tensor]], mode: str = "stream"):
         super().__init__()
@@ -116,6 +126,7 @@ class ManagedBranchWeights(nn.Module):
                     pass
 
     def attach_to(self, base_patcher: Any, key: str = "vdn_h3_branch"):
+        """Register the storage as a nested ModelPatcher for lifecycle/accounting."""
         try:
             from comfy.model_patcher import ModelPatcher
         except ImportError:
@@ -159,11 +170,19 @@ class ManagedBranchWeights(nn.Module):
             self._contexts[key] = ctx
         return ctx
 
-    def _schedule(self, ctx, slot_index, block_index, compute_dtype, keys):
+    def _schedule(
+        self,
+        ctx: _StreamContext,
+        slot_index: int,
+        block_index: int,
+        compute_dtype: torch.dtype,
+        keys: Collection[str] | None,
+    ) -> None:
         slot = ctx.slots[slot_index]
-        if slot.block == block_index and (keys is None or set(keys).issubset(slot.tensors)):
-            return
         source = self._source(block_index, keys)
+        required = set(source)
+        if slot.block == block_index and required.issubset(slot.tensors):
+            return
         if slot.consumed is not None:
             ctx.stream.wait_event(slot.consumed)
         with torch.cuda.stream(ctx.stream):
@@ -188,21 +207,34 @@ class ManagedBranchWeights(nn.Module):
         slot.consumed = None
         ctx.block_to_slot[block_index] = slot_index
 
-    def _stream_weights(self, block_index, device, dtype, keys):
+    def _stream_weights(
+        self,
+        block_index: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        keys: Collection[str] | None,
+    ) -> dict[str, torch.Tensor]:
         ctx = self._context(device, dtype)
         slot_index = ctx.block_to_slot.get(block_index)
         if slot_index is None:
+            # Prefer the slot by parity; if it is still carrying a different block its
+            # consumed event makes the prefetch stream wait before overwrite.
             slot_index = block_index & 1
             self._schedule(ctx, slot_index, block_index, dtype, keys)
         else:
             slot = ctx.slots[slot_index]
-            if keys is not None and not set(keys).issubset(slot.tensors):
+            required = set(self._source(block_index, keys))
+            if not required.issubset(slot.tensors):
                 self._schedule(ctx, slot_index, block_index, dtype, keys)
         slot = ctx.slots[slot_index]
         if slot.ready is not None:
             torch.cuda.current_stream(device).wait_event(slot.ready)
+
         source = self._source(block_index, keys)
         result = {key: slot.tensors[key] for key in source}
+
+        # Full block requests are the linear path.  Prefetch the next full block into
+        # the alternate slot while the current block computes.
         if keys is None and block_index + 1 < len(self):
             next_slot = 1 - slot_index
             if ctx.slots[next_slot].block != block_index + 1:
@@ -228,12 +260,21 @@ class ManagedBranchWeights(nn.Module):
             else tensor.to(
                 device=device,
                 dtype=self._target_dtype(key, dtype),
-                non_blocking=(device.type == "cuda" and tensor.device.type == "cpu" and tensor.is_pinned()),
+                non_blocking=(
+                    device.type == "cuda"
+                    and tensor.device.type == "cpu"
+                    and tensor.is_pinned()
+                ),
             )
             for key, tensor in source.items()
         }
 
-    def mark_consumed(self, block_index, device, dtype):
+    def mark_consumed(
+        self,
+        block_index: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> None:
         if self.mode != "stream":
             return
         device = torch.device(device)
@@ -250,6 +291,11 @@ class ManagedBranchWeights(nn.Module):
         ctx.slots[slot_index].consumed = event
 
     def release(self) -> "ManagedBranchWeights":
+        for ctx in self._contexts.values():
+            try:
+                ctx.stream.synchronize()
+            except Exception:
+                pass
         self._contexts.clear()
         if self.mode == "resident":
             unloaded = False

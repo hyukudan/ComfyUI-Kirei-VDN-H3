@@ -1,4 +1,4 @@
-"""ComfyUI entry point for the Kirei VDN-H3 private alpha."""
+"""ComfyUI entry point for the optimized Kirei VDN-H3 integration."""
 
 # ComfyUI imports custom-node roots as packages, while pytest can collect this file
 # as a top-level module because the directory name contains hyphens.

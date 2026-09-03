@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -13,6 +15,7 @@ import torch.nn.functional as F
 from .calibration import CalibrationStore, calibration_signature
 
 
+_LOG = logging.getLogger("comfy.vdn_h3")
 ANCHOR_FRAME_MODES = ("none", "columns", "rows", "both")
 ATTENTION_BACKENDS = (
     "auto",
@@ -45,6 +48,7 @@ class WindowAttentionCache:
         self._broken: dict[str, str] = {}
         self.calibration = CalibrationStore()
         self.last_calibration_hit: str | None = None
+        self.last_autotune_error: str | None = None
 
     def get(self, key):
         value = self._masks.get(key)
@@ -84,6 +88,7 @@ class WindowAttentionCache:
         self._compiled = None
         self._broken.clear()
         self.last_calibration_hit = None
+        self.last_autotune_error = None
 
     release = clear
 
@@ -325,6 +330,59 @@ def _backend_available(backend: str, cache: WindowAttentionCache | None):
     return False
 
 
+def _autotune_if_needed(
+    query,
+    num_frames,
+    bounds,
+    anchor_frames,
+    cache,
+    video_start,
+    video_end,
+    tokens_per_frame,
+):
+    if (
+        cache is None
+        or not query.is_cuda
+        or not torch.cuda.is_available()
+        or video_start is None
+        or video_end is None
+        or tokens_per_frame is None
+    ):
+        return None
+    available = 1
+    available += int(flex_available(cache))
+    available += int(flash2_available(cache))
+    available += int(decomposed_available(cache))
+    if available <= 1:
+        return None
+    layout = SimpleNamespace(
+        num_frames=int(num_frames),
+        bounds=tuple(tuple(pair) for pair in bounds),
+        anchor_frames=str(anchor_frames),
+        video_start=int(video_start),
+        video_end=int(video_end),
+        tokens_per_frame=int(tokens_per_frame),
+    )
+    try:
+        from .autotune import runtime_autotune_attention
+
+        # Runtime is shape-driven. Reusing the real Q tensor for Q/K/V avoids allocating
+        # three synthetic inputs while preserving the exact backend geometry.
+        return runtime_autotune_attention(
+            query,
+            query,
+            query,
+            layout,
+            query.shape[-1] ** -0.5,
+            cache,
+            runs=2,
+        )
+    except Exception as exc:
+        cache.last_autotune_error = str(exc)
+        _LOG.warning("VDN-H3 attention autotune failed; using conservative dispatch: %s", exc)
+        return None
+
+
 def resolve_attention_backend(
     requested: str,
     query: torch.Tensor,
@@ -342,6 +400,7 @@ def resolve_attention_backend(
     if requested != "auto":
         return requested
     groups = window_group_count(num_frames, bounds, anchor_frames)
+    signature = None
     if cache is not None:
         signature = calibration_signature(
             query,
@@ -358,6 +417,20 @@ def resolve_attention_backend(
             cache.last_calibration_hit = calibrated
             return calibrated
         cache.last_calibration_hit = None
+        tuned = _autotune_if_needed(
+            query,
+            num_frames,
+            bounds,
+            anchor_frames,
+            cache,
+            video_start,
+            video_end,
+            tokens_per_frame,
+        )
+        if tuned and _backend_available(tuned, cache):
+            cache.last_calibration_hit = tuned
+            return tuned
+    # CPU or a runtime with only grouped attention keeps the conservative heuristics.
     if query.is_cuda and torch.cuda.is_available():
         capability = torch.cuda.get_device_capability(query.device)
         if capability[0] >= 10 and decomposed_available(cache):
@@ -366,8 +439,6 @@ def resolve_attention_backend(
         return "grouped"
     if query.is_cuda and query.shape[0] >= 8192 and flex_available(cache):
         return "flex"
-    # FA2 is deliberately calibration-only by default. On Ada the gather cost can be
-    # larger than the kernel win, so auto never assumes it is faster.
     return "grouped"
 
 

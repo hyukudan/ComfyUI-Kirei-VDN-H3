@@ -531,6 +531,14 @@ def apply_checkpoint(
         if curve_terms:
             from .curve import apply_curve_adapters
             apply_curve_adapters(cloned, state, curve_terms)
+        state.adapters = {
+            "active": list(wanted),
+            "strengths": {
+                name: float(per_adapter_strength.get(name, global_strength)) for name in wanted
+            },
+            "lora_mode": runtime["lora_mode"],
+            "reports": list(reports),
+        }
     except Exception:
         state.close()
         raise

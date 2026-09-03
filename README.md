@@ -4,8 +4,8 @@
 >
 > `ComfyUI-Kirei-VDN-H3` is an experimental, private, correctness-first port of
 > VideoDeltaNet for ComfyUI's native MiniMax H3 implementation. It is incomplete,
-> its API and checkpoint format may change without notice, and it has not yet been
-> validated by a complete generated video with the released VDN weights. Do not use it for production
+> its API and checkpoint format may change without notice. One short real-weight
+> smoke video has passed, but parity and quality are not established. Do not use it for production
 > work or install it into an important ComfyUI environment.
 
 ## Current status
@@ -16,7 +16,8 @@
 - Synthetic CPU tests: 55 passing.
 - RTX PRO 6000 CUDA validation: Flex/grouped smoke parity passed.
 - Real VDN checkpoint: complete inventory and strict structural loading passed.
-- Factorized native ComfyUI LoRA path: implemented; real model application is under test.
+- Factorized native ComfyUI LoRA path: real checkpoint application passed.
+- Real 608×352, 22-frame video+audio smoke generation: passed on RTX PRO 6000.
 - Output-quality and performance claims: none yet.
 
 Development happens in this isolated directory. A private clone is installed as a
@@ -64,12 +65,15 @@ PRO 6000 Blackwell Workstation Edition:
 - Released stage checkpoint inventory loads successfully from safetensors.
 - Adapter A/B factors remain low-rank and use native ComfyUI offset patches; AdaLN
   curve adapters are injected at runtime for pruned H3 checkpoints.
+- Real application registered 520 compact LoRA terms over 208 native weights, 51
+  runtime curve-AdaLN targets, and 50 VDN branches.
+- A 4-step, 608×352, 22-frame H3 INT8 smoke generated an H.264/AAC MP4 in 37 seconds.
 - CUDA FlexAttention agrees with grouped SDPA within BF16 tolerance
   (`max_abs_error=0.00390625`).
 - Per-model Flex cache contains one entry during the probe and zero after `release()`.
 
-These checks do **not** establish real-checkpoint visual parity, generation quality,
-or production stability.
+These checks do **not** establish parity with the official implementation, quality at
+production durations/resolutions, numerical determinism, or production stability.
 
 ## Engineering report
 

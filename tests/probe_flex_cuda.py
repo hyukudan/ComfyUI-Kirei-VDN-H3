@@ -15,7 +15,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path as _Path
 
-sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))  # importable from any cwd
+_PLUGIN_ROOT = _Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PLUGIN_ROOT))
+for _candidate in _PLUGIN_ROOT.parents:
+    if (_candidate / "folder_paths.py").is_file():
+        sys.path.insert(0, str(_candidate))
+        break
 
 import torch  # noqa: E402
 
@@ -76,6 +81,10 @@ def many_lengths(device, count: int = 12) -> None:
         key = torch.randn_like(query)
         value = torch.randn_like(query)
         bounds = window_bounds(frames, radius=1, chunk=5)
+        out = window_softmax_flex(
+            query, key, value, video_start, video_end, frames, per_frame,
+            bounds, scale, anchor_frames="both", cache=cache,
+        )
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
         before = torch.cuda.memory_allocated(device)

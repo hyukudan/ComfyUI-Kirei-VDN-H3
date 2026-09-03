@@ -241,11 +241,12 @@ def test_calibration_signature_tracks_node_version_and_backend_inventory(monkeyp
     parsed = json.loads(before)
     assert parsed["version"] == CALIBRATION_VERSION == 3
     assert parsed["env"]["node"] == __version__
+    flash2_was_available = "flash2" in parsed["env"]["backends"]
     calibration.runtime_environment.cache_clear()
-    monkeypatch.setattr(window, "flash2_available", lambda cache=None: True)
+    monkeypatch.setattr(window, "flash2_available", lambda cache=None: not flash2_was_available)
     after = calibration_signature(q, 3, bounds, "both", **geometry)
     assert after != before
-    assert "flash2" in json.loads(after)["env"]["backends"]
+    assert ("flash2" in json.loads(after)["env"]["backends"]) is not flash2_was_available
     calibration.runtime_environment.cache_clear()
 
 

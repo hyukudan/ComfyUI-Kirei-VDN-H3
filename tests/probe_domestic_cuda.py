@@ -21,7 +21,12 @@ import torch
 import sys
 from pathlib import Path as _Path
 
-sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))  # importable from any cwd
+_PLUGIN_ROOT = _Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PLUGIN_ROOT))
+for _candidate in _PLUGIN_ROOT.parents:
+    if (_candidate / "folder_paths.py").is_file():
+        sys.path.insert(0, str(_candidate))
+        break
 
 from vdn_h3 import window
 from vdn_h3.projection import (

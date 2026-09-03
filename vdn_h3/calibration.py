@@ -1,8 +1,8 @@
 """Persistent per-GPU attention calibration for VDN-H3.
 
-Calibration is explicit: normal generation never launches hidden benchmarks. The auto
-backend consults this store when an exact hardware/geometry entry exists, otherwise it
-uses conservative built-in heuristics.
+Calibration is available explicitly, while the ``auto`` runtime benchmarks a missing
+CUDA geometry once and persists the exact winner. CPU execution and unsupported
+geometries use conservative built-in heuristics.
 """
 
 from __future__ import annotations

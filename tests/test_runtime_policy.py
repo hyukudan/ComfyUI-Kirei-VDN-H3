@@ -32,6 +32,7 @@ class _Calibration:
 class _Cache:
     _broken = {"flex": "synthetic failure"}
     last_calibration_hit = "grouped"
+    last_autotune_error = None
     calibration = _Calibration()
 
 
@@ -41,11 +42,18 @@ class _Patcher:
     def __init__(self):
         state = SimpleNamespace(
             name="fixture",
+            config={},
+            adapters={
+                "active": ["default", "turbo"],
+                "strengths": {"default": 1.0, "turbo": 1.0},
+                "lora_mode": "bypass",
+            },
             forwards=3,
             profile="auto",
             base_precision="bf16",
             branch_execution="serial",
             block_fusion=False,
+            block_fusion_error=None,
             weight_mode="resident",
             weight_store=_WeightStore(),
             attention_backend="auto",
@@ -61,6 +69,7 @@ class _Patcher:
             curve_adapter=None,
             inference=True,
             diagnostics=_Diagnostics(),
+            last_layout=None,
         )
         self.object_patches = {"diffusion_model._vdn_h3_state": state}
 
@@ -108,6 +117,7 @@ def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatc
     assert compat["compile_policy"] == "off"
     assert compat["projection_precision"] == "bf16"
     assert compat["branch_execution"] == "serial"
+    assert compat["lora_mode"] == "bypass"
     assert not compat["block_fusion"]
 
     low = nodes._resolve_runtime(model, _branch_maps(), profile="low_vram")
@@ -130,10 +140,11 @@ def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatc
 
     fp8 = nodes._resolve_runtime(model, _branch_maps(), profile="experimental_fp8")
     assert fp8["projection_precision"] == "fp8"
+    assert fp8["lora_mode"] == "bypass"
     assert fp8["inference"]
 
 
-def test_auto_int8_resident_matches_native_speed_family(monkeypatch):
+def test_auto_int8_resident_keeps_adapter_bypass_quality_first(monkeypatch):
     monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
     monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
     monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
@@ -142,17 +153,17 @@ def test_auto_int8_resident_matches_native_speed_family(monkeypatch):
     runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
     assert runtime["base_precision"] == "int8"
     assert runtime["branch_mode"] == "resident"
-    # Auto follows the qualified upstream single-GPU tuned scheduler. Parallel remains
-    # an explicit experiment until a real-device benchmark proves it faster.
     assert runtime["branch_execution"] == "serial"
-    assert runtime["lora_mode"] == "merge"
+    # Do not requantize the small released adapter updates by default. max_speed is the
+    # explicit merge/requant path and must pass its own quality gate.
+    assert runtime["lora_mode"] == "bypass"
     assert runtime["projection_precision"] == "int8"
     assert runtime["compile_policy"] == "shared"
     assert runtime["tile_frames"] == 0
     assert runtime["block_fusion"]
 
 
-def test_workstation_fp8_can_opt_into_parallel_when_eligible(monkeypatch):
+def test_workstation_fp8_can_opt_into_parallel_and_merge(monkeypatch):
     monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
     monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
     runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="workstation_fp8")
@@ -163,7 +174,7 @@ def test_workstation_fp8_can_opt_into_parallel_when_eligible(monkeypatch):
     assert runtime["compile_policy"] == "shared"
 
 
-def test_auto_quantized_but_nonresident_keeps_factorized_lora(monkeypatch):
+def test_auto_quantized_nonresident_keeps_factorized_lora(monkeypatch):
     monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "int8")
     monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "hybrid")
     monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "parallel")
@@ -210,7 +221,6 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (70 * gib, 96 * gib))
     assert nodes._auto_branch_mode(model, 5 * gib, int(4.5 * gib)) == "resident"
     assert nodes._auto_tile_frames(model, "resident") == 0
-    # Eligibility helper remains useful for explicit workstation experiments.
     assert nodes._auto_execution_mode(model, "resident") == "parallel"
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (5 * gib, 96 * gib))
@@ -228,6 +238,8 @@ def test_runtime_snapshot_and_node_are_machine_readable():
     assert snapshot["attention_calibration"]["last_hit"] == "grouped"
     assert snapshot["compile_policy"] == "shared"
     assert snapshot["tile_frames"] == 5
+    assert snapshot["adapters"]["active"] == ["default", "turbo"]
+    assert snapshot["adapters"]["lora_mode"] == "bypass"
     assert snapshot["cuda"]["available"] is False
 
     node = KireiVDNH3RuntimeReport()

@@ -110,6 +110,42 @@ def _weight_ready(norm, x: torch.Tensor) -> bool:
     return isinstance(weight, torch.Tensor) and weight.device == x.device
 
 
+def _swiglu_body(hidden):
+    gate, up = hidden.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+def _is_int8_weight(weight) -> bool:
+    return getattr(weight, "_layout_cls", None) == "TensorWiseINT8Layout"
+
+
+def _mlp_forward(block, state, h: torch.Tensor, base_key: tuple):
+    """The H3 MLP with its SwiGLU compiled whenever ComfyUI will not fuse it.
+
+    ``comfy.ops.linear_input_act`` folds the activation into the INT8 kernel; on BF16,
+    FP8 and NVFP4 weights it runs eagerly (three passes over [tokens, 2*ffn]). A LoRA
+    bypass hook on the MLP owns its own activation and is left untouched too.
+    """
+    mlp = block.mlp
+    fc1, fc2 = getattr(mlp, "fc1", None), getattr(mlp, "fc2", None)
+    if (
+        fc1 is None
+        or fc2 is None
+        or "forward" in mlp.__dict__  # bypass hook installed on this instance
+        or _is_int8_weight(getattr(fc2, "weight", None))
+    ):
+        return mlp(h)
+    hidden = fc1(h)
+    try:
+        activation = _compiled(
+            state, "block_swiglu", _swiglu_body, (hidden,),
+            (*base_key, tuple(hidden.shape), hidden.dtype),
+        )
+    except _BlockFusionUnavailable:
+        activation = _swiglu_body(hidden)
+    return fc2(activation)
+
+
 def make_fast_block_forward(block: Any, state: Any, block_index: int):
     """Drop-in ComfyUI ``DiTBlock.forward`` with shared compiled pointwise kernels."""
     original_forward = block.forward
@@ -182,7 +218,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     (x, block.norm2.weight, float(block.norm2.eps), scale_mlp, shift_mlp, indices),
                     (*base_key, scale_mlp.dtype),
                 )
-            mlp_out = block.mlp(h)
+            mlp_out = _mlp_forward(block, state, h, base_key)
             with state.diagnostics.scope("block.post_mlp", x.device):
                 return _compiled(
                     state,

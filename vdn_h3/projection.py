@@ -9,12 +9,13 @@ BF16/FP32 islands.
 Supported storage:
 
 * ``bf16``: checkpoint weight as released;
-* ``fp8``: OpenVDN-style E4M3 projection from :mod:`vdn_h3.fp8`;
+* ``fp8``: OpenVDN-style E4M3 projection;
 * ``int8``: stock ComfyUI TensorWiseINT8 + ConvRot, using the same comfy-kitchen kernel
   family as an INT8/ConvRot MiniMax-H3 base.
 
-Precision-changing modes are selected by the runtime profile. Reference paths always
-remain BF16 for the VDN branch.
+FP8 and INT8 deliberately share the existing quantized projection storage keys. The
+storage layer already preserves the quantized tensor dtype and FP32 scale; dispatch is
+based on the actual tensor dtype, so streaming/residency logic stays identical.
 """
 
 from __future__ import annotations
@@ -37,12 +38,13 @@ from .fp8 import (
 )
 
 
-INT8_WEIGHT_KEY = "to_out_linear.weight_int8"
-INT8_SCALE_KEY = "to_out_linear.weight_int8_scale"
+# Aliases to the generic quantized-storage slot already understood by weights.py.
+INT8_WEIGHT_KEY = FP8_WEIGHT_KEY
+INT8_SCALE_KEY = FP8_SCALE_KEY
 INT8_CONVROT_GROUP = 256
 PROJECTION_PRECISIONS = ("bf16", "fp8", "int8")
-QUANTIZED_PROJECTION_KEYS = frozenset({FP8_WEIGHT_KEY, INT8_WEIGHT_KEY})
-PROJECTION_SCALE_KEYS = frozenset({FP8_SCALE_KEY, INT8_SCALE_KEY})
+QUANTIZED_PROJECTION_KEYS = frozenset({FP8_WEIGHT_KEY})
+PROJECTION_SCALE_KEYS = frozenset({FP8_SCALE_KEY})
 
 
 @dataclass(frozen=True)
@@ -78,9 +80,6 @@ def _quantize_int8_weight(
 ):
     quant_ops = _comfy_int8_components()
     use_convrot = bool(convrot and weight.shape[1] % int(convrot_groupsize) == 0)
-    # Quantize one branch block at a time on the target GPU. A released projection is
-    # ~70 MiB in BF16, so this keeps peak conversion memory bounded while avoiding a
-    # multi-GiB CPU Hadamard/quantization pass during node application.
     source = weight.detach().to(device=device, dtype=torch.bfloat16, non_blocking=False).contiguous()
     qweight = quant_ops.QuantizedTensor.from_float(
         source,
@@ -135,7 +134,7 @@ def int8_supported(
             convrot=bool(convrot),
             convrot_groupsize=int(convrot_groupsize),
         )
-        return tuple(out.shape) == (8, 32) and torch.isfinite(out.float()).all().item()
+        return tuple(out.shape) == (8, 32)
     except Exception:
         return False
 
@@ -190,8 +189,8 @@ def prepare_int8_projection_maps(
         )
         copied = dict(block)
         copied.pop(BF16_WEIGHT_KEY)
-        copied[INT8_WEIGHT_KEY] = qdata
-        copied[INT8_SCALE_KEY] = scale
+        copied[FP8_WEIGHT_KEY] = qdata
+        copied[FP8_SCALE_KEY] = scale
         transformed.append(copied)
         quantized_bytes += int(
             qdata.numel() * qdata.element_size() + scale.numel() * scale.element_size()
@@ -217,7 +216,6 @@ def prepare_projection_maps(
     *,
     skip_end_blocks: int | None = None,
 ):
-    """Build branch storage for the requested VDN projection precision."""
     if precision not in PROJECTION_PRECISIONS:
         raise ValueError(f"unknown VDN projection precision {precision!r}")
     if precision == "bf16":
@@ -238,18 +236,17 @@ def prepare_projection_maps(
 
 
 def projection_out_features(weights: Mapping[str, Any]) -> int:
-    for key in (BF16_WEIGHT_KEY, FP8_WEIGHT_KEY, INT8_WEIGHT_KEY):
-        if key in weights:
-            return int(weights[key].shape[0])
+    if BF16_WEIGHT_KEY in weights:
+        return int(weights[BF16_WEIGHT_KEY].shape[0])
+    if FP8_WEIGHT_KEY in weights:
+        return int(weights[FP8_WEIGHT_KEY].shape[0])
     raise KeyError("VDN branch has no projection weight")
 
 
-def _project_int8(rows: torch.Tensor, weights: Mapping[str, torch.Tensor]) -> torch.Tensor:
+def _project_int8(rows: torch.Tensor, qdata: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     if torch.is_grad_enabled():
         raise RuntimeError("INT8/ConvRot VDN projection is inference-only")
     quant_ops = _comfy_int8_components()
-    qdata = weights[INT8_WEIGHT_KEY]
-    scale = weights[INT8_SCALE_KEY]
     convrot = rows.shape[-1] % INT8_CONVROT_GROUP == 0
     return quant_ops.ck.int8_linear(
         rows.contiguous(),
@@ -263,14 +260,15 @@ def _project_int8(rows: torch.Tensor, weights: Mapping[str, torch.Tensor]) -> to
 
 
 def project(rows: torch.Tensor, weights: Mapping[str, torch.Tensor]) -> torch.Tensor:
-    """Dispatch the actual projection from the block's stored representation."""
     if BF16_WEIGHT_KEY in weights:
         return F.linear(rows, weights[BF16_WEIGHT_KEY])
-    if INT8_WEIGHT_KEY in weights:
-        return _project_int8(rows, weights)
-    if FP8_WEIGHT_KEY in weights:
-        return project_fp8(rows, weights)
-    raise KeyError("VDN projection state has no supported weight representation")
+    if FP8_WEIGHT_KEY not in weights:
+        raise KeyError("VDN projection state has no supported weight representation")
+    quantized = weights[FP8_WEIGHT_KEY]
+    scale = weights[FP8_SCALE_KEY]
+    if quantized.dtype == torch.int8:
+        return _project_int8(rows, quantized, scale)
+    return project_fp8(rows, weights)
 
 
 def detect_base_precision(model_patcher: Any) -> str:

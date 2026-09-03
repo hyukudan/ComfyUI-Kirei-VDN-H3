@@ -36,6 +36,7 @@ jobs:
             tests/test_hybrid.py \
             tests/test_layout.py \
             tests/test_optimized_runtime.py \
+            tests/test_precision_runtime.py \
             tests/test_runtime_policy.py \
             tests/test_spec.py \
             tests/test_window.py

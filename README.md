@@ -141,9 +141,25 @@ measured stages, so it is not a zero-overhead production option. The runtime rec
 `vdn_h3_private.benchmark.runtime_snapshot(model)` exposes the resolved runtime state
 and the latest diagnostic snapshot for repeatable experiments.
 
-## Validation
+## Baseline validated before this rewrite
 
-Before this optimization pass, the repository's synthetic suite had 55 passing tests.
+The immediately preceding alpha on `main` had already passed real RTX PRO 6000 smoke
+validation with the released stage checkpoint:
+
+- complete synthetic suite: **55 passed**;
+- real H3 INT8 checkpoint application: 520 compact low-rank terms over 208 native
+  weight targets, 51 runtime curve-AdaLN targets and 50 VDN branch blocks;
+- quantized fused-QKV materialization probe with stacked offset LoRAs: passed;
+- Flex versus grouped CUDA smoke parity: BF16 maximum absolute error `0.00390625`,
+  `allclose=True`;
+- complete 4-step, 608×352, 22-frame video+audio smoke generation: passed in 37 seconds
+  on the RTX PRO 6000 launcher path.
+
+Those results establish a useful baseline for the optimized rewrite, but they are not
+being presented as post-rewrite validation.
+
+## Validation of the optimized rewrite
+
 The rewritten paths add optimization-specific CPU tests covering:
 
 - reference/inference scan parity;
@@ -154,7 +170,9 @@ The rewritten paths add optimization-specific CPU tests covering:
 - full-cover gate parity.
 
 Those focused tests pass in the implementation harness. Python compilation also passes
-for every new/rewritten module.
+for every new/rewritten module. The pre-existing tests were reviewed against the
+preserved APIs (`run_scans`, grouped attention, `ManagedBranchWeights`, full-cover gate,
+and reversible `apply_vdn`).
 
 A real post-rewrite CUDA integration run is still required before merging this branch
 to a production installation. In particular, the following cannot be validated in the
@@ -192,5 +210,5 @@ you are authorized to use the relevant MiniMax/VDN weights in your territory.
 
 ## Engineering notes
 
-- [`docs/PORT_REPORT.md`](docs/PORT_REPORT.md) — original feasibility and upstream audit.
+- [`docs/PORT_REPORT.md`](docs/PORT_REPORT.md) — original feasibility, upstream audit and pre-optimization RTX smoke results.
 - [`docs/OPTIMIZATION_IMPLEMENTATION.md`](docs/OPTIMIZATION_IMPLEMENTATION.md) — implementation map for this optimization pass.

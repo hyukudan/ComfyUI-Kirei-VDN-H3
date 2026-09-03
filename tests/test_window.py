@@ -93,6 +93,36 @@ def test_grouped_video_queries_are_contiguous_slices(monkeypatch):
         assert group.shape[0] % per_frame == 0
 
 
+def test_exact_sdpa_uses_comfy_backend_priority_without_override(monkeypatch):
+    calls = []
+    comfy_module = types.ModuleType("comfy")
+    ops_module = types.ModuleType("comfy.ops")
+
+    def exact_sdpa(q, k, v, **kwargs):
+        calls.append((q.shape, k.shape, kwargs.get("scale")))
+        return F.scaled_dot_product_attention(q, k, v, **kwargs)
+
+    ops_module.scaled_dot_product_attention = exact_sdpa
+    comfy_module.ops = ops_module
+    monkeypatch.setitem(sys.modules, "comfy", comfy_module)
+    monkeypatch.setitem(sys.modules, "comfy.ops", ops_module)
+
+    rows, heads, dim = 9, 2, 4
+    q = torch.randn(rows, heads, dim)
+    k = torch.randn(rows + 3, heads, dim)
+    v = torch.randn_like(k)
+    scale = dim**-0.5
+    got = window._sdpa(q, k, v, scale, transformer_options=None)
+    want = F.scaled_dot_product_attention(
+        q.permute(1, 0, 2).unsqueeze(0),
+        k.permute(1, 0, 2).unsqueeze(0),
+        v.permute(1, 0, 2).unsqueeze(0),
+        scale=scale,
+    ).squeeze(0).permute(1, 0, 2)
+    torch.testing.assert_close(got, want)
+    assert calls == [((1, heads, rows, dim), (1, heads, rows + 3, dim), scale)]
+
+
 def test_comfy_dispatch_contract(monkeypatch):
     calls = []
 

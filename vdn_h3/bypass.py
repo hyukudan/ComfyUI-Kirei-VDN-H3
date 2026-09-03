@@ -4,6 +4,13 @@ Q/K/V factors remain independent in output space, but all terms targeting the sa
 native module share one down GEMM and all terms targeting the same output slice share
 one up GEMM. Default+turbo fused QKV therefore evaluates as one down plus Q/K/V ups,
 without materializing dense B@A weights.
+
+``mlp.fc2`` is special: native MiniMax-H3 evaluates it through
+``comfy.ops.linear_input_act``, which folds the SwiGLU activation into the INT8 kernel
+and never calls ``fc2.forward``. Those factors are therefore hooked on the parent MLP:
+the native (possibly fused/quantized) base GEMM is kept and the exact low-rank term is
+added from the same SwiGLU activation, so the adapter update is never rounded into a
+requantized weight.
 """
 
 from __future__ import annotations
@@ -229,8 +236,58 @@ class _BypassHook:
             self.original_forward = None
 
 
+def swiglu(hidden: torch.Tensor) -> torch.Tensor:
+    """Native MiniMax-H3 SwiGLU: the first half of ``fc1`` is the gate."""
+    gate, up = hidden.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+def _is_int8_quantized(weight) -> bool:
+    return getattr(weight, "_layout_cls", None) == "TensorWiseINT8Layout"
+
+
+def fc2_base_output(fc2: nn.Module, hidden: torch.Tensor, activation: torch.Tensor) -> torch.Tensor:
+    """``fc2(swiglu(hidden))`` through the same path native ComfyUI uses.
+
+    INT8 weights keep the fused ``linear_input_act`` kernel (the activation never reaches
+    HBM); every other storage runs the plain projection over the already computed
+    activation, which the low-rank term needs anyway.
+    """
+    if _is_int8_quantized(getattr(fc2, "weight", None)):
+        try:
+            from comfy.ops import linear_input_act
+        except ImportError:
+            linear_input_act = None
+        if linear_input_act is not None:
+            return linear_input_act(fc2, hidden, "swiglu")
+    return fc2(activation)
+
+
+class _MlpBypassHook(_BypassHook):
+    """Exact ``mlp.fc2`` adapter term evaluated in activation space on the parent MLP."""
+
+    def _forward(self, x, *args, **kwargs):
+        module = self.module
+        hidden = module.fc1(x)
+        activation = swiglu(hidden)
+        base_out = fc2_base_output(module.fc2, hidden, activation)
+        if not isinstance(base_out, torch.Tensor):
+            raise RuntimeError("VDN-H3 MLP bypass expected a tensor fc2 output")
+        return self.adapter.apply(activation, base_out)
+
+
+_MLP_FC2_SUFFIX = ".mlp.fc2"
+
+
 def requires_weight_merge(key: str) -> bool:
-    return key.endswith(".mlp.fc2.weight")
+    """Whether a factor cannot be evaluated in activation space.
+
+    Every supported target now has an exact bypass: ``mlp.fc2`` uses the MLP-level hook
+    instead of forcing a weight merge (which requantizes INT8/FP8 weights and rounds
+    part of the update away). Kept as an explicit policy point for future targets.
+    """
+    del key
+    return False
 
 
 def partition_factors(factors: Iterable[WeightedFactor], mode: str):
@@ -284,11 +341,17 @@ def install_bypass(model_patcher: Any, factors: Iterable[WeightedFactor]):
 
     hooks: list[_BypassHook] = []
     for path, adapter in zip(runtime.module_paths, runtime.groups):
+        hook_path = path[: -len(".fc2")] if path.endswith(_MLP_FC2_SUFFIX) else path
         try:
-            module = model_patcher.get_model_object(path)
+            module = model_patcher.get_model_object(hook_path)
         except Exception as exc:
-            raise RuntimeError(f"VDN-H3 bypass target {path!r} does not exist") from exc
-        hooks.append(_BypassHook(module, adapter))
+            raise RuntimeError(f"VDN-H3 bypass target {hook_path!r} does not exist") from exc
+        if hook_path != path:
+            if not hasattr(module, "fc1") or not hasattr(module, "fc2"):
+                raise RuntimeError(f"VDN-H3 MLP bypass target {hook_path!r} has no fc1/fc2")
+            hooks.append(_MlpBypassHook(module, adapter))
+        else:
+            hooks.append(_BypassHook(module, adapter))
 
     try:
         from comfy.patcher_extension import PatcherInjection
@@ -319,7 +382,9 @@ __all__ = [
     "FrugalLoRABypassAdapter",
     "LoRABypassRuntime",
     "WeightedFactor",
+    "fc2_base_output",
     "install_bypass",
     "partition_factors",
     "requires_weight_merge",
+    "swiglu",
 ]

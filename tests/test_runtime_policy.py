@@ -140,7 +140,8 @@ def test_profile_resolution_has_exact_reference_and_domestic_low_vram(monkeypatc
 
     fp8 = nodes._resolve_runtime(model, _branch_maps(), profile="experimental_fp8")
     assert fp8["projection_precision"] == "fp8"
-    assert fp8["lora_mode"] == "bypass"
+    # Experimental profiles follow auto's adapter rule: a BF16 base merges exactly.
+    assert fp8["lora_mode"] == "merge"
     assert fp8["inference"]
 
 
@@ -254,3 +255,64 @@ def test_runtime_snapshot_and_node_are_machine_readable():
     schema = node.INPUT_TYPES()
     assert schema["optional"]["after"][0] == "*"
     assert node.OUTPUT_NODE is True
+
+
+def test_auto_bf16_base_merges_adapters_exactly(monkeypatch):
+    monkeypatch.setattr(nodes, "detect_base_precision", lambda model: "bf16")
+    monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "serial")
+    monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 0)
+    runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
+    # One fp32 delta folded into BF16 weights is exact and removes the runtime GEMMs.
+    assert runtime["lora_mode"] == "merge"
+    assert runtime["projection_precision"] == "bf16"
+    low = nodes._resolve_runtime(object(), _branch_maps(), profile="low_vram")
+    assert low["lora_mode"] == "bypass"
+
+
+def test_auto_quantized_bases_keep_the_exact_bypass(monkeypatch):
+    monkeypatch.setattr(nodes, "_auto_branch_mode", lambda *args: "resident")
+    monkeypatch.setattr(nodes, "_auto_execution_mode", lambda *args: "serial")
+    monkeypatch.setattr(nodes, "_auto_tile_frames", lambda *args: 0)
+    for precision in ("int8", "fp8", "nvfp4", "mxfp8"):
+        monkeypatch.setattr(nodes, "detect_base_precision", lambda model, p=precision: p)
+        runtime = nodes._resolve_runtime(object(), _branch_maps(), profile="auto")
+        assert runtime["base_precision"] == precision
+        assert runtime["lora_mode"] == "bypass"
+        assert runtime["projection_precision"] == "bf16"
+
+
+def test_auto_branch_mode_budgets_against_the_base_model_size(monkeypatch):
+    gib = 1024**3
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(nodes, "_model_cuda_device", lambda _: torch.device("cuda:0"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=96 * gib),
+    )
+    # Before ComfyUI loads the base the card looks almost empty.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (94 * gib, 96 * gib))
+    int8_base = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 34 * gib)
+    bf16_base = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 66 * gib)
+    huge_base = SimpleNamespace(load_device=torch.device("cuda:0"), model_size=lambda: 82 * gib)
+    assert nodes._auto_branch_mode(int8_base, 5 * gib, int(4.5 * gib)) == "resident"
+    assert nodes._auto_branch_mode(bf16_base, 5 * gib, int(4.5 * gib)) == "resident"
+    assert nodes._auto_branch_mode(huge_base, 5 * gib, int(4.5 * gib)) == "hybrid"
+
+
+def test_layout_snapshot_reports_global_rows():
+    from vdn_h3.benchmark import _layout_snapshot
+    from vdn_h3.layout import VDNLayout
+
+    layout = VDNLayout(
+        seq_len=1500, video_start=1200, video_end=1500, num_frames=3, tokens_per_frame=100,
+        frame_size=(10, 10), text_start=0, text_len=200, bounds=((0, 2),) * 3,
+        full_cover=True, anchor_frames="both",
+    )
+    snapshot = _layout_snapshot(SimpleNamespace(last_layout=layout))
+    assert snapshot["video_rows"] == 300
+    assert snapshot["text_rows"] == 200
+    assert snapshot["other_global_rows"] == 1000
+    assert snapshot["global_rows"] == 1200
+    assert abs(snapshot["global_fraction"] - 0.8) < 1e-9

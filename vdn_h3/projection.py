@@ -268,22 +268,43 @@ def project(rows: torch.Tensor, weights: Mapping[str, torch.Tensor]) -> torch.Te
     return project_fp8(rows, weights)
 
 
+BASE_PRECISIONS = ("bf16", "int8", "fp8", "nvfp4", "mxfp8", "w4a4", "w4a8")
+
+
 def detect_base_precision(model_patcher: Any) -> str:
-    """Infer the native H3 wide-linear precision family without moving weights."""
+    """Infer the native H3 wide-linear precision family without moving weights.
+
+    Every comfy-kitchen storage family is recognised so runtime policy can tell a
+    quantized backbone from a BF16 one even when no VDN projection exists in that
+    family (NVFP4/MXFP8/W4 bases keep a BF16 projection but use adapter bypass).
+    """
     try:
         dm = model_patcher.get_model_object("diffusion_model")
         weight = dm.blocks[0].attn.qkv_proj.weight
     except Exception:
         return "bf16"
     layout = str(getattr(weight, "_layout_cls", ""))
+    upper = layout.upper()
     if layout == "TensorWiseINT8Layout":
         return "int8"
-    if "FP8" in layout.upper() or getattr(weight, "dtype", None) in {
+    if "MXFP8" in upper:
+        return "mxfp8"
+    if "NVFP4" in upper:
+        return "nvfp4"
+    if "CONVROTW4A4" in upper:
+        return "w4a4"
+    if "W4A8" in upper:
+        return "w4a8"
+    if "FP8" in upper or getattr(weight, "dtype", None) in {
         torch.float8_e4m3fn,
         getattr(torch, "float8_e5m2", torch.float8_e4m3fn),
     }:
         return "fp8"
     return "bf16"
+
+
+def is_quantized_base(precision: str) -> bool:
+    return precision != "bf16"
 
 
 __all__ = [
@@ -301,6 +322,7 @@ __all__ = [
     "detect_base_precision",
     "fp8_supported",
     "int8_supported",
+    "is_quantized_base",
     "prepare_int8_projection_maps",
     "prepare_projection_maps",
     "project",

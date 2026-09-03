@@ -11,7 +11,12 @@ from .apply import apply_factor_patches
 from .bypass import WeightedFactor, install_bypass, partition_factors
 from .hybrid import VDNState, apply_vdn, validate_h3_model
 from .kernels import COMPILE_POLICIES, KERNEL_BACKENDS
-from .projection import PROJECTION_PRECISIONS, detect_base_precision, prepare_projection_maps
+from .projection import (
+    PROJECTION_PRECISIONS,
+    detect_base_precision,
+    is_quantized_base,
+    prepare_projection_maps,
+)
 from .weights import BRANCH_MODES, PIN_STRATEGIES, STREAMED_PROJECTION_KEY
 from .window import ATTENTION_BACKENDS
 
@@ -19,15 +24,29 @@ from .window import ATTENTION_BACKENDS
 _LOG = logging.getLogger("comfy.vdn_h3")
 _PLACEHOLDER = "<place an authorized VDN checkpoint under models/vdn>"
 _EXECUTION_MODES = ("serial", "parallel")
+# UI order: the four profiles a user should normally pick from come first; the rest are
+# explicit experiments kept for saved workflows and benchmark scenarios.
 _PROFILES = (
     "auto",
     "max_speed",
-    "workstation_fp8",
-    "balanced",
     "low_vram",
     "reference",
+    "balanced",
     "compat_reference",
     "experimental_fp8",
+    "workstation_fp8",
+)
+
+_PROFILE_TOOLTIP = (
+    "auto: quality-first. Exact calibrated attention, BF16 VDN projection when the branch "
+    "is resident, adapters merged on BF16 bases and kept as an exact activation-space "
+    "bypass on INT8/FP8/NVFP4 bases.\n"
+    "max_speed: resident branch, adapters merged (requantized on quantized bases), "
+    "quantized projection, CUDA graphs. Faster only if the benchmark and the quality gate "
+    "say so.\n"
+    "low_vram: hybrid storage, 5-frame exact tiling, bypass adapters (24 GB cards).\n"
+    "reference: numerical oracle (eager branch, grouped SDPA, BF16, no compile).\n"
+    "balanced / compat_reference / experimental_fp8 / workstation_fp8: explicit experiments."
 )
 
 
@@ -139,17 +158,34 @@ def _gpu_budget(model):
         return None
 
 
+def _base_model_bytes(model) -> int | None:
+    """Size of the H3 base as ComfyUI accounts it, whether or not it is loaded yet."""
+    getter = getattr(model, "model_size", None)
+    if not callable(getter):
+        return None
+    try:
+        size = int(getter())
+    except Exception:
+        return None
+    return size if size > 0 else None
+
+
 def _auto_branch_mode(model, branch_bytes: int, projection_bytes: int | None = None) -> str:
     budget = _gpu_budget(model)
     if budget is None:
         return "stream"
     _device, total, free = budget
+    # The node usually runs before ComfyUI has loaded the H3 base, so "free" VRAM is
+    # nearly the whole card at this point. Budget against what remains once the base is
+    # resident, which is what the render will actually see.
+    base_bytes = _base_model_bytes(model)
+    available = free if base_bytes is None else min(free, total - base_bytes)
     projection_bytes = int(projection_bytes or branch_bytes * 0.90)
     headroom = max(18 * 1024**3, int(total * 0.22))
-    if total >= 48 * 1024**3 and free > branch_bytes * 1.20 + headroom:
+    if total >= 48 * 1024**3 and available > branch_bytes * 1.20 + headroom:
         return "resident"
     small_resident = max(0, branch_bytes - projection_bytes)
-    if free > small_resident + 6 * 1024**3:
+    if available > small_resident + 6 * 1024**3:
         return "hybrid"
     return "stream"
 
@@ -256,8 +292,17 @@ def _resolve_runtime(
         resolved_lora = lora_mode
     elif profile in {"max_speed", "workstation_fp8"}:
         resolved_lora = "merge"
-    else:
+    elif profile in {"reference", "compat_reference", "low_vram"}:
         resolved_lora = "bypass"
+    elif is_quantized_base(base_precision):
+        # Folding a LoRA into INT8/FP8/NVFP4 storage requantizes the weight and rounds
+        # part of the update away (softer output). The activation-space bypass is exact
+        # on every target, mlp.fc2 included (see bypass._MlpBypassHook).
+        resolved_lora = "bypass"
+    else:
+        # BF16 storage: one fp32 delta and one rounding, the same fold OpenVDN performs
+        # before inference, and no low-rank GEMMs left in the hot path.
+        resolved_lora = "merge"
 
     if attention_backend != "auto":
         resolved_attention = attention_backend
@@ -361,6 +406,7 @@ def apply_checkpoint(
     projection_precision: str = "auto",
     strict_validation: bool = True,
     diagnostics: bool = False,
+    adaln_fp32: bool = True,
     linear_kernels: str | None = None,
     branch_weights: str | None = None,
 ):
@@ -472,6 +518,7 @@ def apply_checkpoint(
     state.profile = runtime["profile"]
     state.base_precision = runtime["base_precision"]
     state.branch_execution = runtime["branch_execution"]
+    state.adaln_fp32 = bool(adaln_fp32)
 
     cloned = model.clone()
     try:
@@ -539,8 +586,8 @@ def apply_checkpoint(
 
     _LOG.info(
         "VDN-H3 %s applied: profile=%s base=%s branch=%s execution=%s lora=%s attention=%s "
-        "kernel=%s compile=%s tile_frames=%d pin=%s projection=%s block_fusion=%s; "
-        "%d blocks, %.2f GiB branch; adapters %s",
+        "kernel=%s compile=%s tile_frames=%d pin=%s projection=%s block_fusion=%s "
+        "adaln_fp32=%s; %d blocks, %.2f GiB branch; adapters %s",
         checkpoint_name,
         runtime["profile"],
         runtime["base_precision"],
@@ -554,6 +601,7 @@ def apply_checkpoint(
         runtime["pin_strategy"],
         runtime["projection_precision"],
         runtime["block_fusion"],
+        state.adaln_fp32,
         len(blocks),
         state.weight_store.nbytes / 1024**3,
         ", ".join(reports),
@@ -567,36 +615,157 @@ class KireiApplyVDNH3:
         advanced = {"advanced": True}
         return {
             "required": {
-                "model": ("MODEL",),
-                "vdn_checkpoint": (_checkpoints(),),
-                "profile": (list(_PROFILES), {"default": "auto"}),
-                "apply_turbo_adapter": ("BOOLEAN", {"default": True}),
+                "model": (
+                    "MODEL",
+                    {"tooltip": "Native ComfyUI MiniMax-H3 MODEL (BF16, INT8/ConvRot, FP8 or NVFP4 base)."},
+                ),
+                "vdn_checkpoint": (
+                    _checkpoints(),
+                    {
+                        "tooltip": (
+                            "OpenVDN stage directory under models/vdn. stage-dmd-step-250 is the "
+                            "released 8-step model; stage-b-step-2000 is the 50-step model."
+                        )
+                    },
+                ),
+                "profile": (list(_PROFILES), {"default": "auto", "tooltip": _PROFILE_TOOLTIP}),
+                "apply_turbo_adapter": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "ON: the released 8-step model (sample with euler / simple / 8 steps / "
+                            "cfg 1). OFF: the 50-step Stage-B model (euler / simple / 50). Stage-B "
+                            "checkpoints carry no turbo adapter: switch this OFF for them."
+                        ),
+                    },
+                ),
                 "strength": (
-                    "FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
+                    "FLOAT",
+                    {
+                        "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                        "tooltip": "Strength of both adapters. 1.0 is the released model and the only value the canonical benchmark accepts.",
+                    },
                 ),
             },
             "optional": {
                 "default_adapter_strength": (
-                    "FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced}
+                    "FLOAT",
+                    {
+                        "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced,
+                        "tooltip": "Stage-B `default` adapter strength. -1 inherits `strength`.",
+                    },
                 ),
                 "turbo_adapter_strength": (
-                    "FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced}
+                    "FLOAT",
+                    {
+                        "default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05, **advanced,
+                        "tooltip": "Stage-DMD `turbo` adapter strength. -1 inherits `strength`.",
+                    },
                 ),
-                "branch_mode": (["auto", *BRANCH_MODES], {"default": "auto", **advanced}),
-                "branch_execution": (["auto", *_EXECUTION_MODES], {"default": "auto", **advanced}),
-                "lora_mode": (["auto", "bypass", "merge"], {"default": "auto", **advanced}),
-                "attention_backend": (list(ATTENTION_BACKENDS), {"default": "auto", **advanced}),
-                "kernel_backend": (list(KERNEL_BACKENDS), {"default": "auto", **advanced}),
-                "compile_policy": (["auto", *COMPILE_POLICIES], {"default": "auto", **advanced}),
-                "tile_frames": (
-                    "INT", {"default": 0, "min": 0, "max": 64, "step": 1, **advanced}
+                "lora_mode": (
+                    ["auto", "bypass", "merge"],
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": (
+                            "auto: merge into BF16 bases (exact, no runtime GEMMs); exact "
+                            "activation-space bypass on INT8/FP8/NVFP4 bases, where merging would "
+                            "requantize the weight and soften the update. bypass / merge force one."
+                        ),
+                    },
                 ),
-                "pin_strategy": (list(PIN_STRATEGIES), {"default": "auto", **advanced}),
+                "branch_mode": (
+                    ["auto", *BRANCH_MODES],
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": (
+                            "Where the 4.3 GB VDN branch lives. resident: on the GPU. hybrid: small "
+                            "tensors resident, the output projection streamed. stream: CPU masters "
+                            "with double-buffered staging. auto budgets total VRAM minus the base model."
+                        ),
+                    },
+                ),
+                "attention_backend": (
+                    list(ATTENTION_BACKENDS),
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": (
+                            "Exact local-window softmax kernel. auto calibrates grouped / flex / "
+                            "flash2 / decomposed once per GPU and geometry and persists the winner. "
+                            "reference: grouped oracle. compat: through ComfyUI's attention override "
+                            "(Sage etc.), approximate."
+                        ),
+                    },
+                ),
                 "projection_precision": (
-                    ["auto", *PROJECTION_PRECISIONS], {"default": "auto", **advanced}
+                    ["auto", *PROJECTION_PRECISIONS],
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": (
+                            "Precision of the VDN to_out_linear GEMM. auto: BF16 when the branch is "
+                            "resident; may follow an INT8/FP8 base on hybrid/stream placement. "
+                            "int8 / fp8 are quality-gated experiments."
+                        ),
+                    },
                 ),
-                "strict_validation": ("BOOLEAN", {"default": True, **advanced}),
-                "diagnostics": ("BOOLEAN", {"default": False, **advanced}),
+                "kernel_backend": (
+                    list(KERNEL_BACKENDS),
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": "Temporal-conv + activation kernels of the linear branch: auto (Triton when available), triton, conv1d, eager.",
+                    },
+                ),
+                "compile_policy": (
+                    ["auto", *COMPILE_POLICIES],
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": (
+                            "torch.compile policy for the pointwise / gather / epilogue bodies: off, "
+                            "shared (default), reduce_overhead (CUDA graphs, used by max_speed), "
+                            "max_autotune."
+                        ),
+                    },
+                ),
+                "tile_frames": (
+                    "INT",
+                    {
+                        "default": 0, "min": 0, "max": 64, "step": 1, **advanced,
+                        "tooltip": "0: untiled or the profile's choice. N: process K/V, Q and readout in N-frame tiles to cut activation memory. Exact.",
+                    },
+                ),
+                "pin_strategy": (
+                    list(PIN_STRATEGIES),
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": "Pinned host memory for streamed branch weights: auto / comfy follow ComfyUI's policy, all pins everything, none disables pinning.",
+                    },
+                ),
+                "branch_execution": (
+                    ["auto", *_EXECUTION_MODES],
+                    {
+                        "default": "auto", **advanced,
+                        "tooltip": "serial (tuned default) or parallel: experimental second CUDA stream for the linear branch, resident weights only.",
+                    },
+                ),
+                "adaln_fp32": (
+                    "BOOLEAN",
+                    {
+                        "default": True, **advanced,
+                        "tooltip": (
+                            "Compute the AdaLN SiLU from the fp32 time embedding, as OpenVDN's "
+                            "patched diffusers does (ComfyUI rounds it to BF16 first). Fidelity fix; "
+                            "turn off only to A/B against the native path."
+                        ),
+                    },
+                ),
+                "strict_validation": (
+                    "BOOLEAN",
+                    {"default": True, **advanced, "tooltip": "Check every branch tensor shape against the loaded H3 geometry before applying."},
+                ),
+                "diagnostics": (
+                    "BOOLEAN",
+                    {"default": False, **advanced, "tooltip": "Record per-stage CUDA-event timings and memory for the Runtime Report. No extra syncs during sampling."},
+                ),
             },
         }
 
@@ -604,8 +773,9 @@ class KireiApplyVDNH3:
     FUNCTION = "apply"
     CATEGORY = "model_patches/video"
     DESCRIPTION = (
-        "Apply VideoDeltaNet H3 with native-precision projection, optimized branch "
-        "execution, factorized/merged adapters and calibrated attention dispatch."
+        "Apply OpenVDN VideoDeltaNet (VDN-H3) to a native MiniMax-H3 model: exact "
+        "local-window attention plus the recurrent linear branch and its adapters, on an "
+        "optimized single-GPU runtime. Recommended: profile auto, euler / simple, 8 steps, cfg 1."
     )
 
     def apply(
@@ -628,6 +798,7 @@ class KireiApplyVDNH3:
         projection_precision="auto",
         strict_validation=True,
         diagnostics=False,
+        adaln_fp32=True,
     ):
         return (
             apply_checkpoint(
@@ -649,6 +820,7 @@ class KireiApplyVDNH3:
                 projection_precision=projection_precision,
                 strict_validation=strict_validation,
                 diagnostics=diagnostics,
+                adaln_fp32=adaln_fp32,
             ),
         )
 

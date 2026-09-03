@@ -83,6 +83,11 @@ def _measurement(precision="bf16", profile="auto", plan=None):
             "profile": profile,
             "projection": {"precision": precision},
             "checkpoint_recipe": {"turbo_num_steps": 8},
+            "adapters": {
+                "active": ["default", "turbo"],
+                "strengths": {"default": 1.0, "turbo": 1.0},
+                "lora_mode": "bypass",
+            },
         },
     }
 
@@ -109,12 +114,8 @@ def test_record_result_rejects_unverified_sampling_plan():
     measurement = _measurement(plan={"verified": False})
     with pytest.raises(ValueError, match="verified Kirei Benchmark Sampling"):
         module.build_result(
-            measurement,
-            _vdn_scenario(),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            measurement, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
         )
 
 
@@ -123,12 +124,8 @@ def test_record_result_rejects_res_multistep_on_stage_dmd():
     measurement = _measurement(plan=_plan(sampler_name="res_multistep"))
     with pytest.raises(ValueError, match="sampling plan mismatch|res_multistep"):
         module.build_result(
-            measurement,
-            _vdn_scenario(),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            measurement, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
         )
 
 
@@ -137,12 +134,8 @@ def test_record_result_rejects_beta_scheduler_on_stage_dmd():
     measurement = _measurement(plan=_plan(scheduler_name="beta"))
     with pytest.raises(ValueError, match="scheduler_name"):
         module.build_result(
-            measurement,
-            _vdn_scenario(),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            measurement, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
         )
 
 
@@ -150,21 +143,13 @@ def test_record_result_rejects_wrong_denoise_or_step_count():
     module = _module()
     with pytest.raises(ValueError, match="denoise"):
         module.build_result(
-            _measurement(plan=_plan(denoise=0.8)),
-            _vdn_scenario(),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            _measurement(plan=_plan(denoise=0.8)), _vdn_scenario(), _vdn_recipe(),
+            seed=1, prompt_hash="p", quality_status="pending",
         )
     with pytest.raises(ValueError, match="steps"):
         module.build_result(
-            _measurement(plan=_plan(steps=6)),
-            _vdn_scenario(),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            _measurement(plan=_plan(steps=6)), _vdn_scenario(), _vdn_recipe(),
+            seed=1, prompt_hash="p", quality_status="pending",
         )
 
 
@@ -174,12 +159,8 @@ def test_record_result_rejects_wrong_model_sampling_shift():
     measurement["sampling"] = {"video_shift": 6.0, "audio_shift": 3.0}
     with pytest.raises(ValueError, match="model sampling shifts"):
         module.build_result(
-            measurement,
-            _vdn_scenario(),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            measurement, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
         )
 
 
@@ -187,12 +168,8 @@ def test_record_result_rejects_precision_fallback_under_wrong_label():
     module = _module()
     with pytest.raises(ValueError, match="projection_precision='int8'"):
         module.build_result(
-            _measurement(precision="bf16"),
-            _vdn_scenario(precision="int8"),
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            _measurement(precision="bf16"), _vdn_scenario(precision="int8"),
+            _vdn_recipe(), seed=1, prompt_hash="p", quality_status="pending",
         )
 
 
@@ -203,12 +180,35 @@ def test_record_result_rejects_wrong_profile_label():
     scenario["profile"] = "max_speed"
     with pytest.raises(ValueError, match="profile='max_speed'"):
         module.build_result(
-            _measurement(profile="auto"),
-            scenario,
-            _vdn_recipe(),
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            _measurement(profile="auto"), scenario, _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
+        )
+
+
+def test_record_result_rejects_missing_or_wrong_adapter_recipe():
+    module = _module()
+    missing = _measurement()
+    missing["runtime_report"].pop("adapters")
+    with pytest.raises(ValueError, match="does not expose the active adapter recipe"):
+        module.build_result(
+            missing, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
+        )
+
+    wrong_strength = _measurement()
+    wrong_strength["runtime_report"]["adapters"]["strengths"]["turbo"] = 0.6
+    with pytest.raises(ValueError, match="strength=0.6"):
+        module.build_result(
+            wrong_strength, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
+        )
+
+    wrong_active = _measurement()
+    wrong_active["runtime_report"]["adapters"]["active"] = ["default"]
+    with pytest.raises(ValueError, match="runtime adapters"):
+        module.build_result(
+            wrong_active, _vdn_scenario(), _vdn_recipe(), seed=1,
+            prompt_hash="p", quality_status="pending",
         )
 
 
@@ -257,10 +257,6 @@ def test_non_vdn_control_rejects_vdn_runtime_state():
     }
     with pytest.raises(ValueError, match="non-VDN control"):
         module.build_result(
-            measurement,
-            scenario,
-            recipe,
-            seed=1,
-            prompt_hash="p",
-            quality_status="pending",
+            measurement, scenario, recipe, seed=1,
+            prompt_hash="p", quality_status="pending",
         )

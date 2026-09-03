@@ -1,10 +1,18 @@
 [project]
 name = "comfyui-kirei-vdn-h3"
-version = "0.2.0"
-description = "Optimized VideoDeltaNet integration for native ComfyUI MiniMax-H3"
+version = "0.3.0"
+description = "VideoDeltaNet (VDN-H3) for native ComfyUI MiniMax-H3: exact math, optimized single-GPU runtime"
 requires-python = ">=3.10"
 dependencies = []
 license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/hyukudan/ComfyUI-Kirei-VDN-H3"
+
+[tool.comfy]
+# PublisherId must match your registry.comfy.org publisher before `comfy node publish`.
+# PublisherId = "hyukudan"
+DisplayName = "Kirei VDN-H3"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

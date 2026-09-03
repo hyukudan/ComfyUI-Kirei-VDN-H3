@@ -338,11 +338,21 @@ Terms sharing an output slice concatenate scaled B/up matrices column-wise:
 Default+turbo fused QKV therefore needs one shared down GEMM and one up GEMM per Q/K/V
 slice instead of independent pairs for every adapter term.
 
-### Merge exception
+### `mlp.fc2` exact bypass
 
-Native H3 may consume `mlp.fc2` through `linear_input_act` without calling its ordinary
-`forward`. Such factors must use the native weight patch path rather than an activation
-hook.
+Native H3 consumes `mlp.fc2` through `comfy.ops.linear_input_act`, which folds the SwiGLU
+into the INT8 kernel and never calls `fc2.forward`. Those factors are hooked on the
+parent MLP instead: the native fc2 GEMM (fused/quantized or plain) is kept and the exact
+low-rank term is added from the same SwiGLU activation. No target is ever forced into a
+weight merge. Merging into a quantized weight requantizes it and rounds part of the
+update away, which is exactly the softening `lora_mode=bypass` exists to avoid.
+
+### Adapter policy
+
+`auto` merges on BF16 bases (one fp32 delta, one rounding, the fold OpenVDN performs
+before inference, no low-rank GEMMs left in the hot path) and keeps the activation-space
+bypass on every quantized base (INT8, FP8, NVFP4, MXFP8, W4). `max_speed` merges
+everywhere and must pass its own quality gate.
 
 ### Runtime recipe metadata
 
@@ -379,6 +389,20 @@ runtime curve category and are re-injected using:
 
 The e-grid search prefers checkpoint-local/model-root locations and retains the legacy
 MiniMax-H3-Turbo sibling path only as a fallback.
+
+---
+
+## 11b. AdaLN fp32 activation
+
+ComfyUI casts the fp32 time embedding to the compute dtype before every block's AdaLN
+SiLU. OpenVDN patched diffusers to activate in fp32 and cast afterwards, after measuring
+a 3.5e-3 norm-relative error on the modulation that biases every block identically at
+every step; the released checkpoints were trained under that patch.
+
+Kirei object-patches `time_embedder.forward` to keep the fp32 embedding for the current
+forward and replaces every `adaln_proj.forward` (50 blocks plus the final layer) with a
+body that activates that copy and projects in the model dtype. Curve-form bases (no
+SiLU, fp32 AdaLN) are skipped. Switch: `adaln_fp32`; state: Runtime Report `adaln_fp32`.
 
 ---
 
@@ -426,6 +450,16 @@ to packed row order. Dense rows remain exact SDPA.
 contains GPU/software identity and exact packed geometry. Only exact candidates that pass
 parity against the grouped oracle can win.
 
+### GPU families
+
+`window.gpu_family` classifies the device once. Hopper (sm_90) and datacenter Blackwell
+(sm_100/sm_103) may try the FA4/CuTe decomposition first; consumer and workstation
+Blackwell (sm_120: RTX 50xx, RTX PRO 6000), Ada and Ampere never do, because those
+kernels do not exist there. Before autotuning, `auto` also estimates the K/V copy volume
+grouped attention would need for the layout (every global row is copied into every
+window group) and selects Flex outright when the copies would exceed the guard; the
+reason is reported as `attention_calibration.dispatch_reason`.
+
 ---
 
 ## 13. Projection precision
@@ -446,6 +480,10 @@ state and narrow/sensitive VDN operations stay BF16/FP32.
 Stores an actual quantized projection representation plus scale; it does not retain a
 hidden BF16 duplicate for quantized interior blocks. Actual-device scaled-matmul support
 is probed before installation.
+
+`detect_base_precision` recognises every comfy-kitchen storage family (INT8, FP8,
+NVFP4, MXFP8, W4A4, W4A8). Families without a matching VDN projection keep the BF16
+projection; the base being quantized still selects the exact adapter bypass.
 
 Precision policy may follow an explicitly selected scenario/profile or an already
 quantized base. Benchmark labels are validated against the **resolved** Runtime Report,
@@ -490,7 +528,9 @@ synchronizing around every scope.
 The Runtime Report exposes:
 
 - checkpoint recipe;
-- adapter recipe;
+- adapter recipe and `adaln_fp32`;
+- GPU family and the attention dispatch reason;
+- packed-layout row breakdown (video / text / other global rows);
 - profile/base/projection precision;
 - branch placement/execution;
 - attention/backend calibration/failures;

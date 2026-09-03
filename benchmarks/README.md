@@ -20,12 +20,16 @@ sampler       = euler
 scheduler     = simple
 steps / NFE   = 8
 denoise       = 1.0
+cfg           = 1.0
 video shift   = 12.0
 audio shift   = 3.0
 adapters      = default 1.0 + turbo 1.0
 ```
 
-This corresponds to OpenVDN's MiniMax-H3 flow/Euler inference trajectory.
+This corresponds to OpenVDN's MiniMax-H3 flow/Euler inference trajectory. OpenVDN runs
+one model evaluation per step (no classifier-free guidance): keep CFG at 1.0. The
+recorder validates sampler, sigmas, shifts, profile, precision and adapters from the
+Runtime Report, but it cannot see the guider, so CFG is the operator's responsibility.
 
 **Do not use `res_multistep` for this checkpoint.** `res_multistep` is a base-model
 sampler; attaching the Stage-DMD/Turbo adapters while keeping that sampler changes the
@@ -38,6 +42,7 @@ sampler       = euler
 scheduler     = simple
 steps / NFE   = 50
 denoise       = 1.0
+cfg           = 1.0
 video shift   = 12.0
 audio shift   = 3.0
 adapters      = default 1.0

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5B6572"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="330" rx="8" fill="#F3F5F8"/>
+
+  <!-- input -->
+  <rect x="24" y="130" width="150" height="70" rx="6" fill="#FFFFFF" stroke="#AEB8C4"/>
+  <text x="99" y="158" text-anchor="middle" fill="#171C24" font-weight="600">packed tokens</text>
+  <text x="99" y="178" text-anchor="middle" fill="#66707C" font-size="12">text | audio | video</text>
+
+  <!-- qkv -->
+  <rect x="214" y="130" width="150" height="70" rx="6" fill="#FFFFFF" stroke="#AEB8C4"/>
+  <text x="289" y="158" text-anchor="middle" fill="#171C24" font-weight="600">native qkv_proj</text>
+  <text x="289" y="178" text-anchor="middle" fill="#66707C" font-size="12">ComfyUI MiniMax-H3</text>
+
+  <!-- softmax branch (top) -->
+  <rect x="420" y="36" width="200" height="82" rx="6" fill="#E3E9FA" stroke="#2447B8"/>
+  <text x="520" y="62" text-anchor="middle" fill="#1B3690" font-weight="600">local softmax window</text>
+  <text x="520" y="82" text-anchor="middle" fill="#3D4652" font-size="12">exact SDPA · 15 frames + anchors</text>
+  <text x="520" y="100" text-anchor="middle" fill="#3D4652" font-size="12">RMSNorm + RoPE fused</text>
+
+  <!-- linear branch (bottom) -->
+  <rect x="420" y="212" width="200" height="82" rx="6" fill="#DDF3E6" stroke="#1F7A4D"/>
+  <text x="520" y="238" text-anchor="middle" fill="#14532D" font-weight="600">Video Delta Attention</text>
+  <text x="520" y="258" text-anchor="middle" fill="#3D4652" font-size="12">frame stats · (I+A)⁻¹ · 2 scans</text>
+  <text x="520" y="276" text-anchor="middle" fill="#3D4652" font-size="12">context outside the window</text>
+
+  <!-- gates -->
+  <rect x="660" y="52" width="88" height="50" rx="6" fill="#FFFFFF" stroke="#AEB8C4"/>
+  <text x="704" y="82" text-anchor="middle" fill="#171C24" font-size="13">σ gate</text>
+  <rect x="660" y="228" width="88" height="50" rx="6" fill="#FFFFFF" stroke="#AEB8C4"/>
+  <text x="704" y="258" text-anchor="middle" fill="#171C24" font-size="13">σ gate</text>
+
+  <!-- output -->
+  <rect x="788" y="130" width="96" height="70" rx="6" fill="#FFFFFF" stroke="#AEB8C4"/>
+  <text x="836" y="158" text-anchor="middle" fill="#171C24" font-weight="600">out_proj</text>
+  <text x="836" y="178" text-anchor="middle" fill="#66707C" font-size="12">+ to_out_linear</text>
+
+  <!-- arrows -->
+  <line x1="174" y1="165" x2="212" y2="165" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 364 150 C 400 150, 385 77, 418 77" fill="none" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 364 180 C 400 180, 385 253, 418 253" fill="none" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="620" y1="77" x2="658" y2="77" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="620" y1="253" x2="658" y2="253" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 748 77 C 770 77, 770 150, 786 150" fill="none" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 748 253 C 770 253, 770 180, 786 180" fill="none" stroke="#5B6572" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- labels -->
+  <text x="372" y="122" text-anchor="end" fill="#66707C" font-size="11">normed + roped q/k</text>
+  <text x="372" y="215" text-anchor="end" fill="#66707C" font-size="11">raw q/k/v</text>
+  <text x="450" y="316" text-anchor="middle" fill="#66707C" font-size="11">Both branches are trained together; their gated sum replaces dense attention over the whole clip.</text>
+</svg>

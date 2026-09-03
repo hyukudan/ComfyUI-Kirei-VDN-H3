@@ -14,8 +14,10 @@ A valid result needs all four.
 
 ## 1. Canonical inference trajectories
 
-Sampler, scheduler, NFE, denoise and MiniMax-H3 shifts are part of model identity for a
-benchmark. Resolution and frame count alone are not enough.
+Sampler, scheduler, NFE, denoise, CFG and MiniMax-H3 shifts are part of model identity
+for a benchmark. Resolution and frame count alone are not enough. OpenVDN renders the
+distilled model with a single model evaluation per step, so CFG must stay at 1.0; the
+result recorder cannot see the guider, so this one is on the operator.
 
 ### OpenVDN Stage-DMD release
 
@@ -28,6 +30,7 @@ sampler         = euler
 scheduler       = simple
 steps / NFE     = 8
 denoise         = 1.0
+cfg             = 1.0
 video shift     = 12.0
 audio shift     = 3.0
 ```
@@ -48,6 +51,7 @@ sampler         = euler
 scheduler       = simple
 steps / NFE     = 50
 denoise         = 1.0
+cfg             = 1.0
 video shift     = 12.0
 audio shift     = 3.0
 projection      = BF16
@@ -68,6 +72,7 @@ sampler         = euler
 scheduler       = simple
 steps           = 8
 denoise         = 1.0
+cfg             = 1.0
 video shift     = 12.0
 audio shift     = 3.0
 ```
@@ -230,7 +235,8 @@ Verify:
 - Stage-B `default` is complete;
 - Stage-DMD `turbo` is complete when enabled;
 - Q/K/V factors land on correct fused slices;
-- `mlp.fc2` factors follow the native fused-linear exception;
+- `mlp.fc2` factors run through the MLP-level exact bypass (merged only under
+  `lora_mode=merge`);
 - curve AdaLN terms are not silently dropped;
 - e-grid is found and the curve adapter is active when required;
 - branch/LoRA/curve auxiliaries are registered in Comfy lifecycle;
@@ -428,8 +434,8 @@ Qualify:
 - VDN INT8/ConvRot;
 - VDN FP8;
 - `max_speed`;
-- grouped vs calibrated exact attention;
-- FA4 when available;
+- grouped vs calibrated exact attention (FA4/CuTe kernels do not exist on sm_120, so
+  expect grouped or Flex to win);
 - resident placement;
 - experimental parallel scheduler separately.
 
@@ -533,6 +539,8 @@ partial denoise for Stage-DMD, the render is not a canonical VDN test.
 Check:
 
 - local VDN attention did not receive Sage/kitchen quantized override;
+- adapters were not merged into a quantized base (`adapters.lora_mode` is `bypass` on
+  INT8/FP8/NVFP4 bases) and `adaln_fp32` is true;
 - adapter strengths are exactly 1.0 for the canonical Stage-DMD run;
 - curve AdaLN factors were not dropped;
 - projection precision is really BF16 in the fidelity test.

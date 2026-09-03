@@ -14,7 +14,7 @@ from typing import Any
 import torch
 
 
-CALIBRATION_VERSION = 1
+CALIBRATION_VERSION = 2
 CALIBRATABLE_BACKENDS = ("grouped", "flex", "flash2", "decomposed")
 
 
@@ -37,6 +37,9 @@ def calibration_signature(
     anchor_frames: str,
     *,
     groups: int,
+    video_start: int | None = None,
+    video_end: int | None = None,
+    tokens_per_frame: int | None = None,
 ) -> str:
     device = query.device
     if device.type == "cuda" and torch.cuda.is_available():
@@ -57,6 +60,9 @@ def calibration_signature(
         "head_dim": int(query.shape[2]),
         "frames": int(num_frames),
         "groups": int(groups),
+        "video_start": None if video_start is None else int(video_start),
+        "video_end": None if video_end is None else int(video_end),
+        "tokens_per_frame": None if tokens_per_frame is None else int(tokens_per_frame),
         "anchor_frames": str(anchor_frames),
         "bounds": [[int(lo), int(hi)] for lo, hi in bounds],
     }
@@ -104,17 +110,18 @@ class CalibrationStore:
     def save(self):
         self._load()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": CALIBRATION_VERSION,
-            "entries": self._entries,
-        }
+        payload = {"version": CALIBRATION_VERSION, "entries": self._entries}
         temp = self.path.with_suffix(self.path.suffix + ".tmp")
         temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temp.replace(self.path)
 
     def snapshot(self):
         self._load()
-        return {"path": str(self.path), "entries": len(self._entries)}
+        return {
+            "path": str(self.path),
+            "version": CALIBRATION_VERSION,
+            "entries": len(self._entries),
+        }
 
 
 __all__ = [

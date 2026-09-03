@@ -1,23 +1,37 @@
-"""Small ComfyUI nodes for apples-to-apples sampler timing.
+"""ComfyUI nodes for recipe-aware sampler benchmarks.
 
 Place ``Kirei Benchmark Start`` immediately before the sampler's MODEL input and connect
-the sampler LATENT directly to ``Kirei Benchmark End.after``. The start node synchronizes
-the selected CUDA device before opening the timing interval; the end node synchronizes
-before closing it. The resulting wall time therefore measures the same graph segment for
-native, Turbo and VDN paths instead of relying on UI timestamps.
+the sampler LATENT directly to ``Kirei Benchmark End.after``. Scenarios come from
+``benchmarks/scenarios.json`` so the UI follows the repository's benchmark protocol.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
 
 
 _TOKEN_TYPE = "KIREI_BENCHMARK_TOKEN"
+_SCENARIOS_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "scenarios.json"
+
+
+def _scenario_payload():
+    try:
+        payload = json.loads(_SCENARIOS_PATH.read_text(encoding="utf-8"))
+        scenarios = {item["id"]: item for item in payload.get("scenarios", [])}
+        return payload, scenarios
+    except Exception:
+        return {"schema_version": 0}, {}
+
+
+def _active_scenario_ids():
+    _payload, scenarios = _scenario_payload()
+    active = [key for key, item in scenarios.items() if item.get("active")]
+    return active or ["benchmark"]
 
 
 def _model_device(model: Any) -> torch.device:
@@ -27,6 +41,43 @@ def _model_device(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
+def _model_sampling(model: Any):
+    candidates = [
+        getattr(model, "model_sampling", None),
+        getattr(getattr(model, "model", None), "model_sampling", None),
+    ]
+    inner = getattr(model, "inner_model", None)
+    if inner is not None:
+        candidates.extend(
+            [
+                getattr(inner, "model_sampling", None),
+                getattr(getattr(inner, "inner_model", None), "model_sampling", None),
+            ]
+        )
+    return next((item for item in candidates if item is not None), None)
+
+
+def _sampling_snapshot(model: Any) -> dict:
+    sampling = _model_sampling(model)
+    options = getattr(model, "model_options", {}) or {}
+    transformer_options = options.get("transformer_options", {}) if isinstance(options, dict) else {}
+
+    def value(name, option_name=None):
+        raw = getattr(sampling, name, None) if sampling is not None else None
+        if raw is None and option_name:
+            raw = transformer_options.get(option_name)
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "class": type(sampling).__name__ if sampling is not None else None,
+        "video_shift": value("shift", "minimax_h3_sigma_shift_video"),
+        "audio_shift": value("audio_shift", "minimax_h3_sigma_shift_audio"),
+    }
+
+
 def _sync(device: torch.device) -> None:
     if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(device)
@@ -34,10 +85,7 @@ def _sync(device: torch.device) -> None:
 
 def _cuda_start(device: torch.device, reset_peak: bool) -> dict[str, int | None]:
     if device.type != "cuda" or not torch.cuda.is_available():
-        return {
-            "allocated_start_bytes": None,
-            "reserved_start_bytes": None,
-        }
+        return {"allocated_start_bytes": None, "reserved_start_bytes": None}
     if reset_peak:
         torch.cuda.reset_peak_memory_stats(device)
     return {
@@ -69,16 +117,11 @@ class KireiBenchmarkStart:
             "required": {
                 "model": ("MODEL",),
                 "scenario_id": (
-                    "STRING",
-                    {
-                        "default": "benchmark",
-                        "tooltip": "Use an id from benchmarks/scenarios.json.",
-                    },
+                    _active_scenario_ids(),
+                    {"tooltip": "Active benchmark recipe from benchmarks/scenarios.json."},
                 ),
             },
-            "optional": {
-                "reset_peak_vram": ("BOOLEAN", {"default": True}),
-            },
+            "optional": {"reset_peak_vram": ("BOOLEAN", {"default": True})},
         }
 
     RETURN_TYPES = ("MODEL", _TOKEN_TYPE)
@@ -86,21 +129,30 @@ class KireiBenchmarkStart:
     FUNCTION = "start"
     CATEGORY = "model_patches/video/benchmark"
     DESCRIPTION = (
-        "Synchronize the model device and start a sampler benchmark interval. Connect the "
-        "MODEL output directly to the sampler."
+        "Start a recipe-aware sampler benchmark. The scenario selector is loaded from "
+        "benchmarks/scenarios.json and the model's H3 sampling shifts are recorded."
     )
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
-        # Always execute: benchmark nodes must never be reused from Comfy's output cache.
         return float("nan")
 
     def start(self, model, scenario_id, reset_peak_vram=True):
+        payload, scenarios = _scenario_payload()
+        scenario = scenarios.get(str(scenario_id))
+        if scenario is None:
+            raise ValueError(f"unknown benchmark scenario {scenario_id!r}")
+        if not scenario.get("active"):
+            raise ValueError(f"benchmark scenario {scenario_id!r} is not active")
+
         device = _model_device(model)
         _sync(device)
         memory = _cuda_start(device, bool(reset_peak_vram))
         token = {
             "scenario_id": str(scenario_id),
+            "scenario_schema_version": int(payload.get("schema_version", 0)),
+            "scenario_spec": scenario,
+            "sampling": _sampling_snapshot(model),
             "device": str(device),
             "started_ns": time.perf_counter_ns(),
             "reset_peak_vram": bool(reset_peak_vram),
@@ -130,8 +182,8 @@ class KireiBenchmarkEnd:
                     "MODEL",
                     {
                         "tooltip": (
-                            "Optional patched model. When it carries VDN state, the measurement "
-                            "embeds the Kirei Runtime Report."
+                            "Connect the same sampled MODEL. VDN scenarios then embed the Runtime "
+                            "Report so adapters/checkpoint recipe/precision can be validated."
                         )
                     },
                 ),
@@ -146,7 +198,7 @@ class KireiBenchmarkEnd:
     OUTPUT_NODE = True
     DESCRIPTION = (
         "Close the sampler benchmark after GPU synchronization and emit wall time, peak "
-        "VRAM and optional VDN runtime metadata as JSON."
+        "VRAM, scenario recipe, sampling shifts and optional VDN runtime metadata."
     )
 
     @classmethod
@@ -163,6 +215,9 @@ class KireiBenchmarkEnd:
         elapsed = (finished_ns - int(benchmark_token["started_ns"])) / 1_000_000_000.0
         payload = {
             "scenario_id": str(benchmark_token.get("scenario_id", "benchmark")),
+            "scenario_schema_version": benchmark_token.get("scenario_schema_version"),
+            "scenario_spec": benchmark_token.get("scenario_spec"),
+            "sampling": benchmark_token.get("sampling"),
             "run_kind": str(run_kind),
             "device": str(device),
             "sampler_seconds": elapsed,
@@ -176,10 +231,8 @@ class KireiBenchmarkEnd:
         if model is not None:
             try:
                 from .benchmark import runtime_snapshot
-
                 payload["runtime_report"] = runtime_snapshot(model)
             except RuntimeError:
-                # Native/Turbo control models intentionally carry no VDN state.
                 payload["runtime_report"] = None
         text = json.dumps(payload, indent=2, sort_keys=True, default=str)
         return {"ui": {"text": [text]}, "result": (text,)}

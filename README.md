@@ -291,7 +291,8 @@ python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_flex_cuda.py
 
 The core probe uses q/k/v with the strides of the real fused projection, runs the real
 calibration into a scratch store and times grouped, Flex, FA2 and FA4. The Flex probe
-pushes twelve packed lengths through one cache to prove the compiled kernel survives.
+pushes twelve packed lengths through one cache to prove the static specialised kernels
+stay compiled instead of falling back to eager attention.
 
 ## Status
 

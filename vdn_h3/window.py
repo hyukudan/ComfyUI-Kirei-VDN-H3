@@ -53,7 +53,7 @@ def raise_recompile_limit(floor: int = DYNAMO_RECOMPILE_FLOOR) -> int | None:
 
     Past the limit dynamo stops compiling a function and runs it eagerly. For
     ``flex_attention`` and ``create_block_mask`` eager means a dense S x S intermediate,
-    so that fallback has to stay out of reach however many layouts a session sees.
+    so that fallback has to stay out of reach across normal multi-layout sessions.
     """
     try:
         config = _dynamo_config()
@@ -112,11 +112,7 @@ class WindowAttentionCache:
         if self._compiled is None and not self.is_broken("flex_compile"):
             try:
                 raise_recompile_limit()
-                # dynamic=True: one compiled kernel serves every packed length. A static
-                # compile recompiles per length and, past dynamo's recompile limit,
-                # silently falls back to eager flex_attention, which materialises the
-                # full S x S score matrix (extreme slowdown or OOM on long clips).
-                self._compiled = torch.compile(flex_attention, dynamic=True)
+                self._compiled = torch.compile(flex_attention, dynamic=False)
             except Exception as exc:
                 self.mark_broken("flex_compile", exc)
         return self._compiled or flex_attention
@@ -328,29 +324,18 @@ def _build_window_tables(sequence_length, video_start, video_end, num_frames, to
 def _window_mask_mod(video_start, video_end, num_frames, tokens_per_frame, lo, hi, anchor_frames):
     allow_anchor_columns = anchor_frames in ("columns", "both")
     allow_anchor_rows = anchor_frames in ("rows", "both")
-    # The geometry is captured as 0-d tensors, not Python ints. torch.compile guards on
-    # the value of every captured int, so each new layout would add a cache entry to the
-    # compiled create_block_mask body until dynamo hit its recompile limit and ran the
-    # eager path, which materialises the full S x S mask. Tensors are guarded by
-    # shape/dtype only.
-    geometry = torch.tensor(
-        [int(video_start), int(video_end), int(num_frames) - 1, int(tokens_per_frame)],
-        dtype=torch.long,
-        device=lo.device,
-    )
-    v_start, v_end, last_frame, per_frame = geometry[0], geometry[1], geometry[2], geometry[3]
 
     def mask_mod(batch, head, query_index, key_index):
         del batch, head
-        global_query = (query_index < v_start) | (query_index >= v_end)
-        global_key = (key_index < v_start) | (key_index >= v_end)
-        query_frame = (query_index - v_start) // per_frame
-        key_frame = (key_index - v_start) // per_frame
+        global_query = (query_index < video_start) | (query_index >= video_end)
+        global_key = (key_index < video_start) | (key_index >= video_end)
+        query_frame = (query_index - video_start) // tokens_per_frame
+        key_frame = (key_index - video_start) // tokens_per_frame
         allowed = global_query | global_key | ((key_frame >= lo[query_index]) & (key_frame <= hi[query_index]))
         if allow_anchor_columns:
-            allowed = allowed | (key_frame == 0) | (key_frame == last_frame)
+            allowed = allowed | (key_frame == 0) | (key_frame == num_frames - 1)
         if allow_anchor_rows:
-            allowed = allowed | (query_frame == 0) | (query_frame == last_frame)
+            allowed = allowed | (query_frame == 0) | (query_frame == num_frames - 1)
         return allowed
 
     return mask_mod

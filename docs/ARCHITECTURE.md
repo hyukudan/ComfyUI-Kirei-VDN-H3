@@ -436,13 +436,13 @@ call.
 
 ### Flex compilation
 
-`flex_attention` is compiled once per cache with `dynamic=True`, and the window mask
-closure captures its geometry as tensors rather than Python ints, so neither the kernel
-nor `create_block_mask` recompiles per packed length. Dynamo's recompile limit is raised
-to at least 64 before the first compile: past that limit dynamo runs the function
-eagerly, and eager Flex materialises the full S x S score matrix.
-`tests/probe_flex_cuda.py` pushes twelve lengths through one cache with
-`fail_on_recompile_limit_hit` set to prove it.
+`flex_attention` is compiled with `dynamic=False` so Inductor specialises each packed
+shape. On the RTX PRO 6000 this is substantially faster than one dynamic kernel. Dynamo's
+recompile limit is raised to at least 64 before the first compile: past that limit dynamo
+runs the function eagerly, and eager Flex materialises the full S x S score matrix.
+Block masks remain cached per geometry. `tests/probe_flex_cuda.py` pushes twelve lengths
+through one cache with `fail_on_recompile_limit_hit` set to prove the specialised kernels
+remain compiled.
 
 ### FA2 / FA4 decomposition
 
@@ -464,6 +464,8 @@ packed geometry. Any change re-measures instead of trusting an old winner; store
 of an older schema are ignored. Only exact candidates that pass parity against the
 grouped oracle can win. The resolution reason (`explicit`, `calibrated`, `flex` guard,
 `autotuned`, `heuristic`) is rewritten on every call and reported.
+Automatic timing uses one warm-up and three steady calls per candidate to avoid choosing
+from a single sub-millisecond sample.
 
 ### GPU families
 

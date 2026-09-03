@@ -1,4 +1,6 @@
 import copy
+import sys
+import types
 
 import pytest
 import torch
@@ -125,7 +127,20 @@ def test_missing_or_bad_shape_adapter_target_fails_before_application():
     assert model.patches == {}
 
 
-def test_factor_patch_uses_native_lora_adapter_and_offset():
+def test_factor_patch_uses_native_lora_adapter_and_offset(monkeypatch):
+    class LoRAAdapter:
+        name = "lora"
+
+        def __init__(self, loaded_keys, weights):
+            self.loaded_keys = loaded_keys
+            self.weights = weights
+
+    comfy = types.ModuleType("comfy")
+    weight_adapter = types.ModuleType("comfy.weight_adapter")
+    weight_adapter.LoRAAdapter = LoRAAdapter
+    comfy.weight_adapter = weight_adapter
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.weight_adapter", weight_adapter)
     model = FakePatcher()
     key = "diffusion_model.blocks.0.attn.qkv_proj.weight"
     patch = FactorPatch(

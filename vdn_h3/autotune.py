@@ -19,9 +19,8 @@ _LOG = logging.getLogger("comfy.vdn_h3")
 
 
 def _timed(fn, device: torch.device, runs: int = 1):
-    # One warm call absorbs lazy kernel/library compilation. One timed steady call is
-    # enough to rank these large kernels and avoids turning first render into a benchmark
-    # suite. The explicit calibration node remains available for multi-run measurements.
+    # One warm call absorbs lazy kernel/library compilation. The explicit calibration
+    # node remains available for longer multi-run measurements.
     warm = fn()
     del warm
     start = torch.cuda.Event(enable_timing=True)
@@ -59,7 +58,7 @@ def runtime_autotune_attention(
     scale: float,
     cache: Any,
     *,
-    runs: int = 1,
+    runs: int = 3,
 ) -> str | None:
     """Return/persist the fastest exact backend for the current geometry."""
 

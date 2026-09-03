@@ -246,7 +246,7 @@ def test_fa4_kernel_generation_follows_the_family(monkeypatch):
         assert window.prefers_fa4("cuda:0") is first
 
 
-def test_flex_wrapper_compiles_dynamic_and_raises_the_recompile_floor(monkeypatch):
+def test_flex_wrapper_compiles_static_and_raises_the_recompile_floor(monkeypatch):
     import torch._dynamo.config as dynamo_config
 
     captured = {}
@@ -264,20 +264,18 @@ def test_flex_wrapper_compiles_dynamic_and_raises_the_recompile_floor(monkeypatc
         return None
 
     assert cache.attention(sentinel) is sentinel
-    assert captured == {"dynamic": True}
+    assert captured == {"dynamic": False}
     assert window.recompile_limit() >= window.DYNAMO_RECOMPILE_FLOOR
     for name in ("recompile_limit", "cache_size_limit"):
         monkeypatch.setattr(dynamo_config, name, 512, raising=False)
     assert window.raise_recompile_limit() == 512  # never lowered
 
 
-def test_mask_mod_captures_geometry_as_tensors_not_ints():
+def test_mask_mod_handles_global_and_anchor_geometry():
     lo = torch.zeros(40, dtype=torch.long)
     hi = torch.full((40,), 2, dtype=torch.long)
     hi[24:34] = 0  # frame 2 only sees frame 0
     mask_mod = window._window_mask_mod(4, 34, 3, 10, lo, hi, "none")
-    cells = [cell.cell_contents for cell in mask_mod.__closure__]
-    assert not any(isinstance(c, int) and not isinstance(c, bool) for c in cells)
     q, k = torch.tensor(30), torch.tensor
     assert bool(mask_mod(0, 0, q, k(18))) is False  # frame 1 is outside frame 2's window
     assert bool(mask_mod(0, 0, q, k(8))) is True  # frame 0 inside

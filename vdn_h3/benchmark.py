@@ -349,7 +349,7 @@ def runtime_snapshot(model_patcher: Any) -> dict:
             "last_hit": getattr(state.window_cache, "last_calibration_hit", None),
             "last_autotune_error": getattr(state.window_cache, "last_autotune_error", None),
             "dispatch_reason": getattr(state.window_cache, "last_dispatch_reason", None),
-            "flex_compile": "dynamic",
+            "flex_compile": "static-specialized",
             "dynamo_recompile_limit": _recompile_limit(),
         },
         "kernel_backend": getattr(state, "kernel_backend", state.linear_kernels),

@@ -32,12 +32,14 @@ September 2026 audit against OpenVDN and current ComfyUI.
 - `detect_base_precision` recognises NVFP4, MXFP8, W4A4 and W4A8 comfy-kitchen layouts.
 - `auto` branch placement budgets against total VRAM minus the base model size instead
   of the free VRAM seen before ComfyUI loads the base.
-- Flex: `flex_attention` compiled with dynamic shapes, mask geometry captured as tensors,
-  dynamo recompile limit raised to 64. The static compile fell back to eager Flex (a
-  dense S x S score matrix) after eight distinct packed lengths.
+- Flex: static shape-specialised kernels retained for speed and dynamo's recompile limit
+  raised to 64. The old limit fell back to eager Flex (a dense S x S score matrix) after
+  eight distinct packed lengths; dynamic kernels avoided that fallback but measured up
+  to about 2x slower on real RTX PRO 6000 H3 geometries.
 - Calibration store v3: signatures include the node version, torch/CUDA/cuDNN/driver,
   Triton, flash-attn 2 / flash-attn-4 versions and the installed backend inventory, so a
-  node update or a newly installed backend re-measures; v2 files are ignored.
+  node update or a newly installed backend re-measures; v2 files are ignored. Automatic
+  calibration averages three steady calls instead of trusting one sub-millisecond sample.
 - Dispatch reason rewritten on every resolution (`explicit`, `calibrated`, `flex` guard,
   `autotuned`, `heuristic`); it no longer survives a calibration hit.
 

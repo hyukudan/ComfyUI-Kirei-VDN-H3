@@ -1,8 +1,8 @@
 """ComfyUI nodes for recipe-aware sampler benchmarks.
 
-Place ``Kirei Benchmark Start`` immediately before the sampler's MODEL input and connect
-the sampler LATENT directly to ``Kirei Benchmark End.after``. Scenarios come from
-``benchmarks/scenarios.json`` so the UI follows the repository's benchmark protocol.
+Use ``Kirei Benchmark Scenario`` as the single source of truth for the test geometry and
+recipe, then place ``Kirei Benchmark Start`` immediately before the sampler's MODEL input
+and connect the sampler LATENT directly to ``Kirei Benchmark End.after``.
 """
 
 from __future__ import annotations
@@ -25,13 +25,27 @@ def _scenario_payload():
         scenarios = {item["id"]: item for item in payload.get("scenarios", [])}
         return payload, scenarios
     except Exception:
-        return {"schema_version": 0}, {}
+        return {"schema_version": 0, "recipes": {}}, {}
 
 
 def _active_scenario_ids():
     _payload, scenarios = _scenario_payload()
     active = [key for key, item in scenarios.items() if item.get("active")]
     return active or ["benchmark"]
+
+
+def _resolve_scenario(scenario_id: str):
+    payload, scenarios = _scenario_payload()
+    scenario = scenarios.get(str(scenario_id))
+    if scenario is None:
+        raise ValueError(f"unknown benchmark scenario {scenario_id!r}")
+    if not scenario.get("active"):
+        raise ValueError(f"benchmark scenario {scenario_id!r} is not active")
+    recipe_id = scenario.get("recipe_id")
+    recipe = (payload.get("recipes") or {}).get(recipe_id)
+    if not isinstance(recipe, dict):
+        raise ValueError(f"benchmark scenario {scenario_id!r} references unknown recipe {recipe_id!r}")
+    return payload, scenario, recipe
 
 
 def _model_device(model: Any) -> torch.device:
@@ -110,15 +124,77 @@ def _cuda_end(device: torch.device) -> dict[str, int | None]:
     }
 
 
-class KireiBenchmarkStart:
+class KireiBenchmarkScenario:
+    """Expose one active benchmark scenario as connectable workflow values."""
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "scenario": (
+                    _active_scenario_ids(),
+                    {
+                        "tooltip": (
+                            "Select once, then wire steps/width/height/frames/shifts into the "
+                            "workflow so the scenario controls the actual render rather than just its label."
+                        )
+                    },
+                )
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "STRING")
+    RETURN_NAMES = (
+        "scenario_id",
+        "recipe_id",
+        "steps",
+        "width",
+        "height",
+        "frames",
+        "video_shift",
+        "audio_shift",
+        "scenario_json",
+    )
+    FUNCTION = "resolve"
+    CATEGORY = "model_patches/video/benchmark"
+    DESCRIPTION = "Resolve an active benchmark scenario into connectable recipe/geometry values."
+
+    def resolve(self, scenario):
+        payload, spec, recipe = _resolve_scenario(str(scenario))
+        merged = {
+            "schema_version": int(payload.get("schema_version", 0)),
+            "scenario": spec,
+            "recipe": recipe,
+        }
+        return (
+            str(spec["id"]),
+            str(spec["recipe_id"]),
+            int(spec["steps"]),
+            int(spec["width"]),
+            int(spec["height"]),
+            int(spec["frames"]),
+            float(recipe["video_shift"]),
+            float(recipe["audio_shift"]),
+            json.dumps(merged, indent=2, sort_keys=True, default=str),
+        )
+
+
+class KireiBenchmarkStart:
+    @classmethod
+    def INPUT_TYPES(cls):
+        default = _active_scenario_ids()[0]
+        return {
+            "required": {
                 "model": ("MODEL",),
                 "scenario_id": (
-                    _active_scenario_ids(),
-                    {"tooltip": "Active benchmark recipe from benchmarks/scenarios.json."},
+                    "STRING",
+                    {
+                        "default": default,
+                        "tooltip": (
+                            "Connect Kirei Benchmark Scenario.scenario_id here. The id is validated "
+                            "against benchmarks/scenarios.json before timing starts."
+                        ),
+                    },
                 ),
             },
             "optional": {"reset_peak_vram": ("BOOLEAN", {"default": True})},
@@ -129,8 +205,7 @@ class KireiBenchmarkStart:
     FUNCTION = "start"
     CATEGORY = "model_patches/video/benchmark"
     DESCRIPTION = (
-        "Start a recipe-aware sampler benchmark. The scenario selector is loaded from "
-        "benchmarks/scenarios.json and the model's H3 sampling shifts are recorded."
+        "Start a recipe-aware sampler benchmark and record the model's actual H3 sampling shifts."
     )
 
     @classmethod
@@ -138,13 +213,7 @@ class KireiBenchmarkStart:
         return float("nan")
 
     def start(self, model, scenario_id, reset_peak_vram=True):
-        payload, scenarios = _scenario_payload()
-        scenario = scenarios.get(str(scenario_id))
-        if scenario is None:
-            raise ValueError(f"unknown benchmark scenario {scenario_id!r}")
-        if not scenario.get("active"):
-            raise ValueError(f"benchmark scenario {scenario_id!r} is not active")
-
+        payload, scenario, recipe = _resolve_scenario(str(scenario_id))
         device = _model_device(model)
         _sync(device)
         memory = _cuda_start(device, bool(reset_peak_vram))
@@ -152,6 +221,7 @@ class KireiBenchmarkStart:
             "scenario_id": str(scenario_id),
             "scenario_schema_version": int(payload.get("schema_version", 0)),
             "scenario_spec": scenario,
+            "recipe_spec": recipe,
             "sampling": _sampling_snapshot(model),
             "device": str(device),
             "started_ns": time.perf_counter_ns(),
@@ -183,7 +253,7 @@ class KireiBenchmarkEnd:
                     {
                         "tooltip": (
                             "Connect the same sampled MODEL. VDN scenarios then embed the Runtime "
-                            "Report so adapters/checkpoint recipe/precision can be validated."
+                            "Report so checkpoint recipe/precision can be validated."
                         )
                     },
                 ),
@@ -197,8 +267,8 @@ class KireiBenchmarkEnd:
     CATEGORY = "model_patches/video/benchmark"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "Close the sampler benchmark after GPU synchronization and emit wall time, peak "
-        "VRAM, scenario recipe, sampling shifts and optional VDN runtime metadata."
+        "Close the sampler benchmark after GPU synchronization and emit wall time, peak VRAM, "
+        "scenario/recipe, actual sampling shifts and optional VDN runtime metadata."
     )
 
     @classmethod
@@ -217,6 +287,7 @@ class KireiBenchmarkEnd:
             "scenario_id": str(benchmark_token.get("scenario_id", "benchmark")),
             "scenario_schema_version": benchmark_token.get("scenario_schema_version"),
             "scenario_spec": benchmark_token.get("scenario_spec"),
+            "recipe_spec": benchmark_token.get("recipe_spec"),
             "sampling": benchmark_token.get("sampling"),
             "run_kind": str(run_kind),
             "device": str(device),
@@ -239,16 +310,19 @@ class KireiBenchmarkEnd:
 
 
 NODE_CLASS_MAPPINGS = {
+    "KireiBenchmarkScenario": KireiBenchmarkScenario,
     "KireiBenchmarkStart": KireiBenchmarkStart,
     "KireiBenchmarkEnd": KireiBenchmarkEnd,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "KireiBenchmarkScenario": "Kirei Benchmark Scenario",
     "KireiBenchmarkStart": "Kirei Benchmark Start",
     "KireiBenchmarkEnd": "Kirei Benchmark End",
 }
 
 
 __all__ = [
+    "KireiBenchmarkScenario",
     "KireiBenchmarkStart",
     "KireiBenchmarkEnd",
     "NODE_CLASS_MAPPINGS",

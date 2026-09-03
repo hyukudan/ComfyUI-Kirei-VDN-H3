@@ -49,10 +49,11 @@ class VDNState:
         checkpoint_root: str | None = None,
         projection_precision: str = "bf16",
         projection_info: Any = None,
+        block_fusion: bool = False,
         diagnostics: bool = False,
         linear_kernels: str | None = None,
     ):
-        from .fp8 import PROJECTION_PRECISIONS
+        from .projection import PROJECTION_PRECISIONS
         from .window import ATTENTION_BACKENDS, WindowAttentionCache
 
         if linear_kernels is not None:
@@ -82,6 +83,7 @@ class VDNState:
         self.tile_frames = int(tile_frames)
         self.projection_precision = projection_precision
         self.projection_info = projection_info
+        self.block_fusion = bool(block_fusion)
         self.branches = list(branches)
         self.window_cache = WindowAttentionCache(limit=24)
         self.branch_runtime = SharedBranchRuntime(
@@ -93,6 +95,8 @@ class VDNState:
         self.lora_runtime = None
         self.forwards = 0
         self.last_attention_backend = None
+        self.last_layout = None
+        self.branch_execution = "serial"
         self.diagnostics = DiagnosticsRecorder(diagnostics)
 
         if weight_maps is None:
@@ -108,10 +112,8 @@ class VDNState:
             maps = list(weight_maps)
             if len(maps) != len(self.branches):
                 raise ValueError("weight_maps must match branch count")
-        if projection_precision == "fp8":
-            # FP8 mode deliberately keeps edge blocks BF16. Hybrid storage therefore
-            # treats both possible representations as streamable and each block owns
-            # exactly one of them.
+        if projection_precision in {"fp8", "int8"}:
+            # Quantized and BF16 edge blocks share the same streamed storage slots.
             streamed_keys = (STREAMED_PROJECTION_KEY, FP8_STREAMED_PROJECTION_KEY)
         else:
             streamed_keys = (STREAMED_PROJECTION_KEY,)
@@ -136,7 +138,6 @@ class VDNState:
                         diagnostics=self.diagnostics,
                     )
                 except TypeError:
-                    # Compatibility with the base/reference LinearBranch API.
                     set_runtime(linear_kernels=kernel_backend, diagnostics=self.diagnostics)
 
     @property
@@ -156,18 +157,13 @@ class VDNState:
         self.weight_store.mark_consumed(index, device, dtype)
 
     def projection_view(self, weights):
-        """Return branch-visible metadata plus the actual projection callable.
-
-        FP8 mode is heterogeneous by block: edge blocks contain the canonical BF16
-        weight, while interior blocks contain FP8 weight + scale. The dispatch is based
-        on the block's actual inventory rather than a global precision assumption.
-        """
+        """Return branch-visible shape metadata plus the selected projection callable."""
         if STREAMED_PROJECTION_KEY in weights:
             return weights, lambda value: F.linear(value, weights[STREAMED_PROJECTION_KEY])
-        from .fp8 import FP8_WEIGHT_KEY, project
+        from .projection import FP8_WEIGHT_KEY, project
 
         if FP8_WEIGHT_KEY not in weights:
-            raise RuntimeError("VDN projection state contains neither BF16 nor FP8 weight")
+            raise RuntimeError("VDN projection state contains neither BF16 nor quantized weight")
         branch_weights = dict(weights)
         branch_weights[STREAMED_PROJECTION_KEY] = _ShapeOnlyWeight(
             tuple(int(x) for x in weights[FP8_WEIGHT_KEY].shape)
@@ -175,6 +171,16 @@ class VDNState:
         return branch_weights, lambda value: project(value, weights)
 
     def release(self):
+        try:
+            from .parallel import release_parallel_contexts
+            release_parallel_contexts(self)
+        except Exception:
+            pass
+        try:
+            from .block_kernels import release_block_fusions
+            release_block_fusions(self)
+        except Exception:
+            pass
         self.weight_store.release()
         self.window_cache.release()
         self.branch_runtime.release()
@@ -206,6 +212,7 @@ def make_layout_wrapper(state: VDNState):
         except (IndexError, KeyError) as exc:
             raise TypeError("VDN-H3 could not locate x/context in the MiniMax-H3 forward call") from exc
         layout = layout_from_payload(kwargs.get("minimax_payload"), x, context, state.config)
+        state.last_layout = layout
         state.forwards += 1
         curve_scope = nullcontext()
         if state.curve_adapter is not None:
@@ -410,9 +417,9 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                     getattr(branch, "enable_text_state", config.get("enable_text_state", False))
                 )
                 with state.diagnostics.scope("attention.linear_branch", x.device):
+                    branch_weights, projector = state.projection_view(weights)
                     projected = getattr(branch, "projected_delta", None)
                     if projected is None:
-                        branch_weights, projector = state.projection_view(weights)
                         readout = branch.readout(
                             branch_weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
                             layout.num_frames, layout.tokens_per_frame, layout.bounds,
@@ -424,7 +431,6 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                         )
                         linear_delta = projector(readout.to(dtype=x.dtype))
                     else:
-                        branch_weights, projector = state.projection_view(weights)
                         linear_delta = projected(
                             branch_weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
                             layout.num_frames, layout.tokens_per_frame, layout.bounds,
@@ -484,15 +490,16 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                     raise RuntimeError(
                         f"VDN branch block {block_index} is missing softmax gate tensor {exc.args[0]!r}"
                     ) from exc
-                if run_inference:
-                    softmax_out.mul_(gate.to(dtype=softmax_out.dtype))
-                else:
-                    softmax_out = softmax_out * gate.to(dtype=softmax_out.dtype)
-                del gate
+                from .softmax_kernels import apply_softmax_gate
+                flat = apply_softmax_gate(softmax_out, gate, state, inference=run_inference)
+                del gate, softmax_out
+            else:
+                flat = softmax_out.reshape(layout.seq_len, -1)
+                del softmax_out
 
             with state.diagnostics.scope("attention.out_proj", x.device):
-                out = attn.out_proj(softmax_out.reshape(layout.seq_len, -1).to(dtype=x.dtype))
-            del softmax_out
+                out = attn.out_proj(flat.to(dtype=x.dtype))
+            del flat
 
             if linear_delta is not None:
                 out[layout.video_start : layout.video_end].add_(linear_delta)
@@ -585,6 +592,8 @@ def apply_vdn(model_patcher: Any, state: VDNState):
             f"diffusion_model.blocks.{index}.attn.forward",
             make_vdn_forward(block.attn, state, index),
         )
+    from .block_kernels import install_block_fusions
+    install_block_fusions(model_patcher, state, blocks)
     try:
         from comfy.patcher_extension import WrappersMP
     except ImportError:

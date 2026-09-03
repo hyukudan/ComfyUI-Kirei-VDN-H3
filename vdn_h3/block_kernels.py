@@ -135,9 +135,6 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
         ):
             return fallback(x, t_emb, mod_segments, rope_freqs, transformer_options)
 
-        # The compiled spelling never mutates this residual. Keep its reference so a
-        # late failure (e.g. post-attn or pre-MLP compile) can restart the *whole* native
-        # block rather than feeding an already-updated residual through it twice.
         original_x = x
         cache = getattr(state, "block_pointwise_cache", None)
         if cache is None:
@@ -160,7 +157,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     "block_pre",
                     _pre_body,
                     (x, block.norm1.weight, float(block.norm1.eps), scale_msa, shift_msa, indices),
-                    (*base_key, "attn", scale_msa.dtype),
+                    (*base_key, scale_msa.dtype),
                 )
             attn_out = block.attn(
                 h,
@@ -173,7 +170,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     "block_post",
                     _post_body,
                     (x, gate_msa, indices, attn_out),
-                    (*base_key, "attn", gate_msa.dtype),
+                    (*base_key, gate_msa.dtype),
                 )
             del h, attn_out
 
@@ -183,7 +180,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     "block_pre",
                     _pre_body,
                     (x, block.norm2.weight, float(block.norm2.eps), scale_mlp, shift_mlp, indices),
-                    (*base_key, "mlp", scale_mlp.dtype),
+                    (*base_key, scale_mlp.dtype),
                 )
             mlp_out = block.mlp(h)
             with state.diagnostics.scope("block.post_mlp", x.device):
@@ -192,7 +189,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
                     "block_post",
                     _post_body,
                     (x, gate_mlp, indices, mlp_out),
-                    (*base_key, "mlp", gate_mlp.dtype),
+                    (*base_key, gate_mlp.dtype),
                 )
         except _BlockFusionUnavailable as exc:
             state.block_fusion = False

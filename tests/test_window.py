@@ -227,3 +227,20 @@ def test_grouped_copy_guard_reasons(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (10 * gib, 96 * gib))
     assert window.grouped_copies_too_large("cuda:0", 4 * gib, 4 * gib)
     assert window.grouped_copies_too_large("cuda:0", 1 * gib, 2 * gib) is None
+
+
+def test_fa4_kernel_generation_follows_the_family(monkeypatch):
+    cases = {
+        (10, 0): ("tcgen05", True),
+        (9, 0): ("wgmma", True),
+        (12, 0): ("mma_sync", False),
+        (8, 9): ("mma_sync", False),
+        (8, 6): ("mma_sync", False),
+        (7, 5): ("unsupported", False),
+    }
+    for capability, (kernel, first) in cases.items():
+        monkeypatch.setattr(
+            window.torch.cuda, "get_device_capability", lambda device=None, c=capability: c
+        )
+        assert window.fa4_kernel("cuda:0") == kernel
+        assert window.prefers_fa4("cuda:0") is first

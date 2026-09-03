@@ -67,8 +67,10 @@ weights exactly and leaves no low-rank GEMMs in the hot path.
 
 **Requirements.** A current ComfyUI with native MiniMax-H3 support, a CUDA build of
 PyTorch, Triton (temporal kernel, FlexAttention, compiled fusions). Optional:
-comfy-kitchen for INT8/NVFP4 bases, flash-attn 2 on Ampere/Ada/Hopper, flash-attn 4 on
-Hopper and datacenter Blackwell only.
+comfy-kitchen for INT8/NVFP4 bases; flash-attn 2 for the varlen decomposition on
+Ampere/Ada/Hopper; **flash-attn-4**, the CuTe DSL package (`pip install flash-attn-4`,
+or `"flash-attn-4[cu13]"` on CUDA 13), which brings the tcgen05 kernel on B200, the
+wgmma kernel on Hopper and an mma.sync kernel on sm_120 / Ada / Ampere.
 
 ---
 
@@ -142,22 +144,50 @@ diffusers does; ComfyUI rounds it to BF16 first. `adaln_fp32` is on by default.
 
 A profile name is not a benchmark result.
 
+<details>
+<summary><b>Advanced inputs</b> (collapsed in the node; every one has a tooltip)</summary>
+
+| Input | Options | Notes |
+|---|---|---|
+| `default_adapter_strength`, `turbo_adapter_strength` | -1 … 2 | per-adapter strength; -1 inherits `strength` |
+| `lora_mode` | auto, bypass, merge | auto merges on BF16 bases and bypasses on quantized ones; merging into a quantized base requantizes the weight |
+| `branch_mode` | auto, resident, hybrid, stream | where the VDN branch lives; auto budgets total VRAM minus the base model |
+| `attention_backend` | auto, grouped, flex, flash2, decomposed, reference, compat | exact local-window kernel; auto calibrates once per geometry and persists; compat goes through ComfyUI's attention override and is approximate |
+| `projection_precision` | auto, bf16, int8, fp8 | precision of the VDN `to_out_linear` GEMM; int8 / fp8 are quality-gated experiments |
+| `kernel_backend` | auto, triton, conv1d, eager | temporal-conv and activation kernels of the linear branch |
+| `compile_policy` | auto, off, shared, reduce_overhead, max_autotune | torch.compile policy for the fused bodies; reduce_overhead is CUDA graphs |
+| `tile_frames` | 0 … 64 | 0 lets the profile choose; N runs the branch in exact N-frame tiles |
+| `pin_strategy` | auto, comfy, all, none | pinned host memory for streamed branch weights |
+| `branch_execution` | auto, serial, parallel | parallel is an experimental second CUDA stream, resident weights only |
+| `adaln_fp32` | on / off | activate AdaLN from the fp32 time embedding; off only to A/B against the native path |
+| `strict_validation` | on / off | check every branch tensor against the loaded H3 geometry before applying |
+| `diagnostics` | on / off | per-stage CUDA-event timings and memory in the Runtime Report |
+
+Use `reference` instead of rebuilding the numerical oracle from these switches.
+
+</details>
+
 ---
 
 ## Your GPU
 
-**RTX PRO 6000 Blackwell / RTX 50xx (sm_120).** The FA4/CuTe kernels do not exist on
-this family, so `auto` calibrates between grouped SDPA and Flex-Triton once per geometry
-and persists the winner in `models/vdn/vdn_h3_calibration.json`. NVFP4 and MXFP8 bases
-are recognised. The fast INT8 path of the ConvRot checkpoint needs a torch cu130+ build;
-older builds run comfy-kitchen's slow fallback. ComfyUI's global SageAttention switch
-does not touch the exact VDN windows unless you select `attention_backend = compat`.
+**RTX PRO 6000 Blackwell / RTX 50xx (sm_120).** This family is not a B200: it has no
+tcgen05 tensor-core path and 99 KB of shared memory, so the FA4 kernel OpenVDN measured
+does not apply. flash-attn-4 does ship an sm_120 kernel, its SM80-class mma.sync design,
+and `auto` treats it as one more exact candidate: the calibration benchmarks grouped
+SDPA, Flex-Triton and the FA4 decomposition once per geometry, checks parity and
+persists the winner in `models/vdn/vdn_h3_calibration.json`. Nothing is assumed to win
+here until it does; the Runtime Report shows the generation as `fa4_kernel`. NVFP4 and
+MXFP8 bases are recognised. The fast INT8 path of the ConvRot checkpoint needs a torch
+cu130+ build; older builds run comfy-kitchen's slow fallback. ComfyUI's global
+SageAttention switch does not touch the exact VDN windows unless you select
+`attention_backend = compat`.
 
 **24 GB cards.** `auto` moves to hybrid or streamed branch storage and exact 5-frame tiles
 when the budget requires it; `low_vram` forces that layout.
 
-**H100 / H200 / B200.** The FA4 decomposition is tried first when flash-attn 4 is
-installed; otherwise the same grouped/Flex calibration applies.
+**H100 / H200 / B200.** The FA4 decomposition (wgmma / tcgen05 kernels) is tried first
+when flash-attn-4 is installed; otherwise the same grouped/Flex calibration applies.
 
 ---
 
@@ -209,7 +239,7 @@ H3 aligns the requested frame count to its temporal grid. That is not a quality 
 | Out of memory on the first run with reference images | grouped attention copies every global row into every window | check `attention_calibration.dispatch_reason`; force `attention_backend = flex` or use `low_vram` |
 | INT8 base is slow | torch build older than cu130: comfy-kitchen falls back | install a cu130+ build or use the `fp8_scaled` base |
 | Dropdown shows the placeholder instead of a checkpoint | the stage directory is not under `models/vdn` | move it there and refresh the node list |
-| "VDN already applied" | one model was patched twice | keep a single Apply node per model |
+| "VDN-H3 is already applied to this MODEL" | one model was patched twice | keep a single Apply node per model |
 | Slower than base H3 at 608×352 · 121 f | expected near break-even | measure at 241 frames or 720p and compare warm medians |
 
 ---
@@ -224,6 +254,11 @@ H3 aligns the requested frame count to its temporal grid. That is not a quality 
 | Kirei Release VDN-H3 Weights | `…/advanced` | free VDN caches and auxiliary weights |
 | Kirei Benchmark Scenario / Sampling / Start / End | `…/benchmark` | recipe-locked benchmark protocol, see [`benchmarks/README.md`](benchmarks/README.md) |
 | Kirei Apply VDN-H3 (Legacy) | `…/legacy` | compatibility with old saved workflows |
+
+Lifecycle rules: the branch weights are ComfyUI additional models and follow its
+offload and memory accounting; applying VDN twice to one MODEL is rejected, and so is a
+collision with another attention patch (apply VDN first); **Kirei Release VDN-H3
+Weights** frees the caches explicitly; the legacy node id keeps old workflows loading.
 
 ---
 

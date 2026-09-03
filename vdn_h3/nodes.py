@@ -167,7 +167,7 @@ def _auto_tile_frames(model, branch_mode: str) -> int:
 
 
 def _auto_execution_mode(model, branch_mode: str) -> str:
-    """Trade extra raw-QKV VRAM for exact branch/softmax overlap on workstations."""
+    """Eligibility helper for the opt-in two-stream workstation experiment."""
     if branch_mode != "resident":
         return "serial"
     budget = _gpu_budget(model)
@@ -245,12 +245,12 @@ def _resolve_runtime(
 
     if branch_execution != "auto":
         resolved_execution = branch_execution
-    elif profile in {"reference", "compat_reference", "low_vram"}:
-        resolved_execution = "serial"
-    elif profile in {"max_speed", "workstation_fp8"}:
+    elif profile == "workstation_fp8":
+        # Explicit experimental profile only. The qualified upstream single-GPU tuned
+        # scheduler is serial, so auto/max_speed never assume two streams are faster.
         resolved_execution = _auto_execution_mode(model, resolved_branch)
     else:
-        resolved_execution = _auto_execution_mode(model, resolved_branch)
+        resolved_execution = "serial"
     if resolved_execution == "parallel" and resolved_branch != "resident":
         raise ValueError("parallel branch execution requires resident branch weights")
 
@@ -287,11 +287,11 @@ def _resolve_runtime(
         resolved_compile = compile_policy
     elif profile in {"reference", "compat_reference"}:
         resolved_compile = "off"
-    elif resolved_execution == "parallel":
-        # Keep static shared compilation, but do not force CUDA-graph capture across two streams.
-        resolved_compile = "shared"
     elif profile == "max_speed":
         resolved_compile = "reduce_overhead"
+    elif resolved_execution == "parallel":
+        # Avoid forcing CUDA graph capture across independent model streams.
+        resolved_compile = "shared"
     else:
         resolved_compile = "shared"
 

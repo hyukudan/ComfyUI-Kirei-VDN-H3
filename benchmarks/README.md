@@ -50,8 +50,8 @@ architecture/default adapter mapping before blaming Stage-DMD Turbo.
 
 ## Larry MiniMax-H3 Turbo v4 quality control
 
-Larry v4 supports 4–8 steps, with its README noting that **6–8 steps improve motion and
-detail over the 4-step minimum**. For the clean A/B control against VDN we therefore use:
+Larry v4 supports 4–8 steps, with its README noting that 6–8 steps improve motion and
+detail over the four-step minimum. For the clean A/B control against VDN use:
 
 ```text
 sampler       = euler
@@ -64,8 +64,8 @@ audio shift   = 3.0
 ```
 
 On current ComfyUI, stock Euler is valid because MiniMax-H3's audio/video dual schedule
-is handled natively. Larry's dedicated Turbo Sampler is also valid for its own workflow,
-but the benchmark uses stock Euler so Larry and VDN share the exact sampler trajectory.
+is handled natively. The benchmark uses stock Euler so Larry and VDN share the exact
+sampling trajectory.
 
 ## Native/base reference
 
@@ -100,10 +100,9 @@ looked good locally” from “what reproduces the released inference recipe”.
 
 # The benchmark owns SAMPLER and SIGMAS
 
-The most important rule is that benchmark runs must not reuse sampler widgets from an
-existing workflow.
+Benchmark runs must not reuse sampler widgets from an existing workflow.
 
-Use this graph:
+Use:
 
 ```text
 Kirei Benchmark Scenario
@@ -126,7 +125,7 @@ SamplerCustomAdvanced ◄───────────┘
 Kirei Benchmark End
 ```
 
-`Kirei Benchmark Sampling` uses the same current Comfy primitives as
+`Kirei Benchmark Sampling` uses the current Comfy primitives corresponding to
 `KSamplerSelect + BasicScheduler`:
 
 ```text
@@ -134,7 +133,7 @@ comfy.samplers.sampler_object(sampler_name)
 comfy.samplers.calculate_sigmas(model_sampling, scheduler_name, steps)
 ```
 
-For Stage-DMD that means the node itself constructs **Euler + simple + 8 NFE**.
+For Stage-DMD the node itself constructs **Euler + simple + 8 NFE**.
 
 `Kirei Benchmark Start` requires the opaque `recipe_token` produced by that node. A
 hand-configured sampler cannot generate a valid token, so an inherited `res_multistep`
@@ -144,7 +143,7 @@ widget cannot accidentally be recorded as a canonical VDN result.
 
 # Automatic validation
 
-`record_result.py` rejects the measurement if any of these differ from the selected
+`record_result.py` rejects a VDN measurement if any of these differ from the selected
 scenario:
 
 - sampler name;
@@ -155,22 +154,32 @@ scenario:
 - audio shift;
 - VDN checkpoint `turbo_num_steps` declaration;
 - VDN profile (`auto`, `max_speed`, `reference`, ...);
-- requested projection precision when the Runtime Report exposes it;
-- named adapter inventory/strengths when exposed by the Runtime Report.
+- **actual resolved projection precision**;
+- **active VDN adapter inventory**;
+- **adapter strengths**.
 
-In particular, these are invalid Stage-DMD measurements:
+The Runtime Report metadata is mandatory for canonical VDN results. A stale installation
+that does not report `adapters.active` / `adapters.strengths` must be updated before its
+measurement can enter the canonical result set.
+
+A scenario called BF16/INT8/FP8 is also required to report that precision after all
+runtime fallbacks; a BF16 fallback cannot be filed under an INT8 or FP8 label.
+
+Invalid Stage-DMD examples include:
 
 ```text
 res_multistep + simple + 8
 Euler + beta + 8
 Euler + simple + 6
 Euler + simple + 8 + denoise 0.8
+Euler + simple + 8 + default only
+Euler + simple + 8 + turbo strength 0.6
 ```
 
-The canonical Stage-DMD tuple is exactly:
+The canonical Stage-DMD tuple is:
 
 ```text
-Euler / simple / 8 / denoise 1.0 / shifts 12,3
+Euler / simple / 8 / denoise 1.0 / shifts 12,3 / default 1.0 + turbo 1.0
 ```
 
 ---
@@ -195,8 +204,6 @@ Run:
 - VDN Stage-DMD INT8 — Euler/simple/8, after BF16 quality is understood;
 - VDN Stage-DMD FP8 — Euler/simple/8, after BF16 quality is understood.
 
-This is the fast regression loop, not the final long-video verdict.
-
 ## 2. Higher-detail A/B — 960×544, 121 frames
 
 Product group:
@@ -216,17 +223,13 @@ Product group:
 quality8_608x352_241
 ```
 
-This is the **primary repeated performance benchmark**. It is long enough that VDN's
-local-window/linear-memory trade should be meaningful while still being practical for
-multiple warm runs.
-
-Run at minimum:
+This is the **primary repeated performance benchmark**. Run at minimum:
 
 - Larry v4 8-step clean control;
 - VDN BF16;
 - VDN INT8;
 - VDN FP8;
-- VDN `max_speed` after its quality gate.
+- VDN `max_speed` after its own quality gate.
 
 ## 4. Stress/crossover — 608×352, 401 frames
 
@@ -251,11 +254,8 @@ vdn_dmd_int8_8step_1344x768_345
 vdn_dmd_fp8_8step_1344x768_345
 ```
 
-This tier answers two separate questions:
-
-1. does the Stage-B VDN port preserve the model at 50 NFE?;
-2. does Stage-DMD at 8 NFE preserve acceptable quality relative to the clean Larry
-   control at the same Euler/simple/8 trajectory?
+This tier asks whether Stage-B itself ports faithfully and whether Stage-DMD retains
+acceptable few-step quality under the clean Euler/simple/8 control.
 
 ---
 
@@ -265,8 +265,8 @@ This tier answers two separate questions:
 
 ## `product_comparisons`
 
-Compares different model recipes that target the same quality objective **only when the
-actual denoising trajectory matches**. The current canonical Larry-vs-VDN groups are all:
+Different model recipes are compared only when the actual quality trajectory matches.
+The current canonical Larry-vs-VDN groups share:
 
 ```text
 8 NFE
@@ -281,11 +281,9 @@ same seed
 
 ## `technical_comparisons`
 
-Compares only entries from the **same `recipe_id`**. This is where BF16, INT8, FP8 and
-`max_speed` VDN are ranked against each other.
-
-Larry can share the product group with VDN but never contaminates the VDN technical
-ranking.
+Entries are partitioned by `recipe_id`. BF16, INT8, FP8 and `max_speed` VDN can therefore
+be ranked against one another without Larry contaminating the same-recipe engineering
+comparison.
 
 ---
 
@@ -300,7 +298,7 @@ quality_status = pending | qualified | failed | diagnostic
 A speed claim is not eligible until every required path in the product comparison is
 `qualified`.
 
-Check at least:
+Inspect at least:
 
 - subject/identity consistency;
 - prompt following;
@@ -320,14 +318,14 @@ For each scenario:
 
 1. select it in **Kirei Benchmark Scenario**;
 2. wire its geometry values into the latent/video workflow;
-3. connect its `scenario_id` to **Kirei Benchmark Sampling**;
+3. connect `scenario_id` to **Kirei Benchmark Sampling**;
 4. connect the sampled MODEL to **Kirei Benchmark Sampling**;
-5. connect the resulting `SAMPLER` and `SIGMAS` to `SamplerCustomAdvanced`;
+5. connect its `SAMPLER` and `SIGMAS` to `SamplerCustomAdvanced`;
 6. connect its `recipe_token` to **Kirei Benchmark Start**;
 7. feed Benchmark Start's MODEL output to that same sampler;
-8. connect the sampler LATENT directly to **Kirei Benchmark End.after**;
-9. for VDN, also connect the patched MODEL to Benchmark End;
-10. record cold compile/autotune separately;
+8. connect sampler LATENT directly to **Kirei Benchmark End.after**;
+9. for VDN, connect the patched MODEL to Benchmark End so Runtime Report is embedded;
+10. record cold separately;
 11. warm once;
 12. collect five warm runs by default;
 13. report median `sampler_seconds` plus peak VRAM.
@@ -338,7 +336,7 @@ Never include VAE decode or MP4 encoding in the standard sampler interval.
 
 # Recording results
 
-Save the JSON emitted by Benchmark End and run:
+Save Benchmark End JSON and run:
 
 ```bash
 python benchmarks/record_result.py measurement.json \
@@ -347,8 +345,8 @@ python benchmarks/record_result.py measurement.json \
   --quality-status pending
 ```
 
-`--scheduler` is optional and is now only a human-readable label. The real sampler and
-scheduler are taken from the verified `sampling_plan` embedded in the measurement.
+`--scheduler` is optional and only a human-readable label. The actual sampler/scheduler
+come from the verified `sampling_plan`.
 
 Summarize with:
 
@@ -360,14 +358,12 @@ python benchmarks/compare_results.py benchmarks/results.jsonl
 
 # Historical results
 
-Older measurements remain useful as historical context but are **not canonical** if the
-full sampling plan was not recorded.
+Older measurements remain context only when the full sampling plan was not recorded.
+The VDN result produced with `res_multistep + simple` must be repeated through
+`Kirei Benchmark Sampling` before it is used to judge Stage-DMD quality or performance.
 
-The previously observed VDN output generated with `res_multistep + simple` must not be
-used to judge Stage-DMD quality. Repeat it through `Kirei Benchmark Sampling` first.
-
-Likewise, the local hybrid/Sage/Larry-0.6/Euler-beta-6 workflow can be used as a visual
-reference, but it is deliberately outside the clean Larry/OpenVDN benchmark.
+The local hybrid/Sage/Larry-0.6/Euler-beta-6 workflow is retained as a visual reference,
+but it remains outside the canonical result groups.
 
 ---
 
@@ -379,12 +375,14 @@ A technical VDN change is an optimization only when:
 - same prompt/seed;
 - same `vdn_stage_dmd_8` recipe;
 - **Euler + simple + 8 NFE + denoise 1.0**;
-- same H3 shifts 12/3;
-- output passes the relevant quality gate;
+- H3 shifts 12/3;
+- correct `default=1 + turbo=1` adapter recipe;
+- actual resolved profile/precision matches the scenario label;
+- output passes its quality gate;
 - warm median sampler time improves;
 - peak VRAM remains acceptable for the target GPU.
 
-The routine sequence is:
+Routine sequence:
 
 ```text
 608×352 / 121f  -> quick regression

@@ -130,6 +130,11 @@ Recommended order:
 Do not interpret INT8-vs-BF16 timing before checking whether quantization changes the
 visual result enough to matter.
 
+If 960×544 remains too soft to distinguish the quality ceiling clearly, escalate the
+quality A/B to approximately **1360×768 / 121 frames / 8 steps** while keeping the same
+prompt, seed and scheduler. That is a conditional quality stress test, not the routine
+performance benchmark.
+
 ## 3. Primary long-video performance benchmark: 608×352, 241 frames, 8 steps
 
 This is the main end-to-end performance target. It is long enough for the local-window /
@@ -206,7 +211,53 @@ For each scenario:
 9. record `quality_status` independently of timing;
 10. never mix the cold compile/autotune run into steady-state timing.
 
-Recommended result row:
+## In-graph sampler timing
+
+Use the two benchmark nodes so Turbo, VDN and native are timed over exactly the same
+segment:
+
+```text
+model
+  -> Kirei Benchmark Start
+       -> MODEL -> sampler -> LATENT -> Kirei Benchmark End.after
+       -> benchmark_token ------------> Kirei Benchmark End.benchmark_token
+```
+
+Set `scenario_id` on **Kirei Benchmark Start** to an id from `scenarios.json`.
+
+The Start node synchronizes the model CUDA device before opening the interval and can
+reset peak-memory statistics. The End node synchronizes before closing it and outputs:
+
+- `sampler_seconds`;
+- peak allocated/reserved VRAM;
+- run kind (`cold` or `warm`);
+- optional embedded VDN Runtime Report when the patched model is connected.
+
+Connect the sampler LATENT directly to `End.after`. If you connect a decoded video or a
+post-VAE node instead, the measurement intentionally includes that extra work and is no
+longer the standard sampler benchmark.
+
+Both benchmark nodes invalidate ComfyUI's execution cache on every prompt so repeated
+warm measurements really execute.
+
+## Recording a measurement
+
+Save the JSON emitted by **Kirei Benchmark End**, then merge it with the scenario metadata:
+
+```bash
+python benchmarks/record_result.py measurement.json \
+  --seed 1234 \
+  --scheduler "fixed-name-and-settings" \
+  --prompt-hash "<hash>" \
+  --quality-status pending
+```
+
+`record_result.py` appends a normalized row to `benchmarks/results.jsonl` by default.
+For VDN measurements it also inspects `runtime_report.checkpoint_recipe.turbo_num_steps`.
+If the checkpoint reports 8 but the selected scenario requests another step count, the
+result is rejected rather than recorded.
+
+Recommended normalized result row:
 
 ```json
 {
@@ -215,6 +266,8 @@ Recommended result row:
   "quality_target": "checkpoint_declared_distilled8",
   "recipe": "turbo_num_steps_8_same_prompt_seed_scheduler",
   "quality_status": "pending",
+  "quality_gate_required": true,
+  "comparable": true,
   "width": 608,
   "height": 352,
   "frames": 241,
@@ -225,7 +278,6 @@ Recommended result row:
   "checkpoint_turbo_num_steps": 8,
   "run_kind": "warm",
   "sampler_seconds": 12.34,
-  "end_to_end_seconds": 14.56,
   "peak_vram_bytes": 123456789,
   "runtime_report": {}
 }
@@ -239,8 +291,9 @@ Summarize it with:
 python benchmarks/compare_results.py benchmarks/results.jsonl
 ```
 
-The comparator ranks only rows sharing one complete benchmark objective and reports
-whether the group is eligible for a same-quality speed claim.
+The comparator still shows a technical ranking when the structure matches, but
+`speed_claim_eligible` becomes `true` only after every path that requires a quality gate
+is marked `qualified`.
 
 ---
 

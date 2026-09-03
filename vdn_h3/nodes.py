@@ -255,14 +255,8 @@ def _resolve_runtime(
     if lora_mode != "auto":
         resolved_lora = lora_mode
     elif profile in {"max_speed", "workstation_fp8"}:
-        # Merge/requantization removes runtime low-rank GEMMs but can round away part of
-        # a small adapter update on an already quantized base. Keep it behind explicit
-        # speed-oriented profiles and their quality gate.
         resolved_lora = "merge"
     else:
-        # Auto/reference/balanced/low_vram are quality-first. The compact composite
-        # bypass preserves the released low-rank update in activation space even when
-        # the H3 base itself is INT8/FP8/pruned.
         resolved_lora = "bypass"
 
     if attention_backend != "auto":
@@ -311,9 +305,16 @@ def _resolve_runtime(
         resolved_projection = "fp8"
     elif profile == "max_speed":
         resolved_projection = base_precision if base_precision in {"int8", "fp8"} else "fp8"
-    elif base_precision in {"int8", "fp8"}:
+    elif profile == "low_vram" and base_precision in {"int8", "fp8"}:
+        # Low-VRAM explicitly values smaller storage/H2D. This path remains quality-gated.
+        resolved_projection = base_precision
+    elif profile == "auto" and resolved_branch != "resident" and base_precision in {"int8", "fp8"}:
+        # On hybrid/stream consumer paths the reduced transfer/storage can be necessary.
         resolved_projection = base_precision
     else:
+        # Resident auto is quality/performance conservative. Our current workstation
+        # measurement did not show an INT8 projection win, so quantized projections stay
+        # explicit/max_speed experiments until target-GPU benchmarks qualify them.
         resolved_projection = "bf16"
 
     inference = profile not in {"reference", "compat_reference"}

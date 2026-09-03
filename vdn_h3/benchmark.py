@@ -26,6 +26,7 @@ def _cuda_snapshot(model_patcher: Any) -> dict:
                 "name": props.name,
                 "capability": list(torch.cuda.get_device_capability(device)),
                 "family": _gpu_family(device),
+                "fa4_kernel": _fa4_kernel(device),
                 "total_bytes": int(total),
                 "free_bytes": int(free),
                 "allocated_bytes": int(torch.cuda.memory_allocated(device)),
@@ -36,6 +37,15 @@ def _cuda_snapshot(model_patcher: Any) -> dict:
     except Exception as exc:
         result["error"] = str(exc)
     return result
+
+
+def _fa4_kernel(device) -> str:
+    try:
+        from .window import fa4_kernel
+
+        return fa4_kernel(device)
+    except Exception:
+        return "unknown"
 
 
 def _gpu_family(device) -> str:

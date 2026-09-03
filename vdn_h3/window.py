@@ -1,4 +1,4 @@
-"""Window-attention backends for VDN-H3: grouped, Flex, FA2 and Blackwell FA4."""
+"""Window-attention backends for VDN-H3: grouped, Flex, FA2 and FA4 (CuTe DSL)."""
 
 from __future__ import annotations
 
@@ -309,10 +309,11 @@ def _device_key(device):
 def gpu_family(device) -> str:
     """Coarse NVIDIA family for kernel policy.
 
-    Datacenter Hopper (sm_90) and Blackwell (sm_100/sm_103) have FlashAttention-4 /
-    CuTe kernels and the per-tensor FP8 cuBLAS path OpenVDN tuned for. Consumer and
-    workstation Blackwell (sm_120, RTX 50xx / RTX PRO 6000) shares the name but not the
-    kernels, so it must never be treated as sm_100.
+    Datacenter Hopper (sm_90) and Blackwell (sm_100/sm_103) run the wgmma / tcgen05
+    FlashAttention-4 kernels and the per-tensor FP8 cuBLAS path OpenVDN tuned for.
+    Consumer and workstation Blackwell (sm_120, RTX 50xx / RTX PRO 6000) shares the name
+    but not those kernels: flash-attn-4 runs its mma.sync (SM80-class) kernel there, so
+    it must never be treated as sm_100.
     """
     try:
         major, minor = torch.cuda.get_device_capability(device)
@@ -329,9 +330,35 @@ def gpu_family(device) -> str:
     return f"sm_{major}{minor}"
 
 
+FA4_KERNELS = {
+    "blackwell_dc": "tcgen05",
+    "hopper": "wgmma",
+    "blackwell_consumer": "mma_sync",
+    "ada": "mma_sync",
+    "ampere": "mma_sync",
+}
+
+
+def fa4_kernel(device) -> str:
+    """Which flash-attn-4 (CuTe DSL) kernel generation this device would run.
+
+    ``tcgen05`` (sm_100) and ``wgmma`` (sm_90) are the generations OpenVDN measured.
+    ``mma_sync`` is the SM80-class kernel flash-attn-4 also builds for sm_120, Ada and
+    Ampere; whether it beats grouped SDPA or Flex there is a calibration result.
+    """
+    family = gpu_family(device)
+    if family == "unknown":
+        return "unknown"
+    return FA4_KERNELS.get(family, "unsupported")
+
+
 def prefers_fa4(device) -> bool:
-    """Whether the decomposed FA4/CuTe window kernel is worth trying first."""
-    return gpu_family(device) in {"hopper", "blackwell_dc"}
+    """Whether the decomposed FA4/CuTe window kernel is worth trying before calibrating.
+
+    Only the tcgen05 / wgmma generations skip the queue; the mma.sync generation competes
+    in the calibration like grouped, Flex and FA2.
+    """
+    return fa4_kernel(device) in {"tcgen05", "wgmma"}
 
 
 GROUPED_COPY_GUARD_FRACTION = 0.35
@@ -737,6 +764,7 @@ __all__ = [
     "gpu_family",
     "grouped_copies_too_large",
     "grouped_copy_bytes",
+    "fa4_kernel",
     "prefers_fa4",
     "resolve_attention_backend",
     "window_bounds",

@@ -434,8 +434,8 @@ Qualify:
 - VDN INT8/ConvRot;
 - VDN FP8;
 - `max_speed`;
-- grouped vs calibrated exact attention (FA4/CuTe kernels do not exist on sm_120, so
-  expect grouped or Flex to win);
+- grouped vs calibrated exact attention (on sm_120 flash-attn-4 runs its mma.sync
+  kernel; the calibration decides between it, grouped and Flex);
 - resident placement;
 - experimental parallel scheduler separately.
 

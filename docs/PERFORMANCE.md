@@ -89,9 +89,9 @@ Saganaki number is the first one to beat with `profile=auto`.
 
 | Card | Branch | Adapters | VDN projection | Attention candidates |
 |---|---|---|---|---|
-| RTX PRO 6000 / RTX 50xx (sm_120), BF16 base | resident | merged (exact) | BF16 | grouped, Flex-Triton (FA4 does not exist on sm_120) |
-| RTX PRO 6000 / RTX 50xx, INT8 / FP8 / NVFP4 base | resident | bypass (exact, fc2 included) | BF16 | grouped, Flex-Triton |
-| H100 / H200 (sm_90) | resident | as above | BF16 | grouped, Flex, FA4 decomposition if flash-attn 4 is installed |
+| RTX PRO 6000 / RTX 50xx (sm_120), BF16 base | resident | merged (exact) | BF16 | grouped, Flex-Triton, FA4 decomposition with the sm_120 mma.sync kernel when flash-attn-4 is installed; the calibration decides |
+| RTX PRO 6000 / RTX 50xx, INT8 / FP8 / NVFP4 base | resident | bypass (exact, fc2 included) | BF16 | grouped, Flex-Triton, FA4 (sm_120 kernel) |
+| H100 / H200 (sm_90) | resident | as above | BF16 | grouped, Flex, FA4 decomposition (wgmma) if flash-attn-4 is installed |
 | B200 (sm_100) | resident | as above | BF16 | FA4 decomposition first |
 | RTX 4090 24 GB | hybrid + 5-frame tiles | bypass | follows an INT8/FP8 base | grouped, Flex |
 

@@ -452,10 +452,13 @@ parity against the grouped oracle can win.
 
 ### GPU families
 
-`window.gpu_family` classifies the device once. Hopper (sm_90) and datacenter Blackwell
-(sm_100/sm_103) may try the FA4/CuTe decomposition first; consumer and workstation
-Blackwell (sm_120: RTX 50xx, RTX PRO 6000), Ada and Ampere never do, because those
-kernels do not exist there. Before autotuning, `auto` also estimates the K/V copy volume
+`window.gpu_family` classifies the device once and `window.fa4_kernel` names the
+flash-attn-4 generation it would run: `tcgen05` on datacenter Blackwell (sm_100/sm_103),
+`wgmma` on Hopper (sm_90), `mma_sync` on consumer and workstation Blackwell (sm_120:
+RTX 50xx, RTX PRO 6000), Ada and Ampere. Only the first two skip the calibration queue;
+the mma.sync generation is an SM80-class kernel with 99 KB of shared memory on sm_120, so
+it competes with grouped SDPA, Flex and FA2 and wins only by measurement. Before
+autotuning, `auto` also estimates the K/V copy volume
 grouped attention would need for the layout (every global row is copied into every
 window group) and selects Flex outright when the copies would exceed the guard; the
 reason is reported as `attention_calibration.dispatch_reason`.

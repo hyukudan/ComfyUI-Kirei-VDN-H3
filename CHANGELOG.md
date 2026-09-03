@@ -21,7 +21,9 @@ September 2026 audit against OpenVDN and current ComfyUI.
 ### Runtime
 
 - Consumer/workstation Blackwell (sm_120: RTX 50xx, RTX PRO 6000) is no longer treated
-  as datacenter Blackwell: the FA4/CuTe decomposition is only tried on sm_90/sm_100.
+  as datacenter Blackwell: the FA4/CuTe decomposition is only assumed to win on
+  sm_90/sm_100 (wgmma / tcgen05 kernels). On sm_120 flash-attn-4's mma.sync kernel stays
+  a calibration candidate; the Runtime Report names the generation as `fa4_kernel`.
 - Attention dispatch estimates the K/V copies grouped attention would make for the
   layout and picks Flex before autotuning when reference/keyframe rows make them too
   large (REF2VA/I2V layouts).

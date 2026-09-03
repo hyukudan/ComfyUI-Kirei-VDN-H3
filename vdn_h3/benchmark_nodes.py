@@ -1,13 +1,32 @@
 """ComfyUI nodes for recipe-aware sampler benchmarks.
 
-Use ``Kirei Benchmark Scenario`` as the single source of truth for the test geometry and
-recipe, then place ``Kirei Benchmark Start`` immediately before the sampler's MODEL input
-and connect the sampler LATENT directly to ``Kirei Benchmark End.after``.
+The benchmark path deliberately owns the sampler and sigma schedule.  This prevents a
+saved workflow widget from silently leaking a different sampler (for example
+``res_multistep``) into an OpenVDN Stage-DMD run that is supposed to use Euler + simple.
+
+Recommended wiring::
+
+    Kirei Benchmark Scenario
+          | scenario_id
+          v
+    Kirei Benchmark Sampling <--- MODEL
+          | SAMPLER / SIGMAS --------> SamplerCustomAdvanced
+          | recipe_token
+          v
+    Kirei Benchmark Start <----------- same MODEL
+          | MODEL --------------------> SamplerCustomAdvanced
+          | benchmark_token
+          v
+    Kirei Benchmark End <------------- sampler LATENT
+
+``Kirei Benchmark Start`` refuses an unverified recipe token, so benchmark measurements
+cannot be recorded from a hand-configured sampler by accident.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +35,7 @@ import torch
 
 
 _TOKEN_TYPE = "KIREI_BENCHMARK_TOKEN"
+_RECIPE_TOKEN_TYPE = "KIREI_BENCHMARK_RECIPE"
 _SCENARIOS_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "scenarios.json"
 
 
@@ -60,6 +80,28 @@ def _scenario_runtime_controls(spec: dict, recipe: dict):
     return profile, projection, apply_turbo
 
 
+def _sampling_plan(payload: dict, spec: dict, recipe: dict) -> dict:
+    steps = int(spec["steps"])
+    recipe_steps = int(recipe["steps"])
+    if steps != recipe_steps:
+        raise ValueError(
+            f"active benchmark scenario {spec['id']!r} requests {steps} steps but recipe "
+            f"{spec['recipe_id']!r} requires {recipe_steps}"
+        )
+    return {
+        "verified": True,
+        "scenario_schema_version": int(payload.get("schema_version", 0)),
+        "scenario_id": str(spec["id"]),
+        "recipe_id": str(spec["recipe_id"]),
+        "sampler_name": str(recipe["sampler_name"]),
+        "scheduler_name": str(recipe["scheduler_name"]),
+        "steps": steps,
+        "denoise": float(recipe.get("denoise", 1.0)),
+        "video_shift": float(recipe["video_shift"]),
+        "audio_shift": float(recipe["audio_shift"]),
+    }
+
+
 def _model_device(model: Any) -> torch.device:
     try:
         return torch.device(getattr(model, "load_device", "cpu"))
@@ -68,6 +110,14 @@ def _model_device(model: Any) -> torch.device:
 
 
 def _model_sampling(model: Any):
+    getter = getattr(model, "get_model_object", None)
+    if callable(getter):
+        try:
+            value = getter("model_sampling")
+            if value is not None:
+                return value
+        except Exception:
+            pass
     candidates = [
         getattr(model, "model_sampling", None),
         getattr(getattr(model, "model", None), "model_sampling", None),
@@ -102,6 +152,54 @@ def _sampling_snapshot(model: Any) -> dict:
         "video_shift": value("shift", "minimax_h3_sigma_shift_video"),
         "audio_shift": value("audio_shift", "minimax_h3_sigma_shift_audio"),
     }
+
+
+def _close(a, b, tol=1e-6):
+    return a is not None and b is not None and math.isclose(float(a), float(b), abs_tol=tol, rel_tol=0.0)
+
+
+def _validate_model_shifts(snapshot: dict, plan: dict) -> None:
+    # MiniMax-H3 should expose both values on current ComfyUI. Refuse to benchmark an
+    # unknown/different clock because it changes the actual denoising trajectory.
+    if not _close(snapshot.get("video_shift"), plan["video_shift"]):
+        raise ValueError(
+            f"benchmark model video shift={snapshot.get('video_shift')!r}, expected "
+            f"{plan['video_shift']} for scenario {plan['scenario_id']!r}"
+        )
+    if not _close(snapshot.get("audio_shift"), plan["audio_shift"]):
+        raise ValueError(
+            f"benchmark model audio shift={snapshot.get('audio_shift')!r}, expected "
+            f"{plan['audio_shift']} for scenario {plan['scenario_id']!r}"
+        )
+
+
+def _build_sampler_and_sigmas(model, plan: dict):
+    """Use the same current Comfy primitives as KSamplerSelect + BasicScheduler."""
+    import comfy.samplers
+
+    sampler_name = plan["sampler_name"]
+    scheduler_name = plan["scheduler_name"]
+    if sampler_name not in comfy.samplers.SAMPLER_NAMES:
+        raise ValueError(f"ComfyUI does not provide benchmark sampler {sampler_name!r}")
+    if scheduler_name not in comfy.samplers.SCHEDULER_NAMES:
+        raise ValueError(f"ComfyUI does not provide benchmark scheduler {scheduler_name!r}")
+
+    sampler = comfy.samplers.sampler_object(sampler_name)
+    sampling = _model_sampling(model)
+    if sampling is None:
+        raise RuntimeError("benchmark MODEL does not expose model_sampling")
+
+    steps = int(plan["steps"])
+    denoise = float(plan["denoise"])
+    total_steps = steps
+    if denoise < 1.0:
+        if denoise <= 0.0:
+            sigmas = torch.FloatTensor([])
+            return sampler, sigmas
+        total_steps = int(steps / denoise)
+    sigmas = comfy.samplers.calculate_sigmas(sampling, scheduler_name, total_steps).cpu()
+    sigmas = sigmas[-(steps + 1):]
+    return sampler, sigmas
 
 
 def _sync(device: torch.device) -> None:
@@ -147,8 +245,8 @@ class KireiBenchmarkScenario:
                     _active_scenario_ids(),
                     {
                         "tooltip": (
-                            "Select once, then wire geometry/steps/shifts into the workflow. "
-                            "The VDN profile/projection/turbo outputs show the exact Apply VDN settings."
+                            "Select once, then wire geometry and VDN controls into the workflow. "
+                            "Use Kirei Benchmark Sampling for the actual SAMPLER/SIGMAS."
                         )
                     },
                 )
@@ -157,7 +255,7 @@ class KireiBenchmarkScenario:
 
     RETURN_TYPES = (
         "STRING", "STRING", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT",
-        "STRING", "STRING", "BOOLEAN", "STRING",
+        "STRING", "STRING", "FLOAT", "STRING", "STRING", "BOOLEAN", "FLOAT", "STRING",
     )
     RETURN_NAMES = (
         "scenario_id",
@@ -168,26 +266,34 @@ class KireiBenchmarkScenario:
         "frames",
         "video_shift",
         "audio_shift",
+        "sampler_name",
+        "scheduler_name",
+        "denoise",
         "vdn_profile",
         "projection_precision",
         "apply_turbo_adapter",
+        "lora_strength",
         "scenario_json",
     )
     FUNCTION = "resolve"
     CATEGORY = "model_patches/video/benchmark"
-    DESCRIPTION = "Resolve an active benchmark scenario into connectable recipe, geometry and VDN-control values."
+    DESCRIPTION = "Resolve an active benchmark scenario into recipe, geometry and runtime-control values."
 
     def resolve(self, scenario):
         payload, spec, recipe = _resolve_scenario(str(scenario))
+        plan = _sampling_plan(payload, spec, recipe)
         profile, projection, apply_turbo = _scenario_runtime_controls(spec, recipe)
+        lora_strength = float(recipe.get("lora_strength", recipe.get("required_adapter_strength", 1.0)))
         merged = {
             "schema_version": int(payload.get("schema_version", 0)),
             "scenario": spec,
             "recipe": recipe,
+            "sampling_plan": plan,
             "runtime_controls": {
                 "vdn_profile": profile,
                 "projection_precision": projection,
                 "apply_turbo_adapter": apply_turbo,
+                "lora_strength": lora_strength,
             },
         }
         return (
@@ -199,28 +305,65 @@ class KireiBenchmarkScenario:
             int(spec["frames"]),
             float(recipe["video_shift"]),
             float(recipe["audio_shift"]),
+            plan["sampler_name"],
+            plan["scheduler_name"],
+            float(plan["denoise"]),
             profile,
             projection,
             apply_turbo,
+            lora_strength,
             json.dumps(merged, indent=2, sort_keys=True, default=str),
         )
 
 
-class KireiBenchmarkStart:
+class KireiBenchmarkSampling:
+    """Construct the benchmark SAMPLER and SIGMAS from the selected scenario."""
+
     @classmethod
     def INPUT_TYPES(cls):
-        default = _active_scenario_ids()[0]
         return {
             "required": {
                 "model": ("MODEL",),
                 "scenario_id": (
                     "STRING",
+                    {"default": _active_scenario_ids()[0], "tooltip": "Connect Benchmark Scenario.scenario_id."},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("SAMPLER", "SIGMAS", _RECIPE_TOKEN_TYPE, "STRING")
+    RETURN_NAMES = ("sampler", "sigmas", "recipe_token", "sampling_plan_json")
+    FUNCTION = "build"
+    CATEGORY = "model_patches/video/benchmark"
+    DESCRIPTION = (
+        "Build the exact sampler/sigma schedule declared by the benchmark scenario. "
+        "OpenVDN Stage-DMD therefore always receives Euler + simple + 8 NFE + denoise 1.0."
+    )
+
+    def build(self, model, scenario_id):
+        payload, spec, recipe = _resolve_scenario(str(scenario_id))
+        plan = _sampling_plan(payload, spec, recipe)
+        snapshot = _sampling_snapshot(model)
+        _validate_model_shifts(snapshot, plan)
+        sampler, sigmas = _build_sampler_and_sigmas(model, plan)
+        token = dict(plan)
+        token["model_sampling"] = snapshot
+        return sampler, sigmas, token, json.dumps(token, indent=2, sort_keys=True, default=str)
+
+
+class KireiBenchmarkStart:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "recipe_token": (
+                    _RECIPE_TOKEN_TYPE,
                     {
-                        "default": default,
                         "tooltip": (
-                            "Connect Kirei Benchmark Scenario.scenario_id here. The id is validated "
-                            "against benchmarks/scenarios.json before timing starts."
-                        ),
+                            "Required token from Kirei Benchmark Sampling. This proves the sampler and "
+                            "sigma schedule were generated from scenarios.json rather than inherited widgets."
+                        )
                     },
                 ),
             },
@@ -231,23 +374,35 @@ class KireiBenchmarkStart:
     RETURN_NAMES = ("model", "benchmark_token")
     FUNCTION = "start"
     CATEGORY = "model_patches/video/benchmark"
-    DESCRIPTION = "Start a recipe-aware sampler benchmark and record the model's actual H3 sampling shifts."
+    DESCRIPTION = "Start a sampler benchmark only after a verified scenario sampling recipe has been built."
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
         return float("nan")
 
-    def start(self, model, scenario_id, reset_peak_vram=True):
-        payload, scenario, recipe = _resolve_scenario(str(scenario_id))
+    def start(self, model, recipe_token, reset_peak_vram=True):
+        if not isinstance(recipe_token, dict) or recipe_token.get("verified") is not True:
+            raise TypeError("Kirei Benchmark Start requires a verified Kirei Benchmark Sampling token")
+        payload, scenario, recipe = _resolve_scenario(str(recipe_token.get("scenario_id", "")))
+        expected = _sampling_plan(payload, scenario, recipe)
+        for key, value in expected.items():
+            if recipe_token.get(key) != value:
+                raise ValueError(
+                    f"benchmark recipe token mismatch for {key}: {recipe_token.get(key)!r} != {value!r}"
+                )
+
+        snapshot = _sampling_snapshot(model)
+        _validate_model_shifts(snapshot, expected)
         device = _model_device(model)
         _sync(device)
         memory = _cuda_start(device, bool(reset_peak_vram))
         token = {
-            "scenario_id": str(scenario_id),
-            "scenario_schema_version": int(payload.get("schema_version", 0)),
+            "scenario_id": expected["scenario_id"],
+            "scenario_schema_version": expected["scenario_schema_version"],
             "scenario_spec": scenario,
             "recipe_spec": recipe,
-            "sampling": _sampling_snapshot(model),
+            "sampling_plan": expected,
+            "sampling": snapshot,
             "device": str(device),
             "started_ns": time.perf_counter_ns(),
             "reset_peak_vram": bool(reset_peak_vram),
@@ -277,8 +432,8 @@ class KireiBenchmarkEnd:
                     "MODEL",
                     {
                         "tooltip": (
-                            "Connect the same sampled MODEL. VDN scenarios then embed the Runtime "
-                            "Report so checkpoint recipe/profile/precision can be validated."
+                            "Connect the same sampled MODEL. VDN scenarios embed the Runtime Report "
+                            "so checkpoint recipe/profile/precision can be validated."
                         )
                     },
                 ),
@@ -292,8 +447,8 @@ class KireiBenchmarkEnd:
     CATEGORY = "model_patches/video/benchmark"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "Close the sampler benchmark after GPU synchronization and emit wall time, peak VRAM, "
-        "scenario/recipe, actual sampling shifts and optional VDN runtime metadata."
+        "Close the verified sampler benchmark after GPU synchronization and emit wall time, "
+        "peak VRAM, exact sampling plan and optional VDN runtime metadata."
     )
 
     @classmethod
@@ -313,6 +468,7 @@ class KireiBenchmarkEnd:
             "scenario_schema_version": benchmark_token.get("scenario_schema_version"),
             "scenario_spec": benchmark_token.get("scenario_spec"),
             "recipe_spec": benchmark_token.get("recipe_spec"),
+            "sampling_plan": benchmark_token.get("sampling_plan"),
             "sampling": benchmark_token.get("sampling"),
             "run_kind": str(run_kind),
             "device": str(device),
@@ -336,11 +492,13 @@ class KireiBenchmarkEnd:
 
 NODE_CLASS_MAPPINGS = {
     "KireiBenchmarkScenario": KireiBenchmarkScenario,
+    "KireiBenchmarkSampling": KireiBenchmarkSampling,
     "KireiBenchmarkStart": KireiBenchmarkStart,
     "KireiBenchmarkEnd": KireiBenchmarkEnd,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KireiBenchmarkScenario": "Kirei Benchmark Scenario",
+    "KireiBenchmarkSampling": "Kirei Benchmark Sampling",
     "KireiBenchmarkStart": "Kirei Benchmark Start",
     "KireiBenchmarkEnd": "Kirei Benchmark End",
 }
@@ -348,6 +506,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 __all__ = [
     "KireiBenchmarkScenario",
+    "KireiBenchmarkSampling",
     "KireiBenchmarkStart",
     "KireiBenchmarkEnd",
     "NODE_CLASS_MAPPINGS",

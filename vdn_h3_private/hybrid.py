@@ -1,6 +1,6 @@
 """ComfyUI-facing Video Delta Attention integration.
 
-Only this module knows the native H3 attention contract.  Mathematical branch and
+Only this module knows the native H3 attention contract. Mathematical branch and
 window implementations stay dependency-light in :mod:`branch` and :mod:`window`.
 """
 
@@ -21,13 +21,25 @@ _LOG = logging.getLogger("comfy.vdn_h3_private")
 _STATE_PATCH = "diffusion_model._vdn_h3_private_state"
 _WRAPPER_KEY = "vdn_h3_private.layout"
 
+# These tensors feed the recurrent retention gate.  The released implementation
+# evaluates that complete path in fp32 because tiny per-frame errors compound over
+# long clips.  Preserve the checkpoint dtype rather than blindly matching x.dtype.
+_PRESERVE_SOURCE_DTYPE = frozenset(
+    {
+        "alpha.A_log",
+        "alpha.dt_bias",
+        "alpha.down.weight",
+        "alpha.up.weight",
+    }
+)
+
 
 class ManagedBranchWeights(nn.Module):
     """Per-model branch storage with no process-global CUDA references.
 
     ``resident`` buffers are registered, so normal ``model.to(...)`` and ComfyUI
-    offload move them with the patched diffusion model.  ``stream`` storage remains
-    on CPU and returns ephemeral device copies for one block.  Both policies have an
+    offload move them with the patched diffusion model. ``stream`` storage remains
+    on CPU and returns ephemeral device copies for one block. Both policies have an
     explicit :meth:`release` operation.
     """
 
@@ -92,18 +104,23 @@ class ManagedBranchWeights(nn.Module):
                     f"VDN-H3 branch block {block_index} is missing requested weights {missing}"
                 )
             source = {key: source[key] for key in keys}
-        # No result is cached: streaming copies die after the block, and resident
-        # tensors are already managed buffers.  The full device identity is honored.
-        return {
-            key: tensor
-            if tensor.device == device and tensor.dtype == dtype
-            else tensor.to(
-                device=device,
-                dtype=dtype,
-                non_blocking=(device.type == "cuda" and tensor.device.type == "cpu" and tensor.is_pinned()),
-            )
-            for key, tensor in source.items()
-        }
+
+        result: dict[str, torch.Tensor] = {}
+        for key, tensor in source.items():
+            target_dtype = tensor.dtype if key in _PRESERVE_SOURCE_DTYPE else dtype
+            if tensor.device == device and tensor.dtype == target_dtype:
+                result[key] = tensor
+            else:
+                result[key] = tensor.to(
+                    device=device,
+                    dtype=target_dtype,
+                    non_blocking=(
+                        device.type == "cuda"
+                        and tensor.device.type == "cpu"
+                        and tensor.is_pinned()
+                    ),
+                )
+        return result
 
     def release(self) -> "ManagedBranchWeights":
         """Move resident buffers back to CPU; streaming storage is already there."""
@@ -113,7 +130,7 @@ class ManagedBranchWeights(nn.Module):
         return self
 
     def close(self) -> None:
-        """Drop all tensor references.  The patched model cannot run afterwards."""
+        """Drop all tensor references. The patched model cannot run afterwards."""
 
         if self._closed:
             return
@@ -254,16 +271,12 @@ def _normalise_and_rope(attn: Any, q: torch.Tensor, k: torch.Tensor, rope_freqs)
     qw = model_management.cast_to(attn.q_norm.weight, device=q.device)
     kw = model_management.cast_to(attn.k_norm.weight, device=k.device)
     rot = int(rope_freqs.shape[-3]) * 2
-    # Do not mutate raw q/k retained for the linear branch.
-    if getattr(model_management, "in_training", False):
-        q4, k4 = quant_ops.ck.rms_rope_split_half(
-            q4, k4, rope_freqs, qw, kw, epsilon=attn.q_norm.eps, rot_dim=rot
-        )
-    else:
-        q4, k4 = q4.clone(), k4.clone()
-        quant_ops.ck.rms_rope_split_half_(
-            q4, k4, rope_freqs, qw, kw, epsilon=attn.q_norm.eps, rot_dim=rot
-        )
+    # VDN needs the pre-norm/pre-RoPE q/k for its linear branch.  The out-of-place
+    # Comfy kernel writes the normalized/rotated pair directly, avoiding two full
+    # clone passes while leaving the raw fused-QKV buffer untouched.
+    q4, k4 = quant_ops.ck.rms_rope_split_half(
+        q4, k4, rope_freqs, qw, kw, epsilon=attn.q_norm.eps, rot_dim=rot
+    )
     return q4[0], k4[0]
 
 
@@ -299,7 +312,7 @@ def _dense_softmax(
         skip_reshape=True,
         transformer_options=transformer_options or {},
     )
-    # Comfy's skip_reshape contract is [B,S,H*D].  Canonicalising here is the
+    # Comfy's skip_reshape contract is [B,S,H*D]. Canonicalising here is the
     # crucial full-cover gate fix: [S,H*D] cannot broadcast with [S,H,1].
     if out.numel() != seq * heads * dim:
         raise RuntimeError(
@@ -367,15 +380,18 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
         linear_active = bool(config.get("linear_enabled", True)) and not layout.full_cover
         if linear_active:
             va, vb = layout.video_start, layout.video_end
-            q_video = q_raw[va:vb].clone()
-            k_video = k_raw[va:vb].clone()
-            v_video = value[va:vb].clone()
+            # Views are intentional.  _normalise_and_rope is out-of-place, and neither
+            # grouped SDPA nor FlexAttention mutates V.  Keeping these views avoids
+            # cloning almost the entire QKV volume before every transformer block.
+            q_video = q_raw[va:vb]
+            k_video = k_raw[va:vb]
+            v_video = value[va:vb]
             text_x = text_k = text_v = None
             if bool(getattr(branch, "enable_text_state", config.get("enable_text_state", False))):
                 ta, tb = layout.text_start, layout.text_start + layout.text_len
                 text_x = x[ta:tb]
-                text_k = k_raw[ta:tb].clone()
-                text_v = value[ta:tb].clone()
+                text_k = k_raw[ta:tb]
+                text_v = value[ta:tb]
 
         query, key = _normalise_and_rope(attn, q_raw, k_raw, rope_freqs)
         if layout.full_cover:
@@ -430,6 +446,12 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
             softmax_out = softmax_out * gate.to(dtype=softmax_out.dtype)
         out = attn.out_proj(softmax_out.reshape(layout.seq_len, -1).to(dtype=x.dtype))
 
+        # The local branch is finished.  Drop its full-sequence activations before
+        # allocating scan state and branch features.
+        del softmax_out, query, key, q_raw, k_raw, value
+        if gate_enabled:
+            del gate
+
         if linear_active:
             readout = branch.readout(
                 weights,
@@ -452,8 +474,12 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                 raise RuntimeError(
                     f"VDN branch block {block_index} is missing {exc.args[0]!r}"
                 ) from exc
-            # The linear branch is defined only for target-video rows.  Other packed
-            # modalities remain byte-for-byte on the softmax path.
+            # The linear branch is defined only for target-video rows. Other packed
+            # modalities remain byte-for-byte on the softmax path.  In training, clone
+            # before the slice update so autograd never observes an in-place mutation
+            # of out_proj's result; inference keeps the zero-copy update.
+            if torch.is_grad_enabled():
+                out = out.clone()
             out[layout.video_start : layout.video_end].add_(delta)
         return out
 

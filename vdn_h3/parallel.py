@@ -1,13 +1,10 @@
 """Optional exact overlap of the VDN linear branch with local softmax.
 
-The low-memory runtime intentionally evaluates the linear branch before RoPE so it can
-reuse the fused native QKV backing storage without keeping raw Q/K/V copies alive.
-Large-VRAM workstations can make the opposite trade: copy only the video/text raw rows,
-run the linear branch on a dedicated CUDA stream, and let the default stream execute
-RMSNorm+RoPE, window softmax and H3 out projection concurrently.
-
-This module is deliberately opt-in. It does not change VDN math, attention masks,
-adapter weights or precision; it only changes scheduling and consumes additional VRAM.
+The low-memory runtime evaluates the linear branch before RoPE so it can reuse native
+QKV storage. Large-VRAM workstations can make the opposite trade: copy compact raw
+video/text Q/K/V, run the far branch on a dedicated CUDA stream, and let the default
+stream execute fused QK preparation, window softmax and H3 output projection
+concurrently. The two branches join only at their trained sum.
 """
 
 from __future__ import annotations
@@ -22,7 +19,6 @@ import torch.nn.functional as F
 from .hybrid import (
     _STATE_PATCH,
     _WRAPPER_KEY,
-    _dense_softmax,
     _normalise_and_rope,
     _qkv,
     _window_softmax,
@@ -82,7 +78,7 @@ def _record_on_stream(tensor: torch.Tensor | None, stream: torch.cuda.Stream) ->
 
 
 def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
-    """Return a VDN attention forward that overlaps exact linear/softmax branches."""
+    """Overlap exact linear/softmax branches on resident large-VRAM execution."""
 
     serial_forward = make_serial_vdn_forward(attn, state, block_index)
     original_forward = attn.forward
@@ -98,9 +94,6 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
             )
         linear_active = bool(config.get("linear_enabled", True)) and not layout.full_cover
         run_inference = state.inference and not torch.is_grad_enabled()
-        # Parallel scheduling is a workstation optimization. Streamed/hybrid branch
-        # buffers have their own producer/consumer lifecycle and should keep using the
-        # serial low-memory spelling until specifically qualified.
         if (
             not linear_active
             or not run_inference
@@ -128,9 +121,8 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
         with state.diagnostics.scope("attention.qkv", x.device):
             q_raw, k_raw, value = _qkv(attn, x)
 
-        # Compact copies are the speed-for-memory trade that makes overlap possible:
-        # the main stream may now mutate full Q/K in-place for fused RMSNorm+RoPE while
-        # the branch stream consumes immutable raw features.
+        # These copies are the deliberate speed-for-memory trade. They preserve the
+        # pre-RoPE raw branch inputs while the main stream mutates the native Q/K views.
         with state.diagnostics.scope("parallel.raw_copy", x.device):
             q_video = q_raw[va:vb].clone()
             k_video = k_raw[va:vb].clone()
@@ -142,8 +134,6 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
         for tensor in (q_video, k_video, v_video, text_k, text_v):
             _record_on_stream(tensor, ctx.stream)
 
-        # Enqueue the complete branch on its own stream. Python returns after launches;
-        # the GPU can keep executing these kernels while the main stream enters softmax.
         try:
             with torch.cuda.stream(ctx.stream):
                 with state.diagnostics.scope("weights.transfer", x.device):
@@ -190,8 +180,6 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
                 state.mark_weights_consumed(block_index, x.device, x.dtype)
                 ctx.branch_done.record(ctx.stream)
         except Exception:
-            # A synchronous compile/dispatch failure is safest to recover by draining
-            # the auxiliary stream and delegating to the already-qualified serial path.
             try:
                 ctx.stream.synchronize()
             except Exception:
@@ -235,15 +223,19 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
                     weights.get("softmax_gate.up.bias"),
                 )
             ).reshape(layout.seq_len, heads, 1)
-            softmax_out.mul_(gate.to(dtype=softmax_out.dtype))
-            del gate
+            from .softmax_kernels import apply_softmax_gate
+            flat = apply_softmax_gate(softmax_out, gate, state, inference=True)
+            del gate, softmax_out
+        else:
+            flat = softmax_out.reshape(layout.seq_len, -1)
+            del softmax_out
 
         with state.diagnostics.scope("attention.out_proj", x.device):
-            out = attn.out_proj(softmax_out.reshape(layout.seq_len, -1).to(dtype=x.dtype))
-        del softmax_out
+            out = attn.out_proj(flat.to(dtype=x.dtype))
+        del flat
 
-        # The main stream only waits at the actual dependency point. Everything above
-        # is therefore available to overlap with the recurrent branch and its projection.
+        # Wait only at the actual mathematical dependency. QK prep, softmax, gate and
+        # out_proj above are free to overlap with the recurrent branch/projection.
         main_stream.wait_event(ctx.branch_done)
         with state.diagnostics.scope("parallel.join", x.device):
             out[va:vb].add_(linear_delta)
@@ -257,7 +249,7 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
 
 
 def apply_vdn_parallel(model_patcher: Any, state: Any):
-    """Install the same VDN model patch using the optional parallel scheduler."""
+    """Install VDN with the large-VRAM two-stream scheduler and full tuned block set."""
 
     _dm, blocks = validate_h3_model(model_patcher, len(state.branches))
     existing = getattr(model_patcher, "object_patches", {})
@@ -281,6 +273,8 @@ def apply_vdn_parallel(model_patcher: Any, state: Any):
             f"diffusion_model.blocks.{index}.attn.forward",
             make_parallel_vdn_forward(block.attn, state, index),
         )
+    from .block_kernels import install_block_fusions
+    install_block_fusions(model_patcher, state, blocks)
     try:
         from comfy.patcher_extension import WrappersMP
     except ImportError:

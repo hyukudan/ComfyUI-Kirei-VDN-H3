@@ -66,6 +66,18 @@ bicycle, and no obvious hard or repeated pattern artifacts; both 5.17-second MP4
 also contained non-silent AAC audio. Quality remains `pending` until full-motion and
 audio playback is reviewed, so these rows do not authorize a same-quality speed claim.
 
+### Release-scale stability validation (not an official benchmark row)
+
+After fixing the Flex K/V address overflow described in [Architecture](ARCHITECTURE.md),
+the canonical `vdn_dmd_bf16_8step_1344x768_345` workflow completed at 1344×768, 345
+frames and 8 NFE on 2026-09-04. `auto` selected FA2 from an exact-shape calibration
+(FA2 211.49 ms, grouped 219.48 ms, Flex 241.69 ms; both alternatives matched the
+grouped reference within the configured tolerance). Sampling took about 221.7 s and
+the whole ComfyUI prompt 281.15 s. Observed process VRAM was about 79,286 MiB and no
+new `nvlddmkm` event was recorded. The same visual workload with Larry v4 completed in
+about 490 s sampling / 536.23 s total. These are single end-to-end validation runs,
+not five-run warm medians, so the official canonical table row remains `pending`.
+
 ### Historical points (context only, not comparable)
 
 Recorded before the benchmark protocol existed; sampler and prompt were not captured and

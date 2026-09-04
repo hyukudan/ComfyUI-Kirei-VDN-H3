@@ -24,18 +24,23 @@ September 2026 audit against OpenVDN and current ComfyUI.
   as datacenter Blackwell: the FA4/CuTe decomposition is only assumed to win on
   sm_90/sm_100 (wgmma / tcgen05 kernels). On sm_120 flash-attn-4's mma.sync kernel stays
   a calibration candidate; the Runtime Report names the generation as `fa4_kernel`.
-- Attention dispatch estimates the K/V copies grouped attention would make for the
-  layout and picks Flex before autotuning when reference/keyframe rows make them too
-  large (REF2VA/I2V layouts).
+- Attention dispatch separates peak-memory risk from aggregate K/V-copy bandwidth.
+  Peak-risk layouts select Flex without attempting an unsafe calibration; bandwidth-only
+  warnings still calibrate the installed exact backends and persist the measured winner.
+- Flex now guards the real reachable storage offset of fused Q/K/V views before calling
+  Inductor. A 1344×768, 345-frame layout exceeded int32 only through its physical stride;
+  the generated K/V address arithmetic wrapped and caused repeatable driver MMU faults.
+  Dangerous views are made contiguous before Flex, while smaller zero-copy layouts stay
+  unchanged.
 - The fused block path compiles the SwiGLU whenever ComfyUI will not fuse it (every base
   that is not INT8).
 - `detect_base_precision` recognises NVFP4, MXFP8, W4A4 and W4A8 comfy-kitchen layouts.
 - `auto` branch placement budgets against total VRAM minus the base model size instead
   of the free VRAM seen before ComfyUI loads the base.
-- Flex: static shape-specialised kernels retained for speed and dynamo's recompile limit
-  raised to 64. The old limit fell back to eager Flex (a dense S x S score matrix) after
-  eight distinct packed lengths; dynamic kernels avoided that fallback but measured up
-  to about 2x slower on real RTX PRO 6000 H3 geometries.
+- Flex uses one dynamic compiled call and raises dynamo's recompile limit to 64. Static
+  specialisation let Inductor select unsafe int32 K/V offset arithmetic for large fused
+  H3 views; dynamic compilation plus the storage-offset guard keeps those addresses safe
+  and avoids eager Flex (a dense S x S score matrix) across changing packed lengths.
 - Calibration store v3: signatures include the node version, torch/CUDA/cuDNN/driver,
   Triton, flash-attn 2 / flash-attn-4 versions and the installed backend inventory, so a
   node update or a newly installed backend re-measures; v2 files are ignored. Automatic

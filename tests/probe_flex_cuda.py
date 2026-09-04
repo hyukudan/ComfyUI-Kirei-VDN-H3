@@ -3,8 +3,8 @@
     python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_flex_cuda.py
 
 1. Parity of Flex against the grouped oracle.
-2. Twelve distinct packed lengths through one WindowAttentionCache. The static kernels
-   must stay below the raised recompile limit instead of falling back to eager
+2. Twelve distinct packed lengths through one WindowAttentionCache. The dynamic call
+   must stay compiled instead of falling back to eager
    flex_attention, which materialises the full S x S score matrix. The loop runs with
    fail_on_recompile_limit_hit so a fallback is an exception, and the warm peak memory of
    every length is checked against the dense footprint.

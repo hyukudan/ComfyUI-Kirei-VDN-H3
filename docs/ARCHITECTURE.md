@@ -436,13 +436,15 @@ call.
 
 ### Flex compilation
 
-`flex_attention` is compiled with `dynamic=False` so Inductor specialises each packed
-shape. On the RTX PRO 6000 this is substantially faster than one dynamic kernel. Dynamo's
-recompile limit is raised to at least 64 before the first compile: past that limit dynamo
-runs the function eagerly, and eager Flex materialises the full S x S score matrix.
-Block masks remain cached per geometry. `tests/probe_flex_cuda.py` pushes twelve lengths
-through one cache with `fail_on_recompile_limit_hit` set to prove the specialised kernels
-remain compiled.
+`flex_attention` is compiled with `dynamic=True` so one call serves changing packed
+lengths. Dynamo's recompile limit is raised to at least 64 before the first compile: past
+that limit dynamo runs the function eagerly, and eager Flex materialises the full S x S
+score matrix. H3's Q/K/V are views into a fused projection whose physical row stride can
+make the reachable storage offset exceed int32 even when the logical view does not.
+Before Flex, the runtime computes that offset and makes only dangerous operands
+contiguous; this prevents Inductor's K/V address arithmetic from wrapping. Block masks
+remain cached per geometry. `tests/probe_flex_cuda.py` pushes twelve lengths through one
+cache with `fail_on_recompile_limit_hit` set to prove the dynamic call remains compiled.
 
 ### FA2 / FA4 decomposition
 
@@ -477,7 +479,8 @@ the mma.sync generation is an SM80-class kernel with 99 KB of shared memory on s
 it competes with grouped SDPA, Flex and FA2 and wins only by measurement. Before
 autotuning, `auto` also estimates the K/V copy volume
 grouped attention would need for the layout (every global row is copied into every
-window group) and selects Flex outright when the copies would exceed the guard; the
+window group), selects Flex outright only when one gather threatens free VRAM, and lets
+bandwidth-only warnings calibrate the exact candidates; the
 reason is reported as `attention_calibration.dispatch_reason`.
 
 ---

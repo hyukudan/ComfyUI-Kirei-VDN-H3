@@ -30,6 +30,7 @@ ATTENTION_BACKENDS = (
 
 DYNAMO_RECOMPILE_FLOOR = 64
 _RECOMPILE_LIMIT_NAMES = ("recompile_limit", "cache_size_limit")
+FLEX_INT32_INDEX_LIMIT = 1 << 31
 
 
 def _dynamo_config():
@@ -112,7 +113,7 @@ class WindowAttentionCache:
         if self._compiled is None and not self.is_broken("flex_compile"):
             try:
                 raise_recompile_limit()
-                self._compiled = torch.compile(flex_attention, dynamic=False)
+                self._compiled = torch.compile(flex_attention, dynamic=True)
             except Exception as exc:
                 self.mark_broken("flex_compile", exc)
         return self._compiled or flex_attention
@@ -429,18 +430,28 @@ def grouped_copy_bytes(
 
 def grouped_copies_too_large(device, peak_bytes: int, total_bytes: int) -> str | None:
     """Reason string when grouped attention should be skipped for this layout."""
+    if grouped_copy_peak_unsafe(device, peak_bytes):
+        return _grouped_copy_peak_reason(device, peak_bytes)
     if total_bytes > GROUPED_COPY_GUARD_TOTAL_BYTES:
         return f"grouped K/V copies would move {total_bytes / 2**30:.1f} GiB per layer"
+    return None
+
+
+def grouped_copy_peak_unsafe(device, peak_bytes: int) -> bool:
+    """Whether one grouped K/V gather threatens the currently free VRAM."""
     try:
         free, _total = torch.cuda.mem_get_info(device)
     except Exception:
-        return None
-    if peak_bytes > GROUPED_COPY_GUARD_FRACTION * free:
-        return (
-            f"one grouped K/V copy ({peak_bytes / 2**30:.1f} GiB) exceeds "
-            f"{GROUPED_COPY_GUARD_FRACTION:.0%} of free VRAM"
-        )
-    return None
+        return False
+    return int(peak_bytes) > GROUPED_COPY_GUARD_FRACTION * int(free)
+
+
+def _grouped_copy_peak_reason(device, peak_bytes: int) -> str:
+    free, _total = torch.cuda.mem_get_info(device)
+    return (
+        f"one grouped K/V copy ({peak_bytes / 2**30:.1f} GiB) exceeds "
+        f"{GROUPED_COPY_GUARD_FRACTION:.0%} of free VRAM ({free / 2**30:.1f} GiB)"
+    )
 
 
 def flex_available(cache: WindowAttentionCache | None = None) -> bool:
@@ -596,12 +607,8 @@ def resolve_attention_backend(
             video_end=video_end,
             tokens_per_frame=tokens_per_frame,
         )
-        calibrated = cache.calibration.lookup(signature)
-        if calibrated and _backend_available(calibrated, cache):
-            cache.last_calibration_hit = calibrated
-            cache.last_dispatch_reason = f"calibrated: {calibrated}"
-            return calibrated
-        cache.last_calibration_hit = None
+        copy_guard_reason = None
+        copy_peak_unsafe = False
         if (
             query.is_cuda
             and video_start is not None
@@ -612,13 +619,23 @@ def resolve_attention_backend(
             peak, total = grouped_copy_bytes(
                 query, num_frames, tokens_per_frame, bounds, anchor_frames, video_start, video_end
             )
-            reason = grouped_copies_too_large(query.device, peak, total)
-            if reason is not None:
-                # Many global rows (reference video, keyframes): grouped would copy them
-                # for every window and the autotune itself could OOM. Flex reads K/V in
-                # place through the block mask, so it is chosen without benchmarking.
-                cache.last_dispatch_reason = f"flex: {reason}"
+            copy_peak_unsafe = grouped_copy_peak_unsafe(query.device, peak)
+            copy_guard_reason = grouped_copies_too_large(query.device, peak, total)
+        calibrated = cache.calibration.lookup(signature)
+        if calibrated and _backend_available(calibrated, cache):
+            cache.last_calibration_hit = calibrated
+            if copy_peak_unsafe and calibrated != "flex":
+                cache.last_dispatch_reason = f"flex memory guard overrides calibrated {calibrated}: {copy_guard_reason}"
                 return "flex"
+            cache.last_dispatch_reason = f"calibrated: {calibrated}"
+            return calibrated
+        cache.last_calibration_hit = None
+        if copy_peak_unsafe:
+            # Many global rows (reference video, keyframes): grouped would copy them
+            # for every window and the autotune itself could OOM. Flex is chosen
+            # without benchmarking when the peak gather threatens free VRAM.
+            cache.last_dispatch_reason = f"flex: {copy_guard_reason}"
+            return "flex"
         tuned = _autotune_if_needed(
             query,
             num_frames,
@@ -633,11 +650,34 @@ def resolve_attention_backend(
             cache.last_calibration_hit = tuned
             cache.last_dispatch_reason = f"autotuned: {tuned}"
             return tuned
+        if copy_guard_reason is not None:
+            # A bandwidth-only guard is safe to calibrate. If calibration cannot run,
+            # Flex remains the conservative no-repeated-gather fallback.
+            cache.last_dispatch_reason = f"flex: {copy_guard_reason}"
+            return "flex"
     # CPU or a runtime with only grouped attention keeps the conservative heuristics.
     backend, why = _heuristic_backend(query, groups, cache)
     if cache is not None:
         cache.last_dispatch_reason = f"heuristic: {backend} ({why})"
     return backend
+
+
+def _flex_operand(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a BHSD Flex operand whose reachable storage offset fits int32.
+
+    Inductor's Flex template can emit int32 K/V row-offset arithmetic based on the
+    logical tensor size.  H3 Q/K/V are views of a fused projection, so their physical
+    row stride can overflow int32 even when the view itself has fewer than 2**31
+    elements.  A contiguous copy is required only for those dangerous layouts.
+    """
+    operand = tensor.transpose(0, 1).unsqueeze(0)
+    max_offset = sum(
+        max(int(size) - 1, 0) * abs(int(stride))
+        for size, stride in zip(operand.shape, operand.stride())
+    )
+    if max_offset >= FLEX_INT32_INDEX_LIMIT:
+        return operand.contiguous()
+    return operand
 
 
 def window_softmax_flex(
@@ -666,8 +706,8 @@ def window_softmax_flex(
         if cache is not None:
             cache.put(cache_key, block_mask)
     output = attention(
-        query.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
-        value.transpose(0, 1).unsqueeze(0), block_mask=block_mask, scale=scale,
+        _flex_operand(query), _flex_operand(key), _flex_operand(value),
+        block_mask=block_mask, scale=scale,
     )
     return output.squeeze(0).transpose(0, 1)
 

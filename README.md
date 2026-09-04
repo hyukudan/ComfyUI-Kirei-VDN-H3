@@ -131,7 +131,7 @@ reports every decision in the Runtime Report.
 | BF16 base | merged (one fp32 delta, one rounding: exact) | BF16 | resident | calibrated exact winner |
 | INT8 / FP8 / NVFP4 / MXFP8 base | exact activation-space bypass, `mlp.fc2` included | BF16 | resident | calibrated exact winner |
 | Not enough headroom (total VRAM minus the base model) | bypass | may follow an INT8/FP8 base | hybrid or stream + 5-frame exact tiles | calibrated exact winner |
-| Reference/keyframe rows make grouped attention copy too much | as above | as above | as above | Flex, chosen before autotune |
+| Reference/keyframe rows make grouped attention copy too much | as above | as above | as above | calibrated exact winner when the peak fits; Flex without calibration on peak-memory risk |
 
 Two rules behind the table. Merging an adapter into a quantized weight requantizes it and
 rounds part of the update away, which is the softening people see with merged LoRAs on
@@ -198,8 +198,10 @@ SageAttention switch does not touch the exact VDN windows unless you select
 
 **Native Windows.** flash-attn-4 is not installable (no `nvidia-cutlass-dsl` wheel), so
 the candidates are grouped SDPA, Flex through `triton-windows` and FA2 (`flash2`) when a
-wheel for your torch/CUDA is installed. The Runtime Report shows `fa4_available = false`
-next to `fa4_kernel`, the generation the card would run.
+wheel for your torch/CUDA is installed. Flex checks the reachable storage offset of H3's
+fused Q/K/V views and makes only an unsafe large view contiguous before Inductor can emit
+overflowing int32 K/V addressing. The Runtime Report shows `fa4_available = false` next
+to `fa4_kernel`, the generation the card would run.
 
 **24 GB cards.** `auto` moves to hybrid or streamed branch storage and exact 5-frame tiles
 when the budget requires it; `low_vram` forces that layout.
@@ -301,8 +303,8 @@ python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_flex_cuda.py
 
 The core probe uses q/k/v with the strides of the real fused projection, runs the real
 calibration into a scratch store and times grouped, Flex, FA2 and FA4. The Flex probe
-pushes twelve packed lengths through one cache to prove the static specialised kernels
-stay compiled instead of falling back to eager attention.
+pushes twelve packed lengths through one dynamic compiled call to prove it stays compiled
+instead of falling back to eager attention.
 
 ## Status
 

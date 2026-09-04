@@ -229,6 +229,67 @@ def test_grouped_copy_guard_reasons(monkeypatch):
     assert window.grouped_copies_too_large("cuda:0", 1 * gib, 2 * gib) is None
 
 
+@pytest.mark.parametrize("calibrated", [False, True])
+def test_bandwidth_guard_autotunes_when_peak_is_safe(monkeypatch, tmp_path, calibrated):
+    class FakeCudaQuery:
+        is_cuda = True
+        device = torch.device("cuda:0")
+        shape = (90_000, 56, 128)
+
+    cache = window.WindowAttentionCache()
+    cache.calibration = window.CalibrationStore(tmp_path / "cal.json")
+    bounds = window.window_bounds(40, 2, 5)
+    monkeypatch.setattr(window, "flex_available", lambda cache=None: True)
+    monkeypatch.setattr(window, "flash2_available", lambda cache=None: True)
+    monkeypatch.setattr(window, "calibration_signature", lambda *args, **kwargs: "large")
+    monkeypatch.setattr(window, "grouped_copy_bytes", lambda *args, **kwargs: (1, 9 * 1024**3))
+    monkeypatch.setattr(window, "grouped_copy_peak_unsafe", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        window, "grouped_copies_too_large", lambda *args, **kwargs: "9.0 GiB per layer"
+    )
+    monkeypatch.setattr(window, "_autotune_if_needed", lambda *args, **kwargs: "flash2")
+    if calibrated:
+        cache.calibration.record("large", winner="flex", results={})
+
+    resolved = window.resolve_attention_backend(
+        "auto", FakeCudaQuery(), 40, bounds, "both", cache,
+        video_start=10, video_end=89_990, tokens_per_frame=2_249,
+    )
+    assert resolved == ("flex" if calibrated else "flash2")
+    assert cache.last_dispatch_reason == (
+        "calibrated: flex" if calibrated else "autotuned: flash2"
+    )
+    assert window.resolve_attention_backend("flex", FakeCudaQuery(), 40, bounds, "both", cache) == "flex"
+
+
+def test_peak_memory_guard_forces_flex_without_autotuning(monkeypatch, tmp_path):
+    class FakeCudaQuery:
+        is_cuda = True
+        device = torch.device("cuda:0")
+        shape = (90_000, 56, 128)
+
+    cache = window.WindowAttentionCache()
+    cache.calibration = window.CalibrationStore(tmp_path / "cal.json")
+    bounds = window.window_bounds(40, 2, 5)
+    monkeypatch.setattr(window, "flex_available", lambda cache=None: True)
+    monkeypatch.setattr(window, "calibration_signature", lambda *args, **kwargs: "large")
+    monkeypatch.setattr(window, "grouped_copy_bytes", lambda *args, **kwargs: (4, 9))
+    monkeypatch.setattr(window, "grouped_copy_peak_unsafe", lambda *args, **kwargs: True)
+    monkeypatch.setattr(window, "grouped_copies_too_large", lambda *args, **kwargs: "peak risk")
+    monkeypatch.setattr(
+        window,
+        "_autotune_if_needed",
+        lambda *args, **kwargs: pytest.fail("autotune must not run under peak-memory risk"),
+    )
+
+    resolved = window.resolve_attention_backend(
+        "auto", FakeCudaQuery(), 40, bounds, "both", cache,
+        video_start=10, video_end=89_990, tokens_per_frame=2_249,
+    )
+    assert resolved == "flex"
+    assert cache.last_dispatch_reason == "flex: peak risk"
+
+
 def test_fa4_kernel_generation_follows_the_family(monkeypatch):
     cases = {
         (10, 0): ("tcgen05", True),
@@ -246,7 +307,7 @@ def test_fa4_kernel_generation_follows_the_family(monkeypatch):
         assert window.prefers_fa4("cuda:0") is first
 
 
-def test_flex_wrapper_compiles_static_and_raises_the_recompile_floor(monkeypatch):
+def test_flex_wrapper_compiles_dynamic_and_raises_the_recompile_floor(monkeypatch):
     import torch._dynamo.config as dynamo_config
 
     captured = {}
@@ -264,11 +325,28 @@ def test_flex_wrapper_compiles_static_and_raises_the_recompile_floor(monkeypatch
         return None
 
     assert cache.attention(sentinel) is sentinel
-    assert captured == {"dynamic": False}
+    assert captured == {"dynamic": True}
     assert window.recompile_limit() >= window.DYNAMO_RECOMPILE_FLOOR
     for name in ("recompile_limit", "cache_size_limit"):
         monkeypatch.setattr(dynamo_config, name, 512, raising=False)
     assert window.raise_recompile_limit() == 512  # never lowered
+
+
+def test_flex_operand_copies_only_when_reachable_offset_can_overflow_int32(monkeypatch):
+    sequence, heads, dim = 5, 2, 4
+    fused = torch.arange(sequence * 3 * heads * dim).reshape(sequence, 3 * heads * dim)
+    _q, key, _value = (part.view(sequence, heads, dim) for part in fused.split(heads * dim, dim=-1))
+
+    safe = window._flex_operand(key)
+    assert safe.shape == (1, heads, sequence, dim)
+    assert safe.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
+
+    monkeypatch.setattr(window, "FLEX_INT32_INDEX_LIMIT", 32)
+    guarded = window._flex_operand(key)
+    assert guarded.is_contiguous()
+    assert guarded.stride(-2) == dim
+    assert guarded.untyped_storage().data_ptr() != key.untyped_storage().data_ptr()
+    torch.testing.assert_close(guarded, key.transpose(0, 1).unsqueeze(0))
 
 
 def test_mask_mod_handles_global_and_anchor_geometry():

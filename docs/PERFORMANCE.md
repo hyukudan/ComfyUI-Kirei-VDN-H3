@@ -50,14 +50,21 @@ differ from the scenario. Sampler-only seconds, median of five warm runs, peak V
 
 | Date | GPU | torch / CUDA | ComfyUI | Base checkpoint | Scenario | Profile | Projection | Adapters | Attention | s / run (median) | s / NFE | Peak VRAM | Quality |
 |---|---|---|---|---|---|---|---|---|---|---:|---:|---:|---|
-| — | RTX PRO 6000 Blackwell 96 GB | — | — | — | `larry8_608x352_121` | — | — | Larry v4 @1.0 | — | pending | pending | pending | pending |
-| — | RTX PRO 6000 Blackwell 96 GB | — | — | — | `vdn_dmd_bf16_8step_608x352_121` | auto | bf16 | default 1 + turbo 1, bypass/merge | — | pending | pending | pending | pending |
-| — | RTX PRO 6000 Blackwell 96 GB | — | — | — | `vdn_dmd_bf16_8step_608x352_241` | auto | bf16 | default 1 + turbo 1 | — | pending | pending | pending | pending |
+| 2026-09-04 | RTX PRO 6000 Blackwell 96 GB | 2.12.0 / 13.0 | 0.34.0 | H3 pruned INT8/ConvRot | `larry8_608x352_121` | — | — | Larry v4 @1.0 | native dense | 9.061 s | 1.133 s | 39.43 GiB | pending |
+| 2026-09-04 | RTX PRO 6000 Blackwell 96 GB | 2.12.0 / 13.0 | 0.34.0 | H3 pruned INT8/ConvRot | `vdn_dmd_bf16_8step_608x352_121` | auto | bf16 | default 1 + turbo 1, bypass | Flex | 12.215 s | 1.527 s | 41.07 GiB | pending |
+| 2026-09-04 | RTX PRO 6000 Blackwell 96 GB | 2.12.0 / 13.0 | 0.34.0 | H3 pruned INT8/ConvRot | `larry8_608x352_241` | — | — | Larry v4 @1.0 | native dense | 23.089 s | 2.886 s | 40.53 GiB | pending |
+| 2026-09-04 | RTX PRO 6000 Blackwell 96 GB | 2.12.0 / 13.0 | 0.34.0 | H3 pruned INT8/ConvRot | `vdn_dmd_bf16_8step_608x352_241` | auto | bf16 | default 1 + turbo 1, bypass | Flex | 27.348 s | 3.419 s | 42.79 GiB | pending |
 | — | RTX PRO 6000 Blackwell 96 GB | — | — | — | `vdn_dmd_max_speed_8step_608x352_241` | max_speed | as resolved | merged | — | pending | pending | pending | pending |
 | — | RTX PRO 6000 Blackwell 96 GB | — | — | — | `vdn_dmd_bf16_8step_1344x768_345` | auto | bf16 | default 1 + turbo 1 | — | pending | pending | pending | pending |
 
 Fill the table from `benchmarks/results.jsonl` (`python benchmarks/compare_results.py
 benchmarks/results.jsonl`). Delete a placeholder row only when its measured row exists.
+
+The 2026-09-04 121-frame visual pair used the same prompt and seed. A 20-frame contact
+sheet showed continuous motion, stable subject/clothing, the requested cart vault and
+bicycle, and no obvious hard or repeated pattern artifacts; both 5.17-second MP4 files
+also contained non-silent AAC audio. Quality remains `pending` until full-motion and
+audio playback is reviewed, so these rows do not authorize a same-quality speed claim.
 
 ### Historical points (context only, not comparable)
 

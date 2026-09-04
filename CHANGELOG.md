@@ -50,6 +50,9 @@ September 2026 audit against OpenVDN and current ComfyUI.
 - Runtime Report: `adaln_fp32`, GPU family, attention `dispatch_reason`, and a
   video / text / other-global row breakdown of the packed layout.
 - Benchmark recorder requires the active adapter recipe and `lora_mode`.
+- Benchmark Scenario now exposes profile/projection as the same Comfy combo types used
+  by Apply, so the documented wiring passes prompt validation. Checkpoint metadata also
+  carries `turbo_num_steps` into the Runtime Report for strict recipe validation.
 - Runtime Report: `fa4_available` next to `fa4_kernel`, `backends_available`, the dynamo
   recompile limit and the calibration environment.
 

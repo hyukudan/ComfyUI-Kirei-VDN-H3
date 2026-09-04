@@ -1,0 +1,154 @@
+{
+  "attention": {
+    "auto_resolved": "flex",
+    "autotune_error": null,
+    "backend_failures": {},
+    "backends_available": {
+      "decomposed": false,
+      "flash2": true,
+      "flex": true,
+      "grouped": true
+    },
+    "calibration_hit": "flex",
+    "decomposed": {
+      "available": false
+    },
+    "dispatch_reason": "autotuned: flex",
+    "fa4_kernel": "mma_sync",
+    "flash2": {
+      "allclose": true,
+      "available": true,
+      "max_abs": 0.001953125,
+      "max_rel": 134.7549285888672,
+      "mean_abs": 7.682133582420647e-05,
+      "ms": 0.6929374994797399
+    },
+    "flex": {
+      "allclose": true,
+      "available": true,
+      "max_abs": 0.001953125,
+      "max_rel": 97.19876098632812,
+      "mean_abs": 4.063227606820874e-05,
+      "ms": 0.6532375009555835
+    },
+    "grouped_ms": 3.6860000000160653,
+    "groups": 9,
+    "shape": [
+      2144,
+      4,
+      64
+    ],
+    "strides": [
+      768,
+      64,
+      1
+    ]
+  },
+  "capability": [
+    12,
+    0
+  ],
+  "device": "cuda:0",
+  "free_bytes_end": 99226746880,
+  "free_bytes_start": 99977527296,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "quick": false,
+  "scan": {
+    "directions": [
+      {
+        "allclose": true,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0
+      },
+      {
+        "allclose": true,
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "mean_abs": 0.0
+      }
+    ],
+    "inference_ms": 1.929424999616458,
+    "shape": [
+      33,
+      8,
+      64,
+      64
+    ]
+  },
+  "streaming": {
+    "checks": [
+      {
+        "a_log_fp32": true,
+        "block": 0,
+        "dt_bias_fp32": true,
+        "expected": 1.0,
+        "mean": 1.0
+      },
+      {
+        "a_log_fp32": true,
+        "block": 1,
+        "dt_bias_fp32": true,
+        "expected": 2.0,
+        "mean": 2.0
+      },
+      {
+        "a_log_fp32": true,
+        "block": 2,
+        "dt_bias_fp32": true,
+        "expected": 3.0,
+        "mean": 3.0
+      },
+      {
+        "a_log_fp32": true,
+        "block": 3,
+        "dt_bias_fp32": true,
+        "expected": 4.0,
+        "mean": 4.0
+      }
+    ],
+    "mean_transfer_ms": 18.31882499755011,
+    "peak_allocated_bytes": 176599552,
+    "source_mib_per_block": 64,
+    "transfer_ms": [
+      39.59909999684896,
+      11.32550000329502,
+      10.994800002663396,
+      11.355899987393059
+    ]
+  },
+  "temporal": {
+    "compile": {
+      "allclose": true,
+      "broken_shapes": 0,
+      "compiled_graphs": 0,
+      "max_abs": 0.0078125,
+      "max_rel": 1502.99072265625,
+      "mean_abs": 0.0003254587354604155,
+      "ms": 0.029859998903702945
+    },
+    "conv1d": {
+      "allclose": true,
+      "max_abs": 0.0078125,
+      "max_rel": 1502.99072265625,
+      "mean_abs": 0.0002810921287164092,
+      "ms": 0.1355400003376417
+    },
+    "reference_ms": 0.2621666668953064,
+    "shape": [
+      33,
+      384,
+      512
+    ],
+    "triton": {
+      "allclose": true,
+      "available": true,
+      "max_abs": 0.0078125,
+      "max_rel": 1502.99072265625,
+      "mean_abs": 0.0003254587354604155,
+      "ms": 0.024293333990499377
+    }
+  },
+  "torch": "2.12.0+cu130",
+  "total_bytes": 102641500160
+}

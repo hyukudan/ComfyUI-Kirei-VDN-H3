@@ -8,7 +8,7 @@ Exact OpenVDN math · optimized single-GPU runtime · measured, not promised.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-7c3aed.svg)](https://github.com/comfyanonymous/ComfyUI)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-CPU%20pytest%20suite-2ea44f.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-142%20passed-2ea44f.svg)](tests)
 [![Upstream](https://img.shields.io/badge/upstream-OpenVDN%20vdn--minimax--h3-111827.svg)](https://github.com/OpenVDN/vdn-minimax-h3)
 
 <img src="docs/assets/dataflow.svg" alt="One VDN-H3 block: the local softmax window and the Video Delta Attention branch are gated and summed" width="900">
@@ -24,11 +24,54 @@ whole clip, and the Stage-B / Stage-DMD adapters.
 | | |
 |---|---|
 | **Faithful** | Window semantics, recurrence, gates, adapter placement and the AdaLN activation follow the OpenVDN reference. Adapters are never rounded into a quantized weight unless you ask for it. |
-| **Built for one GPU** | Resident branch weights, calibrated exact attention per geometry, fused pointwise kernels, Triton temporal conv, shared compile caches, hybrid/streamed storage and exact tiling for 24 GB cards. |
+| **Built for one GPU** | Resident branch weights, calibrated exact attention per geometry, fused pointwise kernels, Triton temporal conv, model-owned compile caches, hybrid/streamed storage and exact tiling for 24 GB cards. |
 | **Honest** | Every speed number lives in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) with its hardware, recipe and date. The benchmark nodes refuse a measurement whose recipe does not match. |
 
 > Model weights are not included. Follow the licenses of MiniMax-H3 and of the VDN-H3
 > checkpoint you use.
+
+## September 2026 audit snapshot
+
+The current `main` has been audited end to end on this native-Windows workstation:
+
+| Component | Audited configuration |
+|---|---|
+| GPU / driver | RTX PRO 6000 Blackwell 96 GB (sm_120) / 610.88 |
+| ComfyUI / Python | 0.34.0 / 3.12.9 |
+| PyTorch stack | torch 2.12.0+cu130, CUDA 13.0, cuDNN 9.2, `triton-windows` 3.7.1.post27 |
+| Attention extras | flash-attn 2.9.1; FA4 unavailable on native Windows |
+| Quantized kernels | comfy-kitchen 0.2.31 |
+
+The audit verified strict loading of the released Stage-DMD checkpoint, both required
+adapters, the pruned-base AdaLN curve asset, all 142 CPU tests, a cold Flex CUDA probe
+over 12 changing sequence lengths, and a complete 1344×768 · 345-frame render with
+video and audio. No new NVIDIA driver event occurred during the repaired Flex probes or
+the final full render.
+
+The crash seen before the fix was not an H3 “MMU mode”. It was an invalid GPU address:
+static Inductor Flex code used int32 row-offset arithmetic for K/V views of H3's fused
+QKV projection. At the release geometry the physical row stride was 21,504 elements and
+the reachable offset crossed 2³¹ near row 99,865, wrapping the pointer and producing
+`Graphics SM Warp Exception` / `MMU NACK` driver events. Flex now:
+
+1. compiles one dynamic-shape call;
+2. computes the real reachable storage offset of every Q/K/V operand; and
+3. makes only an operand that can cross the int32 boundary contiguous before dispatch.
+
+This repairs Flex itself. It is not a forced-FA2 workaround. For the canonical shape,
+`auto` then measured the three safe exact choices and selected the fastest one:
+
+| Exact-shape calibration, 104,115 tokens | Kernel time | Parity vs grouped |
+|---|---:|---|
+| FA2 | 211.49 ms | pass |
+| Grouped SDPA | 219.48 ms | reference |
+| Flex-Triton | 241.69 ms | pass |
+
+The resulting single stability run took about 221.7 s in the sampler and 281.15 s for
+the whole VDN prompt, with roughly 79,286 MiB observed process VRAM. The matched Larry
+run took about 490 s / 536.23 s. These are one-run diagnostic figures, not the required
+five-warm-run medians; the official canonical row therefore remains pending in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ---
 
@@ -203,6 +246,17 @@ fused Q/K/V views and makes only an unsafe large view contiguous before Inductor
 overflowing int32 K/V addressing. The Runtime Report shows `fa4_available = false` next
 to `fa4_kernel`, the generation the card would run.
 
+If the same machine also runs Unsloth or other Inductor/Triton workloads, give ComfyUI
+its own compile caches in the launcher. Replace `<ComfyUI>` with the installation path:
+
+```bat
+set "TORCHINDUCTOR_CACHE_DIR=<ComfyUI>\user\.cache\torchinductor-comfyui"
+set "TRITON_CACHE_DIR=<ComfyUI>\user\.cache\triton-comfyui"
+```
+
+Cache isolation prevents artifacts from unrelated Python runtimes being reused and makes
+diagnostics reproducible. It does not replace the Flex address fix above.
+
 **24 GB cards.** `auto` moves to hybrid or streamed branch storage and exact 5-frame tiles
 when the budget requires it; `low_vram` forces that layout.
 
@@ -257,7 +311,9 @@ H3 aligns the requested frame count to its temporal grid. That is not a quality 
 |---|---|---|
 | Hard, patterned or oversharpened frames | `res_multistep`, 4 steps on the 8-step checkpoint, or CFG > 1 | use the recipe above |
 | Soft output on an INT8/FP8 base | adapters merged (`max_speed` or `lora_mode = merge`) | `auto` or `lora_mode = bypass` |
-| Out of memory on the first run with reference images | grouped attention copies every global row into every window | check `attention_calibration.dispatch_reason`; force `attention_backend = flex` or use `low_vram` |
+| Driver reset with `Graphics SM Warp Exception` / `MMU NACK` at a large shape | an older static Flex kernel overflowed the physical K/V view offset | update the node; current Flex uses dynamic compilation plus the reachable-offset guard. Do not treat forcing FA2 as the fix |
+| Out of memory on the first run with reference images | grouped attention copies every global row into every window | update the node and check `attention_calibration.dispatch_reason`; current `auto` selects Flex before an unsafe peak-memory calibration, while `low_vram` also reduces model residency |
+| Kernels or failures appear to leak between ComfyUI and an LLM tool | both runtimes inherited one global Inductor/Triton cache | set the two ComfyUI-specific cache directories shown under Native Windows and restart ComfyUI |
 | Old attention winner after updating the node, torch or a backend | none: the calibration signature includes the node version, torch/CUDA/driver, Triton, flash-attn versions and the installed backends | a changed environment recalibrates by itself; delete `models/vdn/vdn_h3_calibration.json` to force it |
 | INT8 base is slow | torch build older than cu130: comfy-kitchen falls back | install a cu130+ build or use the `fp8_scaled` base |
 | Dropdown shows the placeholder instead of a checkpoint | the stage directory is not under `models/vdn` | move it there and refresh the node list |
@@ -308,8 +364,10 @@ instead of falling back to eager attention.
 
 ## Status
 
-0.3.0 is unreleased. The runtime is complete and unit-tested; the measured table for the
-RTX PRO 6000 is still being filled. Candidates that need a measured win **and** a passed
+0.3.0 is unreleased. The runtime is complete; the September 2026 audit is green for the
+142-test CPU suite, the 12-length cold Flex CUDA probe and the full 1344×768 · 345-frame
+stability render. The RTX PRO 6000 table is still being filled with five-run warm medians
+and reviewed quality results. Candidates that need a measured win **and** a passed
 quality gate before they enter `auto`: copy-free grouped attention, SageAttention on the
 local windows, NVFP4 projection, CUDA graphs on the branch, and a parity test against the
 OpenVDN reference implementation.

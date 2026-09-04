@@ -313,6 +313,9 @@ Kirei detects curve mode by either:
 
 When curve terms exist they are re-injected through `h3_silu_temb_grid.safetensors`.
 They must **not** be silently skipped merely because merge mode is selected.
+Keep the e-grid directly under `models/vdn` or in the selected stage directory. The
+legacy `ComfyUI-MiniMax-H3-Turbo` sibling path remains a compatibility fallback, not an
+installation requirement.
 
 Validate:
 
@@ -551,7 +554,9 @@ Check:
 
 - local VDN attention did not receive Sage/kitchen quantized override;
 - adapters were not merged into a quantized base (`adapters.lora_mode` is `bypass` on
-  INT8/FP8/NVFP4 bases) and `adaln_fp32` is true;
+  INT8/FP8/NVFP4 bases);
+- full AdaLN bases report `adaln_fp32 = true`; curve-form pruned bases instead report
+  non-zero `curve_factors` and use their native fp32 curve path;
 - adapter strengths are exactly 1.0 for the canonical Stage-DMD run;
 - curve AdaLN factors were not dropped;
 - projection precision is really BF16 in the fidelity test.

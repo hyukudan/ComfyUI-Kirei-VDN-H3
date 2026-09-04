@@ -63,6 +63,10 @@ September 2026 audit against OpenVDN and current ComfyUI.
   real qkv strides, the real calibration path and times FA2; the Flex probe is a
   twelve-length recompile regression. Windows notes: flash-attn-4 is not installable
   natively, Flex needs `triton-windows`.
+- Installation documents the checkpoint-local `h3_silu_temb_grid.safetensors` needed by
+  curve-form bases instead of relying silently on the legacy MiniMax-H3-Turbo sibling.
+- The quality checklist distinguishes the optional fp32-SiLU patch on full AdaLN bases
+  from the native fp32 curve path used by pruned bases.
 
 ## 0.2.0
 

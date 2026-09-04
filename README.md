@@ -52,6 +52,12 @@ hf download OpenVDN/vdn-minimax-h3 --include "stage-dmd-step-250/*" --local-dir 
 hf download OpenVDN/vdn-minimax-h3 --include "stage-b-step-2000/*"  --local-dir <ComfyUI>/models/vdn
 ```
 
+Pruned/curve-form H3 bases also need `h3_silu_temb_grid.safetensors` to apply the
+Stage-DMD AdaLN factors. Put one copy directly in `models/vdn` (preferred), or inside
+the selected stage directory. Existing installations of `ComfyUI-MiniMax-H3-Turbo`
+may already contain the same file; Kirei accepts that sibling location only as a legacy
+fallback.
+
 **3. Have the native MiniMax-H3 models** from
 [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3):
 
@@ -133,8 +139,11 @@ INT8/FP8 bases, so `auto` never does it. And a quantized backbone does not mean 
 VDN projection should be quantized: on the workstation measurements INT8 did not beat
 BF16, so quantized projections stay explicit experiments.
 
-The AdaLN modulation is activated from the fp32 time embedding, as OpenVDN's patched
-diffusers does; ComfyUI rounds it to BF16 first. `adaln_fp32` is on by default.
+On full AdaLN bases, the modulation is activated from the fp32 time embedding, as
+OpenVDN's patched diffusers does; ComfyUI otherwise rounds it to BF16 first. The
+`adaln_fp32` patch is on by default. Curve-form pruned bases already evaluate their
+AdaLN curve in fp32 without that SiLU patch, so their Runtime Report shows
+`adaln_fp32 = false` and non-zero `curve_factors`.
 
 ### Profiles
 
@@ -163,7 +172,7 @@ A profile name is not a benchmark result.
 | `tile_frames` | 0 … 64 | 0 lets the profile choose; N runs the branch in exact N-frame tiles |
 | `pin_strategy` | auto, comfy, all, none | pinned host memory for streamed branch weights |
 | `branch_execution` | auto, serial, parallel | parallel is an experimental second CUDA stream, resident weights only |
-| `adaln_fp32` | on / off | activate AdaLN from the fp32 time embedding; off only to A/B against the native path |
+| `adaln_fp32` | on / off | request fp32 AdaLN activation on full AdaLN bases; curve-form bases already use their fp32 curve path and do not install this patch |
 | `strict_validation` | on / off | check every branch tensor against the loaded H3 geometry before applying |
 | `diagnostics` | on / off | per-stage CUDA-event timings and memory in the Runtime Report |
 
@@ -230,7 +239,8 @@ the sampler output for a post-render report) and confirm:
 
 1. `euler` / `simple` / 8 steps / denoise 1.0 / CFG 1.0, shifts 12 / 3;
 2. `adapters.active = [default, turbo]`, both strengths 1.0;
-3. `adapters.lora_mode = bypass` on a quantized base, `adaln_fp32 = true`;
+3. `adapters.lora_mode = bypass` on a quantized base; full AdaLN bases report
+   `adaln_fp32 = true`, while curve-form bases report non-zero `curve_factors`;
 4. `projection = bf16` before any INT8/FP8 experiment;
 5. `attention_calibration` names an exact backend (grouped, flex, flash2, decomposed);
 6. Stage-B / 50 with `reference` separates architecture problems from distillation ones.

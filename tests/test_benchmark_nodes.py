@@ -10,6 +10,7 @@ from vdn_h3.benchmark_nodes import (
     _resolve_scenario,
     _sampling_plan,
 )
+from vdn_h3.nodes import KireiApplyVDNH3
 
 
 def _cpu_model():
@@ -76,6 +77,12 @@ def test_benchmark_sampling_node_is_registered_and_describes_sampler_outputs():
     assert "model" in schema["required"]
     assert "scenario_id" in schema["required"]
     assert KireiBenchmarkSampling.RETURN_TYPES[:2] == ("SAMPLER", "SIGMAS")
+
+
+def test_benchmark_scenario_runtime_controls_match_apply_combo_types():
+    apply_inputs = KireiApplyVDNH3.INPUT_TYPES()
+    assert KireiBenchmarkScenario.RETURN_TYPES[11] == apply_inputs["required"]["profile"][0]
+    assert KireiBenchmarkScenario.RETURN_TYPES[12] == apply_inputs["optional"]["projection_precision"][0]
 
 
 def test_benchmark_start_requires_verified_recipe_token():

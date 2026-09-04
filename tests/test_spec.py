@@ -168,6 +168,27 @@ def test_load_validates_complete_branch_and_adapter_inventory(tmp_path):
     assert loaded.config["delta_rule"] == "vdn_solve"
 
 
+def test_load_exposes_declared_turbo_recipe_metadata(tmp_path):
+    root, ckpt, states = _checkpoint(tmp_path)
+    _write_json(ckpt / "metadata.json", {"metadata": {"turbo_num_steps": 8}})
+
+    loaded = load_vdn_checkpoint(
+        ckpt, roots=[root], tensor_loader=lambda path: states[path]
+    )
+
+    assert loaded.config["turbo_num_steps"] == 8
+
+
+def test_load_rejects_invalid_turbo_recipe_metadata(tmp_path):
+    root, ckpt, states = _checkpoint(tmp_path)
+    _write_json(ckpt / "metadata.json", {"metadata": {"turbo_num_steps": 0}})
+
+    with pytest.raises(ValueError, match="turbo_num_steps"):
+        load_vdn_checkpoint(
+            ckpt, roots=[root], tensor_loader=lambda path: states[path]
+        )
+
+
 def test_load_refuses_unknown_or_wrong_shape_branch_tensor(tmp_path):
     root, ckpt, states = _checkpoint(tmp_path, with_adapter=False)
     branch_path = str(ckpt / "linear_branch" / "model.safetensors")

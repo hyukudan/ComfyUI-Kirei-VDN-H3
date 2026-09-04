@@ -33,9 +33,14 @@ from typing import Any
 
 import torch
 
+from .nodes import _PROFILES
+from .projection import PROJECTION_PRECISIONS
+
 
 _TOKEN_TYPE = "KIREI_BENCHMARK_TOKEN"
 _RECIPE_TOKEN_TYPE = "KIREI_BENCHMARK_RECIPE"
+_PROFILE_TYPE = list(_PROFILES)
+_PROJECTION_TYPE = ["auto", *PROJECTION_PRECISIONS]
 _SCENARIOS_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "scenarios.json"
 
 
@@ -255,7 +260,7 @@ class KireiBenchmarkScenario:
 
     RETURN_TYPES = (
         "STRING", "STRING", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT",
-        "STRING", "STRING", "FLOAT", "STRING", "STRING", "BOOLEAN", "FLOAT", "STRING",
+        "STRING", "STRING", "FLOAT", _PROFILE_TYPE, _PROJECTION_TYPE, "BOOLEAN", "FLOAT", "STRING",
     )
     RETURN_NAMES = (
         "scenario_id",

@@ -177,6 +177,25 @@ def _read_json(path: str) -> dict[str, Any]:
     return value
 
 
+def _checkpoint_recipe_metadata(root: str) -> dict[str, Any]:
+    """Load the small inference-recipe fields shipped beside released weights."""
+    path = os.path.join(root, "metadata.json")
+    if not os.path.isfile(path):
+        return {}
+    if not _contained(path, root):
+        raise ValueError("metadata.json realpath escapes the checkpoint")
+    payload = _read_json(path)
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata.json metadata must be an object")
+    result = {}
+    if "turbo_num_steps" in metadata:
+        result["turbo_num_steps"] = _require_int(
+            metadata["turbo_num_steps"], "metadata.turbo_num_steps", minimum=1
+        )
+    return result
+
+
 def _require_bool(value: Any, where: str) -> bool:
     if type(value) is not bool:
         raise ValueError(f"{where} must be a resolved bool, got {value!r}")
@@ -480,7 +499,7 @@ def load_vdn_checkpoint(
     """Load and strictly validate an exploded VDN checkpoint without a tensor cache."""
     inventory = inventory_checkpoint(path, roots=roots)
     spec = validate_model_spec(_read_json(inventory.spec_file))
-    cfg = transform_config(spec)
+    cfg = {**transform_config(spec), **_checkpoint_recipe_metadata(inventory.root)}
     if tensor_loader is None:
         from safetensors.torch import load_file
         tensor_loader = load_file

@@ -32,6 +32,7 @@ from .auxiliary import create_auxiliary_patcher, unload_auxiliary
 _LOG = logging.getLogger("comfy.vdn_h3")
 _INJECTION_KEY = "vdn_h3_lora_bypass"
 _ADDITIONAL_KEY = "vdn_h3_lora_factors"
+_OWNER_STATE_KEY = "_vdn_h3_bypass_owner_state"
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,10 @@ class _BypassHook:
         self.module = module
         self.adapter = adapter
         self.original_forward = None
+        # Bound-method identity is not stable across attribute reads. Keep the exact
+        # callable assigned to the module so eject can distinguish our hook from an
+        # unrelated hook installed after it.
+        self.installed_forward = self._forward
 
     def _forward(self, x, *args, **kwargs):
         base_out = self.original_forward(x, *args, **kwargs)
@@ -226,14 +231,143 @@ class _BypassHook:
         return self.adapter.apply(x, base_out)
 
     def inject(self):
-        if self.original_forward is None:
-            self.original_forward = self.module.forward
-            self.module.forward = self._forward
+        if self.original_forward is not None:
+            if self.module.forward is self.installed_forward:
+                return False
+            raise RuntimeError(
+                "VDN-H3 bypass hook lost ownership of module.forward while active"
+            )
+        original_forward = self.module.forward
+        self.module.forward = self.installed_forward
+        self.original_forward = original_forward
+        return True
 
     def eject(self):
-        if self.original_forward is not None:
-            self.module.forward = self.original_forward
-            self.original_forward = None
+        if self.original_forward is None:
+            return False
+        if self.module.forward is not self.installed_forward:
+            raise RuntimeError(
+                "VDN-H3 bypass will not overwrite an unrelated module.forward hook"
+            )
+        original_forward = self.original_forward
+        self.module.forward = original_forward
+        self.original_forward = None
+        return True
+
+
+class _BypassHookSet:
+    """One clone's hooks, installed and removed as a LIFO transaction."""
+
+    def __init__(self, hooks: Iterable[_BypassHook]):
+        self.hooks = list(hooks)
+
+    def inject(self):
+        injected = []
+        try:
+            for hook in self.hooks:
+                if hook.inject():
+                    injected.append(hook)
+        except Exception:
+            try:
+                for hook in reversed(injected):
+                    hook.eject()
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "VDN-H3 bypass injection failed and its LIFO rollback also failed"
+                ) from rollback_exc
+            raise
+
+    def eject(self):
+        ejected = []
+        try:
+            for hook in reversed(self.hooks):
+                if hook.eject():
+                    ejected.append(hook)
+        except Exception:
+            try:
+                # Restore the original injection order after a partial reverse eject.
+                for hook in reversed(ejected):
+                    hook.inject()
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "VDN-H3 bypass ejection failed and its rollback also failed"
+                ) from rollback_exc
+            raise
+
+
+class _BypassOwnerState:
+    """Coordinates bypass ownership across ModelPatchers sharing one inner model."""
+
+    def __init__(self):
+        self.active: _BypassHookSet | None = None
+
+    def activate(self, hook_set: _BypassHookSet):
+        previous = self.active
+        if previous is hook_set:
+            return
+        if previous is None:
+            hook_set.inject()
+            self.active = hook_set
+            return
+
+        previous.eject()
+        try:
+            hook_set.inject()
+        except Exception:
+            try:
+                previous.inject()
+            except Exception as rollback_exc:
+                self.active = None
+                raise RuntimeError(
+                    "VDN-H3 bypass takeover failed and the previous owner could not be restored"
+                ) from rollback_exc
+            raise
+        self.active = hook_set
+
+    def deactivate(self, hook_set: _BypassHookSet):
+        # ComfyUI may eject a stale clone after another clone has taken ownership.
+        # That callback must never tear down the active clone's hooks.
+        if self.active is not hook_set:
+            return
+        hook_set.eject()
+        self.active = None
+
+
+def _shared_owner_state(model_patcher: Any) -> _BypassOwnerState:
+    owner = getattr(model_patcher, "model", model_patcher)
+    state = getattr(owner, _OWNER_STATE_KEY, None)
+    if state is None:
+        state = _BypassOwnerState()
+        setattr(owner, _OWNER_STATE_KEY, state)
+    elif not isinstance(state, _BypassOwnerState):
+        raise RuntimeError("VDN-H3 bypass owner state is incompatible")
+    return state
+
+
+def _install_owner_injection(model_patcher: Any, hooks: Iterable[_BypassHook]):
+    """Install an owner callback even when this clone has no bypass factors.
+
+    A merge-only clone still shares its inner model with any previously loaded bypass
+    clone. Its empty hook set must therefore take ownership and eject the old hooks.
+    """
+    try:
+        from comfy.patcher_extension import PatcherInjection
+    except ImportError as exc:
+        raise RuntimeError("VDN-H3 LoRA bypass requires ComfyUI PatcherInjection") from exc
+
+    hook_set = _BypassHookSet(hooks)
+    owner_state = _shared_owner_state(model_patcher)
+
+    def inject_all(_patcher):
+        owner_state.activate(hook_set)
+
+    def eject_all(_patcher):
+        owner_state.deactivate(hook_set)
+
+    model_patcher.set_injections(
+        _INJECTION_KEY,
+        [PatcherInjection(inject=inject_all, eject=eject_all)],
+    )
 
 
 def swiglu(hidden: torch.Tensor) -> torch.Tensor:
@@ -320,6 +454,7 @@ def _compute_dtype(model_patcher: Any) -> torch.dtype:
 def install_bypass(model_patcher: Any, factors: Iterable[WeightedFactor]):
     factors = list(factors)
     if not factors:
+        _install_owner_injection(model_patcher, ())
         return 0, None
     grouped: dict[str, list[WeightedFactor]] = defaultdict(list)
     for weighted in factors:
@@ -353,23 +488,7 @@ def install_bypass(model_patcher: Any, factors: Iterable[WeightedFactor]):
         else:
             hooks.append(_BypassHook(module, adapter))
 
-    try:
-        from comfy.patcher_extension import PatcherInjection
-    except ImportError as exc:
-        raise RuntimeError("VDN-H3 LoRA bypass requires ComfyUI PatcherInjection") from exc
-
-    def inject_all(_patcher):
-        for hook in hooks:
-            hook.inject()
-
-    def eject_all(_patcher):
-        for hook in reversed(hooks):
-            hook.eject()
-
-    model_patcher.set_injections(
-        _INJECTION_KEY,
-        [PatcherInjection(inject=inject_all, eject=eject_all)],
-    )
+    _install_owner_injection(model_patcher, hooks)
     _LOG.info(
         "VDN-H3 installed %d low-rank bypass terms across %d modules",
         len(factors), len(hooks),

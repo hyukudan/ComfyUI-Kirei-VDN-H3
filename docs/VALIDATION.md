@@ -208,6 +208,19 @@ The suite covers, among other things:
 - e-grid AdaLN reinjection;
 - benchmark recipe enforcement.
 
+Native Comfy lifecycle smoke (still CPU-only):
+
+```bash
+python tools/smoke_native_bypass_lifecycle.py --comfy-root <ComfyUI>
+```
+
+This uses the installed ComfyUI's real `ModelPatcher.clone()`, `inject_model()` and
+`eject_model()` methods with its real `PatcherInjection`, but only wraps a tiny CPU
+linear layer. It verifies repeated bypass injection, `A -> B -> A` ownership, stale
+ejects, and the bypass-to-merge/empty transition. A pass does not validate MiniMax-H3
+weights, quantized kernels, CUDA execution, generated-image quality, or prove that a
+particular visual regression was caused by bypass lifecycle stacking.
+
 ### Level B — synthetic CUDA probes
 
 Core runtime:

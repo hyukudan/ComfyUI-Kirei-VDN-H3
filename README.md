@@ -302,6 +302,7 @@ Weights** frees the caches explicitly; the legacy node id keeps old workflows lo
 - [`docs/VALIDATION.md`](docs/VALIDATION.md): recipes, quality gates and the acceptance checklist.
 - [`benchmarks/README.md`](benchmarks/README.md): scenarios, recorder and comparison tooling.
 - [`CHANGELOG.md`](CHANGELOG.md).
+- [`docs/ROADMAP.md`](docs/ROADMAP.md): what is done, what the first measurements say, what is pending and in which order.
 
 Tests run on CPU without a GPU or ComfyUI: `python -m pytest -q`. The GPU probes run
 with the Python that runs ComfyUI, from any directory:
@@ -319,12 +320,14 @@ instead of falling back to eager attention.
 
 ## Status
 
-0.3.0 is unreleased. The runtime is complete and covered by the CPU suite, CUDA backend
-probes and a release-scale end-to-end validation. The measured hardware table is still
-being filled with five-run warm medians and reviewed quality results. Candidates that
-need a measured win **and** a passed quality gate before they enter `auto`: copy-free
-grouped attention, SageAttention on the local windows, NVFP4 projection, CUDA graphs on
-the branch, and a parity test against the OpenVDN reference implementation.
+0.3.0 is unreleased. The runtime is complete and covered by the CPU suite, the CUDA
+probes and a release-scale end-to-end validation on the RTX PRO 6000. The first measured
+rows say two things: at 608×352 VDN is still slower than the Larry v4 control at 121 and
+241 frames, where the FLOP model predicts parity, and at the canonical 1344×768 · 345
+frames a single run finished about 2.2× faster than the same control. Quality review is
+pending on every row, so no same-quality speed claim is made yet. The ordered list of
+what is left, with the measurement that closes each item, is
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Credits and license
 

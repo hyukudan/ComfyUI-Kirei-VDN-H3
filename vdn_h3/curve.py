@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -60,16 +61,45 @@ def _egrid_candidates(path: str | None, checkpoint_root: str | None):
     yield from emit(custom_nodes / "ComfyUI-MiniMax-H3-Turbo" / _EGRID_NAME)
 
 
-def load_egrid(path: str | None = None, *, checkpoint_root: str | None = None) -> torch.Tensor:
+def _load_affine_grid(checkpoint_root, table):
+    from safetensors import safe_open
+
+    source = Path(checkpoint_root) / "adaln_affine.safetensors"
+    with safe_open(str(source), framework="pt", device="cpu") as handle:
+        basis = handle.get_tensor("adaln_basis").to(torch.float32)
+        mean = handle.get_tensor("adaln_mean").to(torch.float32)
+        metadata = handle.metadata() or {}
+        source_table = next((handle.get_tensor(k) for k in ("adaln_t_table", "time_embedder.table") if k in handle.keys()), None)
+    table = table.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if table.ndim != 2 or basis.ndim != 2 or mean.ndim != 1 or basis.shape != (table.shape[1], mean.numel()):
+        raise ValueError(f"AdaLN affine dimensions in {source} do not match the loaded H3 curve table")
+    if not torch.isfinite(basis).all() or not torch.isfinite(mean).all():
+        raise ValueError(f"non-finite AdaLN affine in {source}")
+    if source_table is not None and not torch.equal(source_table.to(torch.float32), table):
+        raise ValueError(f"AdaLN affine in {source} belongs to a different H3 curve table")
+    declared_hash = metadata.get("adaln_table_sha256")
+    if declared_hash is not None:
+        digest = hashlib.sha256(str(tuple(table.shape)).encode() + table.numpy().tobytes()).hexdigest()
+        if declared_hash != digest:
+            raise ValueError(f"AdaLN affine table hash in {source} does not match the loaded H3 base")
+    return (table @ basis + mean).contiguous()
+
+
+def load_egrid(path: str | None = None, *, checkpoint_root: str | None = None, table: torch.Tensor | None = None) -> torch.Tensor:
     candidates = list(_egrid_candidates(path, checkpoint_root))
     source = next(
         (candidate for candidate in candidates if candidate.is_file() and candidate.suffix.lower() == ".safetensors"),
         None,
     )
     if source is None:
+        if path is None and checkpoint_root is not None and table is not None:
+            affine_path = Path(checkpoint_root) / "adaln_affine.safetensors"
+            if affine_path.is_file():
+                return _load_affine_grid(checkpoint_root, table)
         searched = ", ".join(str(candidate) for candidate in candidates) or _EGRID_NAME
         raise FileNotFoundError(
-            "pruned H3 AdaLN adapters require h3_silu_temb_grid.safetensors. "
+            "pruned H3 AdaLN adapters require h3_silu_temb_grid.safetensors "
+            "or a matching checkpoint-local adaln_affine.safetensors. "
             f"Searched: {searched}"
         )
     from safetensors.torch import load_file
@@ -249,7 +279,7 @@ def apply_curve_adapters(model_patcher, vdn_state, terms, *, egrid_path: str | N
             "pruned H3 AdaLN structure was detected but the shared adaln_t_table is missing"
         )
     curve_state = CurveAdapterState(
-        load_egrid(egrid_path, checkpoint_root=getattr(vdn_state, "checkpoint_root", None)),
+        load_egrid(egrid_path, checkpoint_root=getattr(vdn_state, "checkpoint_root", None), table=dm.adaln_t_table),
         terms,
         storage_dtype=_compute_dtype(model_patcher),
     )

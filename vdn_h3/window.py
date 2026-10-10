@@ -296,6 +296,8 @@ def window_softmax_grouped(
             count = rows.stop - rows.start
             output[rows] = dense[offset : offset + count]
             offset += count
+        del dense, global_queries
+    del global_q_parts
     for first_frame, stop_frame, selected_frames in _window_runs(num_frames, bounds, anchor_frames):
         row_start = video_start + first_frame * tokens_per_frame
         row_stop = video_start + stop_frame * tokens_per_frame
@@ -308,6 +310,7 @@ def window_softmax_grouped(
         output[row_start:row_stop] = _sdpa(
             query[row_start:row_stop], selected_key, selected_value, scale, transformer_options
         )
+        del selected_key, selected_value
     return output
 
 

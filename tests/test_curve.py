@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import pytest
+from safetensors.torch import save_file
 
 from vdn_h3.adapters import FactorPatch
 from vdn_h3.curve import (
@@ -7,7 +9,38 @@ from vdn_h3.curve import (
     curve_runtime_scope,
     is_curve_h3_base,
     make_curve_adaln_forward,
+    load_egrid,
 )
+from vdn_h3 import curve
+
+
+def test_affine_companion_recovers_matching_dense_grid(tmp_path, monkeypatch):
+    monkeypatch.setattr(curve, '_egrid_candidates', lambda *args: iter(()))
+    table = torch.tensor([[0.0, 0.0], [1.0, 2.0], [3.0, 4.0]])
+    basis = torch.tensor([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]])
+    mean = torch.tensor([0.1, 0.2, 0.3])
+    save_file({'adaln_basis': basis, 'adaln_mean': mean, 'adaln_t_table': table}, str(tmp_path / 'adaln_affine.safetensors'))
+    grid = load_egrid(checkpoint_root=str(tmp_path), table=table)
+    torch.testing.assert_close(grid, table @ basis + mean)
+    with pytest.raises(ValueError, match='different H3 curve table'):
+        load_egrid(checkpoint_root=str(tmp_path), table=table + 1)
+
+
+def test_egrid_remains_preferred_over_affine_companion(tmp_path, monkeypatch):
+    path = tmp_path / 'h3_silu_temb_grid.safetensors'
+    expected = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    save_file({'silu_t_emb_grid': expected}, str(path))
+    monkeypatch.setattr(curve, '_egrid_candidates', lambda *args: iter([path]))
+    (tmp_path / 'adaln_affine.safetensors').write_bytes(b'invalid')
+    torch.testing.assert_close(load_egrid(checkpoint_root=str(tmp_path), table=torch.zeros(2, 2)), expected)
+
+
+@pytest.mark.parametrize('metadata,basis', [({'adaln_table_sha256': 'wrong'}, torch.ones(2, 3)), ({}, torch.full((2, 3), float('nan')))])
+def test_affine_companion_rejects_wrong_identity_or_invalid_values(tmp_path, monkeypatch, metadata, basis):
+    monkeypatch.setattr(curve, '_egrid_candidates', lambda *args: iter(()))
+    save_file({'adaln_basis': basis, 'adaln_mean': torch.zeros(3)}, str(tmp_path / 'adaln_affine.safetensors'), metadata=metadata)
+    with pytest.raises(ValueError, match='table hash|non-finite'):
+        load_egrid(checkpoint_root=str(tmp_path), table=torch.zeros(3, 2))
 
 
 class TinyAdaln(nn.Module):

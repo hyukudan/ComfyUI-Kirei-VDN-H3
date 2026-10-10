@@ -4,12 +4,38 @@ from __future__ import annotations
 
 import sys
 import types
+import weakref
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from vdn_h3 import window
+
+
+def test_grouped_releases_finished_attention_buffers(monkeypatch):
+    q, k, v = [torch.randn(12, 2, 4) for _ in range(3)]
+    live_buffers = []
+    calls = 0
+    original_sdpa = window._sdpa
+
+    def checked_sdpa(q_rows, k_rows, v_rows, scale, transformer_options=None):
+        nonlocal calls
+        assert all(ref() is None for ref in live_buffers)
+        live_buffers.clear()
+        result = original_sdpa(q_rows, k_rows, v_rows, scale, transformer_options)
+        live_buffers.append(weakref.ref(result))
+        if k_rows is not k:
+            live_buffers.extend((weakref.ref(k_rows), weakref.ref(v_rows)))
+        calls += 1
+        return result
+
+    monkeypatch.setattr(window, '_sdpa', checked_sdpa)
+    bounds = window.window_bounds(8, 1)
+    result = window.window_softmax_grouped(q, k, v, 2, 10, 8, 1, bounds, 0.5)
+    torch.testing.assert_close(result, _dense_oracle(q, k, v, 2, 10, 8, 1, bounds, 0.5, 'none'))
+    assert calls > 2
+    assert all(ref() is None for ref in live_buffers)
 
 
 def _dense_oracle(q, k, v, video_start, video_end, frames, per_frame, bounds, scale, anchors):

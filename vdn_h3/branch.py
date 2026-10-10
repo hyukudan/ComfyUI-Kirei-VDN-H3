@@ -153,7 +153,10 @@ def _frame_stats_prep_body(key_by_frame, value_by_frame, beta):
     return key16, key32, weighted_key32, weighted_value
 
 
-def frame_statistics(
+_STATISTICS_WORKSPACE_BYTES = 1 << 30
+
+
+def _frame_statistics_unbatched(
     key_by_frame: torch.Tensor,
     value_by_frame: torch.Tensor,
     beta: torch.Tensor,
@@ -188,6 +191,45 @@ def frame_statistics(
             matrix_a = (weighted_key.transpose(-1, -2) @ key16).float()
         matrix_a = 0.5 * (matrix_a + matrix_a.transpose(-1, -2))
         matrix_b = (weighted_value.transpose(-1, -2) @ key16).float()
+    return matrix_a, matrix_b
+
+
+def frame_statistics(
+    key_by_frame: torch.Tensor,
+    value_by_frame: torch.Tensor,
+    beta: torch.Tensor,
+    a_fp32: bool = True,
+    *,
+    inference: bool = False,
+    compiler_cache: BranchCompilerCache | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if key_by_frame.ndim != 4 or value_by_frame.shape != key_by_frame.shape:
+        raise ValueError("key and value must share shape [frames, heads, tokens, dim]")
+    if beta.shape != key_by_frame.shape[:-1]:
+        raise ValueError("beta must have shape [frames, heads, tokens]")
+    frames, heads, tokens, dim = key_by_frame.shape
+    per_frame = heads * tokens * (
+        dim * (key_by_frame.element_size() + 8)
+        + 2 * value_by_frame.shape[-1] * value_by_frame.element_size()
+    )
+    batch = max(1, _STATISTICS_WORKSPACE_BYTES // max(1, per_frame))
+    if frames <= batch:
+        return _frame_statistics_unbatched(
+            key_by_frame, value_by_frame, beta, a_fp32,
+            inference=inference, compiler_cache=compiler_cache,
+        )
+    matrix_a = torch.empty(
+        (frames, heads, dim, dim), device=key_by_frame.device, dtype=torch.float32
+    )
+    matrix_b = torch.empty_like(matrix_a)
+    for start in range(0, frames, batch):
+        stop = min(start + batch, frames)
+        a_chunk, b_chunk = _frame_statistics_unbatched(
+            key_by_frame[start:stop], value_by_frame[start:stop], beta[start:stop], a_fp32,
+            inference=inference, compiler_cache=compiler_cache,
+        )
+        matrix_a[start:stop].copy_(a_chunk)
+        matrix_b[start:stop].copy_(b_chunk)
     return matrix_a, matrix_b
 
 

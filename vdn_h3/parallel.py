@@ -17,8 +17,10 @@ import torch
 import torch.nn.functional as F
 
 from .hybrid import (
+    _COMPILER_WRAPPER_KEY,
     _STATE_PATCH,
     _WRAPPER_KEY,
+    _without_comfy_compiler,
     _normalise_and_rope,
     _qkv,
     _window_softmax,
@@ -71,10 +73,7 @@ def release_parallel_contexts(state: Any) -> None:
 
 def _record_on_stream(tensor: torch.Tensor | None, stream: torch.cuda.Stream) -> None:
     if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
-        try:
-            tensor.record_stream(stream)
-        except Exception:
-            pass
+        tensor.record_stream(stream)
 
 
 def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
@@ -249,6 +248,8 @@ def make_parallel_vdn_forward(attn: Any, state: Any, block_index: int):
 
 
 def apply_vdn_parallel(model_patcher: Any, state: Any):
+    from comfy.patcher_extension import WrappersMP
+
     """Install VDN with the large-VRAM two-stream scheduler and full tuned block set."""
 
     _dm, blocks = validate_h3_model(model_patcher, len(state.branches))
@@ -277,14 +278,11 @@ def apply_vdn_parallel(model_patcher: Any, state: Any):
     install_block_fusions(model_patcher, state, blocks)
     from .adaln import install_adaln_fp32
     install_adaln_fp32(model_patcher, state, _dm)
-    try:
-        from comfy.patcher_extension import WrappersMP
-    except ImportError:
-        wrapper_type = "diffusion_model"
-    else:
-        wrapper_type = WrappersMP.DIFFUSION_MODEL
     model_patcher.add_wrapper_with_key(
-        wrapper_type, _WRAPPER_KEY, make_layout_wrapper(state)
+        WrappersMP.DIFFUSION_MODEL, _WRAPPER_KEY, make_layout_wrapper(state)
+    )
+    model_patcher.add_wrapper_with_key(
+        WrappersMP.APPLY_MODEL, _COMPILER_WRAPPER_KEY, _without_comfy_compiler
     )
     return model_patcher
 

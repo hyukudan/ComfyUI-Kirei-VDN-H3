@@ -1,0 +1,63 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "torch": "2.12.0+cu130",
+  "rows": [
+    {
+      "frames": 37,
+      "tokens_per_frame": 209,
+      "memory_cleanup_bitwise_equal": true,
+      "batch3_max_abs": 0.0,
+      "batch3_relative_rmse": 0.0,
+      "before": {
+        "median_ms": 11.448320388793945,
+        "extra_peak_mib": 343.724609375
+      },
+      "memory_cleanup": {
+        "median_ms": 11.476991653442383,
+        "extra_peak_mib": 239.0126953125
+      },
+      "vela_batch3_candidate": {
+        "median_ms": 11.998208045959473,
+        "extra_peak_mib": 825.04296875
+      }
+    },
+    {
+      "frames": 37,
+      "tokens_per_frame": 510,
+      "memory_cleanup_bitwise_equal": true,
+      "batch3_max_abs": 0.0,
+      "batch3_relative_rmse": 0.0,
+      "before": {
+        "median_ms": 42.4714241027832,
+        "extra_peak_mib": 775.98828125
+      },
+      "memory_cleanup": {
+        "median_ms": 43.217918395996094,
+        "extra_peak_mib": 551.8525390625
+      },
+      "vela_batch3_candidate": {
+        "median_ms": 46.13017654418945,
+        "extra_peak_mib": 1878.7890625
+      }
+    },
+    {
+      "frames": 43,
+      "tokens_per_frame": 920,
+      "memory_cleanup_bitwise_equal": true,
+      "batch3_max_abs": 0.0,
+      "batch3_relative_rmse": 0.0,
+      "before": {
+        "median_ms": 154.08639526367188,
+        "extra_peak_mib": 1438.3125
+      },
+      "memory_cleanup": {
+        "median_ms": 153.67372131347656,
+        "extra_peak_mib": 1052.5478515625
+      },
+      "vela_batch3_candidate": {
+        "median_ms": 161.8329620361328,
+        "extra_peak_mib": 3386.609375
+      }
+    }
+  ]
+}

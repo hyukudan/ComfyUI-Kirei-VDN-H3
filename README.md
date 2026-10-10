@@ -58,6 +58,16 @@ the selected stage directory. Existing installations of `ComfyUI-MiniMax-H3-Turb
 may already contain the same file; Kirei accepts that sibling location only as a legacy
 fallback.
 
+If no embedding grid is installed, Kirei also accepts a matching
+`<VDN stage>/adaln_affine.safetensors` companion with `adaln_basis` and `adaln_mean`.
+The small [published companions](https://huggingface.co/multimodalart/MiniMax-H3-Pruned)
+use `transformer/adaln_affine.safetensors` for FL2VA/T2VA and
+`transformer_ref/adaln_affine.safetensors` for Ref2VA. Install only the one matching
+your H3 base. A supplied curve table or `adaln_table_sha256` is verified against the
+loaded base; published files without either are treated as an explicit stage-local
+companion. The original embedding grid remains preferred when both are present.
+This adds portability, not a claim that affine reconstruction improves image quality.
+
 **3. Have the native MiniMax-H3 models** from
 [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3):
 
@@ -138,6 +148,13 @@ rounds part of the update away, which is the softening people see with merged Lo
 INT8/FP8 bases, so `auto` never does it. And a quantized backbone does not mean the new
 VDN projection should be quantized: on the workstation measurements INT8 did not beat
 BF16, so quantized projections stay explicit experiments.
+
+Kirei keeps long clips predictable by batching the temporary frame-statistics workspace
+instead of scaling that preparation allocation with the full sequence. Its model call is
+also scoped away from ComfyUI's allocation-graph compiler before the model call, with the
+user's compiler setting restored after success or failure. This does not disable Kirei's
+separate `torch.compile` policy. Completed global-attention output, selected window K/V
+and materialized branch readout are released before later attention allocations.
 
 On full AdaLN bases, the modulation is activated from the fp32 time embedding, as
 OpenVDN's patched diffusers does; ComfyUI otherwise rounds it to BF16 first. The
@@ -259,6 +276,27 @@ the sampler output for a post-render report) and confirm:
 6. Stage-B / 50 with `reference` separates architecture problems from distillation ones.
 
 H3 aligns the requested frame count to its temporal grid. That is not a quality failure.
+
+---
+
+## Comparison with VDN-H3-Plus and VELA
+
+The October 2026 review compared current source, not just repository versions.
+
+| Feature | Kirei decision |
+|---|---|
+| [VDN-H3-Plus](https://github.com/xmarre/ComfyUI-VDN-H3-Plus) compact AdaLN affine companion | Supported as a fallback when the full embedding grid is absent; table identities are checked when supplied. |
+| Pre-RoPE linear complement and compiler guard | Already present locally; buffer lifetimes and failure restoration now have regression tests. |
+| VDN-H3-Plus mixed-grid / Flow-Aligned Regenerate interfaces | Not implemented. Kirei consumes native uniform H3 packing; do not assume external progressive-grid workflows are compatible. |
+| Pre-quantized full VDN branch files | Not supported. Use the original OpenVDN BF16 stage; Kirei's INT8/FP8 projection options are separate runtime experiments. |
+| [VELA](https://github.com/Speach1sdef178/ComfyUI-VELA-H3) three-window batching | An exact analogue was slower and allocated more temporary memory on the tested RTX 4090 geometries; not enabled. |
+| VELA selective Sage / exact attention islands | Not ported. `auto` remains exact. `compat` allows Comfy attention overrides but does not reproduce VELA's trajectory policy. |
+| VELA anchor-column pruning and retained research caches | Not enabled; these change the trained operator or resource lifetime and need separate decoded-video validation. |
+
+The RTX 4090 buffer-lifetime probe reduced temporary peak allocations by **105–386 MiB**
+with bit-identical BF16 attention output in three geometries. These are attention-only
+measurements, not full-video speed or quality claims. See
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and limits.
 
 ---
 

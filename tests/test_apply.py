@@ -13,7 +13,7 @@ from vdn_h3.apply import (
     apply_factor_patches,
     clone_and_apply,
 )
-from vdn_h3.hybrid import VDNState, apply_vdn
+from vdn_h3.hybrid import VDNState, _without_comfy_compiler, apply_vdn
 
 
 class TinyAttn(nn.Module):
@@ -91,6 +91,36 @@ def test_clone_and_apply_does_not_mutate_source_modelpatcher():
     assert source.wrappers == []
     assert "diffusion_model.blocks.0.attn.forward" in result.object_patches
     assert "diffusion_model._vdn_h3_state" in result.object_patches
+
+
+def test_comfy_compiler_switch_is_scoped(monkeypatch):
+    import comfy.cli_args
+
+    monkeypatch.setattr(comfy.cli_args.args, "disable_comfy_compiler", False)
+    seen = []
+
+    def executor():
+        seen.append(comfy.cli_args.args.disable_comfy_compiler)
+        return 7
+
+    assert _without_comfy_compiler(executor) == 7
+    assert seen == [True]
+    assert comfy.cli_args.args.disable_comfy_compiler is False
+
+
+@pytest.mark.parametrize('previous', [False, True])
+def test_comfy_compiler_switch_is_restored_on_failure(monkeypatch, previous):
+    import comfy.cli_args
+
+    monkeypatch.setattr(comfy.cli_args.args, 'disable_comfy_compiler', previous)
+
+    def executor():
+        assert comfy.cli_args.args.disable_comfy_compiler is True
+        raise RuntimeError('sample failed')
+
+    with pytest.raises(RuntimeError, match='sample failed'):
+        _without_comfy_compiler(executor)
+    assert comfy.cli_args.args.disable_comfy_compiler is previous
 
 
 def test_existing_attention_patch_is_rejected_instead_of_overwritten():

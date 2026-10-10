@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+import weakref
 
 import torch
 import torch.nn as nn
@@ -7,6 +7,32 @@ import torch.nn.functional as F
 from vdn_h3.hybrid import ManagedBranchWeights, VDNState, make_vdn_forward
 from vdn_h3.layout import VDNLayout, publish_layout
 from vdn_h3.window import window_bounds
+from vdn_h3 import hybrid
+
+
+def test_inference_readout_is_released_before_softmax(monkeypatch):
+    branch = Branch(False)
+    readouts = []
+    original_readout = branch.readout
+    original_normalise = hybrid._normalise_and_rope
+
+    def tracked_readout(*args, **kwargs):
+        result = original_readout(*args, **kwargs)
+        readouts.append(weakref.ref(result))
+        return result
+
+    def checked_normalise(*args, **kwargs):
+        assert readouts and readouts[0]() is None
+        return original_normalise(*args, **kwargs)
+
+    monkeypatch.setattr(branch, 'readout', tracked_readout)
+    monkeypatch.setattr(hybrid, '_normalise_and_rope', checked_normalise)
+    attn = TinyAttention()
+    x = torch.randn(5, 4)
+    state = VDNState('tiny', {'enable_softmax_gate': False}, [branch], 2, 2, inference=True)
+    with torch.inference_mode(), publish_layout(layout(4, full=False)):
+        result = make_vdn_forward(attn, state, 0)(x)
+    assert result.shape == x.shape
 
 
 class RMS(nn.Module):

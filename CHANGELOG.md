@@ -7,6 +7,10 @@ September 2026 audit against OpenVDN and current ComfyUI.
 
 ### Fidelity
 
+- Pruned bases can use a matching checkpoint-local `adaln_affine.safetensors` when
+  no full embedding grid is installed. Supplied table/hash identities are checked;
+  existing grid-based execution remains preferred.
+
 - **Exact `mlp.fc2` adapter terms.** The turbo adapter targets `ff.net.2` in every
   block; those factors were always merged into the weight (a requantization on
   INT8/FP8 bases) even in bypass mode. They now run as an exact activation-space term
@@ -19,6 +23,15 @@ September 2026 audit against OpenVDN and current ComfyUI.
   INT8/FP8 projections are explicit experiments.
 
 ### Runtime
+
+- Release finished global-attention output, selected window K/V and materialized
+  branch readout before the next allocation. Attention arithmetic and dispatch are
+  unchanged. RTX 4090 BF16 window probes matched bit-for-bit and reduced temporary
+  peak allocations by 105–386 MiB across the three tested geometries.
+- Scope the allocation-graph compiler guard at `APPLY_MODEL` and restore the
+  previous switch on exceptions, including when the user had already disabled it.
+- Bound frame-statistics preparation workspace in long clips without changing the
+  per-frame equations. Existing serial and parallel application paths use the guard.
 
 - Consumer/workstation Blackwell (sm_120: RTX 50xx, RTX PRO 6000) is no longer treated
   as datacenter Blackwell: the FA4/CuTe decomposition is only assumed to win on

@@ -36,6 +36,18 @@ def test_frame_statistics_matches_direct_equations():
     torch.testing.assert_close(matrix_a, matrix_a.transpose(-1, -2))
 
 
+def test_frame_statistics_batched_matches_unbatched(monkeypatch):
+    torch.manual_seed(9)
+    key = torch.randn(5, 2, 4, 3)
+    value = torch.randn_like(key)
+    beta = torch.sigmoid(torch.randn(5, 2, 4))
+    expected = branch.frame_statistics(key, value, beta)
+    monkeypatch.setattr(branch, "_STATISTICS_WORKSPACE_BYTES", 1)
+    actual = branch.frame_statistics(key, value, beta)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
 def test_bidirectional_scans_match_naive_recurrence():
     torch.manual_seed(3)
     frames, heads, dim = 5, 2, 4

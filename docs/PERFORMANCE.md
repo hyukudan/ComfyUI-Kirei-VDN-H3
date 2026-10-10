@@ -43,6 +43,34 @@ model predicts. Three things follow:
 
 ## 2. Measured results
 
+### October 10, 2026: attention buffer lifetime probe
+
+RTX 4090 24 GB, Windows, PyTorch 2.12.0+cu130. Synthetic BF16 Q/K/V, 56 heads,
+head dimension 128, 512 global rows, checkpoint windows (radius 1, chunk 5), both
+anchor rows and columns. One warm-up followed by five CUDA-event measurements;
+the table shows medians and peak additional allocated memory above live inputs.
+The before/after functions used the same tensors and native exact SDPA dispatch.
+
+| Latent frames | Tokens/frame | Before ms | After ms | Before peak MiB | After peak MiB | Output |
+|---:|---:|---:|---:|---:|---:|---|
+| 37 | 209 | 11.45 | 11.48 | 343.72 | 239.01 | bit-identical |
+| 37 | 510 | 42.47 | 43.22 | 775.99 | 551.85 | bit-identical |
+| 43 | 920 | 154.09 | 153.67 | 1438.31 | 1052.55 | bit-identical |
+
+This validates an allocation reduction of 105–386 MiB in grouped attention. It is
+not an end-to-end generation benchmark or evidence of a rendering-speed gain.
+The materialized linear readout lifetime has a regression test but is not included
+in these attention-only measurements.
+
+An independent exact three-window batching analogue inspired by VELA produced the
+same outputs but measured 12.00 / 46.13 / 161.83 ms and 825.04 / 1878.79 / 3386.61 MiB
+in the same order. It was not enabled. This experiment did not evaluate VELA's
+full Sage/critical-island policy or reproduce its retained-buffer implementation.
+
+Raw measurements: [`benchmarks/attention_memory_20261010.json`](../benchmarks/attention_memory_20261010.json).
+
+### End-to-end generation protocol
+
 Every row must come from `benchmarks/record_result.py`, which refuses a measurement
 whose sampler, scheduler, NFE, denoise, shifts, profile, resolved precision or adapters
 differ from the scenario. Sampler-only seconds, median of five warm runs, peak VRAM from

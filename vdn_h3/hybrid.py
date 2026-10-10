@@ -20,6 +20,7 @@ from .weights import FP8_STREAMED_PROJECTION_KEY, ManagedBranchWeights, STREAMED
 _LOG = logging.getLogger("comfy.vdn_h3")
 _STATE_PATCH = "diffusion_model._vdn_h3_state"
 _WRAPPER_KEY = "vdn_h3.layout"
+_COMPILER_WRAPPER_KEY = "vdn_h3.compiler"
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,22 @@ def make_layout_wrapper(state: VDNState):
     return wrapper
 
 
+def _without_comfy_compiler(executor, *args, **kwargs):
+    try:
+        import comfy.cli_args
+    except ImportError:
+        return executor(*args, **kwargs)
+    args_state = comfy.cli_args.args
+    if not hasattr(args_state, "disable_comfy_compiler"):
+        return executor(*args, **kwargs)
+    previous = args_state.disable_comfy_compiler
+    args_state.disable_comfy_compiler = True
+    try:
+        return executor(*args, **kwargs)
+    finally:
+        args_state.disable_comfy_compiler = previous
+
+
 def _qkv(attn: Any, x: torch.Tensor):
     heads, head_dim = int(attn.heads), int(attn.head_dim)
     inner = heads * head_dim
@@ -435,6 +452,7 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
                             skip_ends=(layout.anchor_frames == "both"), inference=True,
                         )
                         linear_delta = projector(readout.to(dtype=x.dtype))
+                        del readout
                     else:
                         linear_delta = projected(
                             branch_weights, x[va:vb], q_raw[va:vb], k_raw[va:vb], value[va:vb],
@@ -575,6 +593,8 @@ def validate_h3_model(model_patcher: Any, block_count: int | None = None):
 
 
 def apply_vdn(model_patcher: Any, state: VDNState):
+    from comfy.patcher_extension import WrappersMP
+
     _dm, blocks = validate_h3_model(model_patcher, len(state.branches))
     existing = getattr(model_patcher, "object_patches", {})
     if _STATE_PATCH in existing:
@@ -601,13 +621,12 @@ def apply_vdn(model_patcher: Any, state: VDNState):
     install_block_fusions(model_patcher, state, blocks)
     from .adaln import install_adaln_fp32
     install_adaln_fp32(model_patcher, state, _dm)
-    try:
-        from comfy.patcher_extension import WrappersMP
-    except ImportError:
-        wrapper_type = "diffusion_model"
-    else:
-        wrapper_type = WrappersMP.DIFFUSION_MODEL
-    model_patcher.add_wrapper_with_key(wrapper_type, _WRAPPER_KEY, make_layout_wrapper(state))
+    model_patcher.add_wrapper_with_key(
+        WrappersMP.DIFFUSION_MODEL, _WRAPPER_KEY, make_layout_wrapper(state)
+    )
+    model_patcher.add_wrapper_with_key(
+        WrappersMP.APPLY_MODEL, _COMPILER_WRAPPER_KEY, _without_comfy_compiler
+    )
     return model_patcher
 
 
@@ -617,5 +636,6 @@ __all__ = [
     "apply_vdn",
     "make_layout_wrapper",
     "make_vdn_forward",
+    "_without_comfy_compiler",
     "validate_h3_model",
 ]

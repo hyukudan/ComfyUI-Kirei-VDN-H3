@@ -10,6 +10,13 @@
 - Saganaki22/ComfyUI-VDN-H3 — Apache-2.0 ComfyUI integration reference.
   - Used for compatibility comparison around native MiniMax-H3 target mapping,
     grouped/Flex attention, adapter application and INT8/ConvRot integration.
+- xmarre/ComfyUI-VDN-H3-Plus — Apache-2.0 compatibility reference for the published
+  AdaLN affine companion format, curve-table identity checks and attention buffer
+  lifetimes. The local fallback reconstructs the embedding grid and retains Kirei's
+  existing adapter execution; it does not copy Plus's affine projection runtime.
+- Speach1sdef178/ComfyUI-VELA-H3 — Apache-2.0 research reference for grouped-window
+  batching and selective exact/approximate attention. No VELA approximation policy,
+  environment overrides or retained research runtime is included in Kirei.
 
 This project is an independent ComfyUI implementation. Adapted source and algorithms
 retain the applicable copyright and license notices.

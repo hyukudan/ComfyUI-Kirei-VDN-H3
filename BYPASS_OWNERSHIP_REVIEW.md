@@ -1,6 +1,8 @@
 # Bypass clone ownership regression — 2026-09-05
 
-Local audited implementation, not yet deployed to the running ComfyUI installation.
+Historical audit. The ownership fix was integrated into `main` and the running
+ComfyUI installation on October 10, 2026. The current full suite passes 155 tests;
+the counts below describe the original September audit.
 
 The prior code guarded individual hook instances, but distinct ModelPatcher clones share
 one inner model and create different hook objects. Injecting a second clone without ejecting

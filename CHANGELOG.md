@@ -57,7 +57,7 @@ September 2026 audit against OpenVDN and current ComfyUI.
 - Calibration store v3: signatures include the node version, torch/CUDA/cuDNN/driver,
   Triton, flash-attn 2 / flash-attn-4 versions and the installed backend inventory, so a
   node update or a newly installed backend re-measures; v2 files are ignored. Automatic
-  calibration averages three steady calls instead of trusting one sub-millisecond sample.
+  automatic calibration averages two steady calls instead of trusting one sub-millisecond sample.
 - Dispatch reason rewritten on every resolution (`explicit`, `calibrated`, `flex` guard,
   `autotuned`, `heuristic`); it no longer survives a calibration hit.
 

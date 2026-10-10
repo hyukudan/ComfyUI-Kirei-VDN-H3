@@ -3,7 +3,7 @@
 # Kirei VDN-H3
 
 **VideoDeltaNet for native ComfyUI MiniMax-H3.**
-Exact OpenVDN math · optimized single-GPU runtime · measured, not promised.
+OpenVDN semantics · exact attention dispatch · optimized single-GPU runtime.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-7c3aed.svg)](https://github.com/comfyanonymous/ComfyUI)
@@ -23,7 +23,7 @@ whole clip, and the Stage-B / Stage-DMD adapters.
 
 | | |
 |---|---|
-| **Faithful** | Window semantics, recurrence, gates, adapter placement and the AdaLN activation follow the OpenVDN reference. Adapters are never rounded into a quantized weight unless you ask for it. |
+| **Faithful** | Window semantics, recurrence, gates, adapter placement and the AdaLN activation follow the OpenVDN design. Tests use Kirei's own reference oracles; automated parity against OpenVDN source is pending. |
 | **Built for one GPU** | Resident branch weights, calibrated exact attention per geometry, fused pointwise kernels, Triton temporal conv, model-owned compile caches, hybrid/streamed storage and exact tiling for 24 GB cards. |
 | **Honest** | Every speed number lives in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) with its hardware, recipe and date. The benchmark nodes refuse a measurement whose recipe does not match. |
 
@@ -133,28 +133,32 @@ in the architecture, window semantics or AdaLN handling, not in the distillation
 
 ## What `auto` decides
 
-`auto` is quality-first. It only takes a faster route when that route is exact, and it
-reports every decision in the Runtime Report.
+`auto` is quality-first: its attention and adapter paths stay exact, and its resident
+projection stays BF16. On hybrid/stream INT8 or FP8 bases it may quantize the VDN
+projection to reduce storage and transfers. That choice is approximate; the Runtime
+Report shows the selected `projection.precision`.
 
 | Situation | Adapters | VDN projection | Branch storage | Local attention |
 |---|---|---|---|---|
 | BF16 base | merged (one fp32 delta, one rounding: exact) | BF16 | resident | calibrated exact winner |
 | INT8 / FP8 / NVFP4 / MXFP8 base | exact activation-space bypass, `mlp.fc2` included | BF16 | resident | calibrated exact winner |
-| Not enough headroom (total VRAM minus the base model) | bypass | may follow an INT8/FP8 base | hybrid or stream + 5-frame exact tiles | calibrated exact winner |
+| Not enough headroom (total VRAM minus the base model) | bypass | may follow an INT8/FP8 base | hybrid or stream; 5-frame exact tiles on cards ≤ 32 GB | calibrated exact winner |
 | Reference/keyframe rows make grouped attention copy too much | as above | as above | as above | calibrated exact winner when the peak fits; Flex without calibration on peak-memory risk |
 
 Two rules behind the table. Merging an adapter into a quantized weight requantizes it and
 rounds part of the update away, which is the softening people see with merged LoRAs on
 INT8/FP8 bases, so `auto` never does it. And a quantized backbone does not mean the new
 VDN projection should be quantized: on the workstation measurements INT8 did not beat
-BF16, so quantized projections stay explicit experiments.
+BF16, so resident quantized projections stay explicit experiments.
 
 Kirei keeps long clips predictable by batching the temporary frame-statistics workspace
 instead of scaling that preparation allocation with the full sequence. Its model call is
 also scoped away from ComfyUI's allocation-graph compiler before the model call, with the
 user's compiler setting restored after success or failure. This does not disable Kirei's
-separate `torch.compile` policy. Completed global-attention output, selected window K/V
-and materialized branch readout are released before later attention allocations.
+separate `torch.compile` policy. Grouped attention releases completed global output and
+selected window K/V before its next allocation. The materialized branch readout is
+released after projection and before softmax; FA2/FA4 buffer lifetimes are a separate
+optimization candidate.
 
 On full AdaLN bases, the modulation is activated from the fp32 time embedding, as
 OpenVDN's patched diffusers does; ComfyUI otherwise rounds it to BF16 first. The
@@ -253,8 +257,9 @@ the extra projection cost as much as the attention they replace.
 | 1280×736 · 145 f | 1.38× |
 | 1344×768 · 345 f | 2.53× (OpenVDN measured 2.65× on a B200) |
 
-Where VDN wins, the time is in the block GEMMs and the local softmax; the linear branch
-is 6-8 % of the block. The model, the measured table and the protocol are in
+The FLOP model puts the linear branch at 6–8 % of block computation; this is not its
+share of runtime. One 768p run with compile off measured about 20 % of warm block time.
+The model, the measured table and the protocol are in
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). If VDN is slower than the base at a geometry
 where the model says it should win, it is a profiler result, not a property of VDN:
 check cold vs warm, the attention backend, the projection precision and the branch
@@ -290,13 +295,19 @@ The October 2026 review compared current source, not just repository versions.
 | VDN-H3-Plus mixed-grid / Flow-Aligned Regenerate interfaces | Not implemented. Kirei consumes native uniform H3 packing; do not assume external progressive-grid workflows are compatible. |
 | Pre-quantized full VDN branch files | Not supported. Use the original OpenVDN BF16 stage; Kirei's INT8/FP8 projection options are separate runtime experiments. |
 | [VELA](https://github.com/Speach1sdef178/ComfyUI-VELA-H3) three-window batching | An exact analogue was slower and allocated more temporary memory on the tested RTX 4090 geometries; not enabled. |
-| VELA selective Sage / exact attention islands | Not ported. `auto` remains exact. `compat` allows Comfy attention overrides but does not reproduce VELA's trajectory policy. |
+| VELA selective Sage / exact attention islands | Not ported. Local-window dispatch uses exact backends; `compat` allows Comfy attention overrides but does not reproduce VELA's trajectory policy. |
 | VELA anchor-column pruning and retained research caches | Not enabled; these change the trained operator or resource lifetime and need separate decoded-video validation. |
 
-The RTX 4090 buffer-lifetime probe reduced temporary peak allocations by **105–386 MiB**
+The RTX 4090 grouped-attention buffer-lifetime probe reduced temporary peak allocations by **105–386 MiB**
 with bit-identical BF16 attention output in three geometries. These are attention-only
 measurements, not full-video speed or quality claims. See
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and limits.
+
+Plus already has tests against OpenVDN source and post-hook bypass coexistence tests;
+these are useful next steps for Kirei. Our forward-replacement hooks are not yet
+qualified with ComfyUI bypass-mode LoRAs on the same modules. Very short full-cover
+clips also use ComfyUI's attention override path. See the
+[improvement plan](docs/IMPROVEMENT_PLAN.md) for validation gaps and priorities.
 
 ---
 

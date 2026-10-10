@@ -680,4 +680,15 @@ remain. The selected legacy e-grid reports `base_table_verified=false`; successf
 generation does not establish that table's identity across other H3 variants.
 See [runtime/media evidence](../benchmarks/generation_auto_032_20261010.json).
 Cold single-run timing remains excluded from the five-run speed table; audio content
-was not judged. Consumer-GPU and FA4 qualification are separate checks.
+was not judged.
+
+The same clean-Core recipe also completed at 768p on RTX 4090 24 GB. `auto` chose
+streamed branch weights, 5-frame tiles and INT8/ConvRot projection; block fusion was
+disabled as expected for streaming. FA2 reported no attention failures. All 124 frames
+decoded with no identical adjacent frames, and video/audio metadata matched the PRO run.
+Sampled frames retained a recognizable runner and market, with visible differences in
+face/clothing and composition from the BF16 run. INT8 projection is approximate: one
+successful scene does not establish quality equivalence. This validates the selected
+stream route, not every hybrid configuration or long/reference-heavy clip. See
+[consumer evidence](../benchmarks/generation_auto_4090_032_20261010.json).
+FA4 and five-median full-video qualification remain pending.

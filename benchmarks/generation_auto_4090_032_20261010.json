@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-10",
+  "node_version": "0.3.2",
+  "node_code_commit": "357cf193d01d651cf4c7b918a9fe0251147cdfc9",
+  "core_sha": "0b5b009dd4496529b08efa9301f97e0a5fefa2f9",
+  "core_tracked_changes": false,
+  "gpu": "NVIDIA GeForce RTX 4090 24GB",
+  "purpose": "single-run consumer default-auto smoke and sampled visual inspection",
+  "seed": 20261010,
+  "runtime": {
+    "profile": "auto",
+    "branch_mode": "stream",
+    "branch_execution": "serial",
+    "projection": {
+      "bf16_blocks": 0,
+      "convrot": true,
+      "convrot_groupsize": 256,
+      "original_bytes": 3853516800,
+      "per_channel": true,
+      "precision": "int8",
+      "quantized_blocks": 50,
+      "quantized_bytes": 1927833600,
+      "saved_bytes": 1925683200,
+      "skip_end_blocks": 0,
+      "storage_ratio": 0.5002790178571429
+    },
+    "block_fusion": false,
+    "block_fusion_error": null,
+    "attention_last": "flash2",
+    "attention_failures": {},
+    "adapters": {
+      "active": [
+        "default",
+        "turbo"
+      ],
+      "lora_mode": "bypass",
+      "reports": [
+        "default@1:bypass=208,merge=0,curve=0",
+        "turbo@1:bypass=312,merge=0,curve=51"
+      ],
+      "strengths": {
+        "default": 1.0,
+        "turbo": 1.0
+      }
+    },
+    "tile_frames": 5
+  },
+  "curve_source": {
+    "base_table_verified": false,
+    "kind": "egrid",
+    "sha256": "30eb3c2cc7fb6b470d9717ff840d359313ac27cd64b705e32da1baa10f72d6a8"
+  },
+  "media": {
+    "frames": 124,
+    "fps": 24.0,
+    "width": 1344.0,
+    "height": 768.0,
+    "exact_duplicate_adjacent_frames": 0,
+    "median_adjacent_frame_mae": 34.99272918701172
+  },
+  "end_to_end_cold_seconds": 211.348,
+  "limits": [
+    "One scene, sampled frames 0/30/61/92/123; no universal quality claim",
+    "INT8 VDN projection is approximate; observed face/clothing and composition differ from BF16 run",
+    "Stream route completed; this does not separately qualify hybrid mode",
+    "Audio presence checked, audio content not judged",
+    "No five-run full-video speed claim"
+  ]
+}

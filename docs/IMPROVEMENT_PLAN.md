@@ -14,7 +14,7 @@ checkpoint/video parity.
 | Native bypass coexistence in both injection orders | Fixed after reproducing both failures; independent linear post-hooks | Real Comfy hook two-cycle tests, shared A/B/A, stale eject and rollback |
 | Calibrate with real, distinct Q/K/V | Implemented; three timing runs, cache schema 4 | Deliberately wrong anchor mask passes old QQQ check and fails distinct-input check |
 | Pinned OpenVDN source oracles | Implemented; source SHA and clean checkout checked | Twenty reduced FP32 window/anchor, branch, hybrid and paired timestep tests |
-| Default `auto` and consumer GPU qualification | Separate generation validation | Require completed runs and runtime/visual evidence; CPU tests do not qualify these routes |
+| Default `auto` and consumer GPU qualification | 768p generations completed on clean Core: PRO resident/BF16 and RTX 4090 stream/INT8 | PRO compiled stages each ran 400 times; decoded-media and sampled visual checks recorded in VALIDATION. Hybrid/long/reference-heavy cases remain pending |
 
 ## Priority 1: compatibility and exact memory improvements
 

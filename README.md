@@ -369,19 +369,24 @@ instead of falling back to eager attention.
 ## Status
 
 0.3.2 is available on `main`; update this installation with `git pull`.
-The October 10 smoke test generated a complete 1344×768 video (124 frames, 24 fps,
+The 0.3.1 smoke test generated a complete 1344×768 video (124 frames, 24 fps,
 with audio) using Stage-DMD, the pruned INT8 FL2VA base and both adapters at 1.0.
 Sampled frames retained a recognizable runner, red jacket and detailed market scene;
 fast limbs remain motion-blurred, and the requested cart vault was not clearly shown.
 This is one-scene validation, not a general quality or speed claim. See the
 [recipe and evidence](docs/VALIDATION.md#18-version-031-generation-smoke-test).
-The runtime is covered by the CPU suite, CUDA backend
-probes and a release-scale end-to-end validation. The measured hardware table is still
+The runtime is covered by the CPU suite, CUDA backend probes and recorded end-to-end
+smoke tests. The measured hardware table is still
 being filled with five-run warm medians and reviewed quality results. Candidates that
 need a measured win **and** a passed quality gate before they enter `auto`: copy-free
 grouped attention, SageAttention on the local windows, NVFP4 projection, CUDA graphs on
 the branch. Reduced FP32 source-oracle parity now runs in CI; CUDA/RoPE, quantized
 weights and end-to-end video parity against OpenVDN remain unqualified.
+
+Version 0.3.2 also completed 768p default-`auto` generations on clean pinned ComfyUI:
+resident/BF16 with the compiled block path on RTX PRO 6000, and stream/INT8 with
+5-frame tiles on RTX 4090 24 GB. The full suite passes 193 tests, including 20 source
+oracles. See [qualification details](docs/VALIDATION.md#19-version-032-clean-core-qualification).
 
 ## Credits and license
 

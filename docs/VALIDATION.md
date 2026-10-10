@@ -625,3 +625,29 @@ still run on the target GPU or an equivalent runner.
 
 A red Actions badge is only a code result if GitHub actually assigned a runner and
 executed the job steps. A no-runner infrastructure failure is not a pytest failure.
+
+## 18. Version 0.3.1 generation smoke test
+
+On October 10, 2026, the complete suite passed (155 tests) and an actual Stage-DMD
+generation completed on an RTX PRO 6000 Blackwell: 1344×768, 124 frames, 24 fps,
+H.264 video with stereo AAC audio. Every video frame decoded; there were no identical
+adjacent frames. This checks execution and container integrity, not perceptual quality.
+
+The [API recipe](../benchmarks/vdn_dmd_768p.api.json) uses the pruned INT8 FL2VA base,
+BF16 VDN projection, `auto`, serial resident branch, compile off, exact bypass,
+both adapters at 1.0, Euler/simple 8 steps, CFG 1 and shifts 12/3. Exact attention
+calibration selected FA2 without recorded failures. The pruned base uses its native
+curve path, so `adaln_fp32=false` does not mean full AdaLN was accidentally rounded.
+
+A Larry v4 control completed with the same seed, prompt, geometry and sampling
+settings. Inspection of frames 0, 30, 61, 92 and 123 showed a recognizable runner,
+red jacket and detailed market in both clips. VDN did not visibly collapse to noise;
+fast limbs were blurred and the requested vault over a cart was not clearly depicted.
+Neither clip followed the night/neon prompt fully. This single scene does not establish
+superiority, exact reference parity or reliable performance across other prompts.
+
+[Machine-readable evidence](../benchmarks/generation_smoke_20261010.json) records the
+runtime and media checks. VDN's first run included calibration and cold loading;
+Larry reused warm assets. These times must not enter the five-run speed table.
+The host also has a separate local ComfyUI QuantizedTensor no-op unload fix; that
+core fix is not shipped by this package. Audio presence was checked, not audio quality.

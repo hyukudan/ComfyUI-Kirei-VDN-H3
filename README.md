@@ -357,7 +357,13 @@ instead of falling back to eager attention.
 
 ## Status
 
-0.3.1 is available from this repository; it has not been published to the Comfy registry.
+0.3.1 is published on `main`; update this installation with `git pull`.
+The October 10 smoke test generated a complete 1344×768 video (124 frames, 24 fps,
+with audio) using Stage-DMD, the pruned INT8 FL2VA base and both adapters at 1.0.
+Sampled frames retained a recognizable runner, red jacket and detailed market scene;
+fast limbs remain motion-blurred, and the requested cart vault was not clearly shown.
+This is one-scene validation, not a general quality or speed claim. See the
+[recipe and evidence](docs/VALIDATION.md#18-version-031-generation-smoke-test).
 The runtime is covered by the CPU suite, CUDA backend
 probes and a release-scale end-to-end validation. The measured hardware table is still
 being filled with five-run warm medians and reviewed quality results. Candidates that

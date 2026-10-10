@@ -1,0 +1,91 @@
+{
+  "date": "2026-10-10",
+  "version": "0.3.1",
+  "purpose": "single-run generation and sampled visual inspection; not a qualified speed benchmark",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "seed": 20261010,
+  "recipe": {
+    "sampler": "euler",
+    "scheduler": "simple",
+    "steps": 8,
+    "denoise": 1,
+    "cfg": 1,
+    "video_shift": 12,
+    "audio_shift": 3
+  },
+  "runtime": {
+    "base_precision": "int8",
+    "checkpoint": "stage-dmd-step-250",
+    "adapters": {
+      "active": [
+        "default",
+        "turbo"
+      ],
+      "lora_mode": "bypass",
+      "reports": [
+        "default@1:bypass=208,merge=0,curve=0",
+        "turbo@1:bypass=312,merge=0,curve=51"
+      ],
+      "strengths": {
+        "default": 1.0,
+        "turbo": 1.0
+      }
+    },
+    "branch_mode": "resident",
+    "branch_execution": "serial",
+    "projection": {
+      "precision": "bf16"
+    },
+    "attention_last": "flash2",
+    "attention_failures": {},
+    "adaln_fp32": false
+  },
+  "environment": {
+    "backends": [
+      "flash2",
+      "flex",
+      "grouped"
+    ],
+    "cuda": "13.0",
+    "cudnn": 92000,
+    "driver": "617.14",
+    "flash_attn": "2.9.1",
+    "flash_attn_4": null,
+    "node": "0.3.1",
+    "torch": "2.12.0+cu130",
+    "triton": "3.7.1"
+  },
+  "media": {
+    "vdn": {
+      "frames": 124,
+      "fps": 24.0,
+      "width": 1344.0,
+      "height": 768.0,
+      "min_adjacent_frame_mae": 28.098756790161133,
+      "median_adjacent_frame_mae": 34.85121536254883,
+      "exact_duplicate_adjacent_frames": 0
+    },
+    "larry": {
+      "frames": 124,
+      "fps": 24.0,
+      "width": 1344.0,
+      "height": 768.0,
+      "min_adjacent_frame_mae": 26.3395938873291,
+      "median_adjacent_frame_mae": 40.0247802734375,
+      "exact_duplicate_adjacent_frames": 0
+    }
+  },
+  "timings_unqualified_seconds": {
+    "vdn_sampler_including_attention_calibration": 111.7,
+    "vdn_end_to_end_cold": 193.23,
+    "larry_sampler": 83.98,
+    "larry_end_to_end_warm": 102.33
+  },
+  "limitations": [
+    "one seed and one scene",
+    "sampled frames reviewed; audio content not judged",
+    "cold VDN vs warm Larry: timings are not comparable speed evidence",
+    "local ComfyUI QuantizedTensor no-op unload fix is external to this package",
+    "no OpenVDN end-to-end parity test"
+  ]
+}

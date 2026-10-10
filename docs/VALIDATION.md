@@ -646,6 +646,11 @@ fast limbs were blurred and the requested vault over a cart was not clearly depi
 Neither clip followed the night/neon prompt fully. This single scene does not establish
 superiority, exact reference parity or reliable performance across other prompts.
 
+A second Larry control at strength 0.65 also completed. Its sampled face and clothing
+looked less hardened than the 1.0 control; composition also changed. This supports
+testing lower Larry strengths when a workflow looks oversharpened, but does not
+establish 0.65 as a universal preset or change VDN's required adapter strengths.
+
 [Machine-readable evidence](../benchmarks/generation_smoke_20261010.json) records the
 runtime and media checks. VDN's first run included calibration and cold loading;
 Larry reused warm assets. These times must not enter the five-run speed table.

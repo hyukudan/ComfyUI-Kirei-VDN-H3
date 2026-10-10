@@ -73,6 +73,15 @@
       "min_adjacent_frame_mae": 26.3395938873291,
       "median_adjacent_frame_mae": 40.0247802734375,
       "exact_duplicate_adjacent_frames": 0
+    },
+    "larry_strength_065": {
+      "frames": 124,
+      "fps": 24.0,
+      "width": 1344.0,
+      "height": 768.0,
+      "min_adjacent_frame_mae": 20.45952606201172,
+      "median_adjacent_frame_mae": 30.139013290405273,
+      "exact_duplicate_adjacent_frames": 0
     }
   },
   "timings_unqualified_seconds": {
@@ -87,5 +96,9 @@
     "cold VDN vs warm Larry: timings are not comparable speed evidence",
     "local ComfyUI QuantizedTensor no-op unload fix is external to this package",
     "no OpenVDN end-to-end parity test"
+  ],
+  "visual_notes": [
+    "Larry strength 1.0 looked more contrasty and hardened in sampled face/clothing frames.",
+    "Larry strength 0.65 completed and looked less hardened; composition changed, so this is not a pixel-matched comparison or universal strength recommendation."
   ]
 }

@@ -15,6 +15,7 @@ from .diagnostics import DiagnosticsRecorder
 from .layout import current_layout, layout_from_payload, publish_layout
 from .runtime import SharedBranchRuntime
 from .weights import FP8_STREAMED_PROJECTION_KEY, ManagedBranchWeights, STREAMED_PROJECTION_KEY
+from .window import _exact_sdpa
 
 
 _LOG = logging.getLogger("comfy.vdn_h3")
@@ -287,7 +288,7 @@ def _normalise_and_rope(attn: Any, q: torch.Tensor, k: torch.Tensor, rope_freqs)
 def _dense_softmax(query, key, value, transformer_options, *, exact=False):
     seq, heads, dim = query.shape
     if exact:
-        attended = F.scaled_dot_product_attention(
+        attended = _exact_sdpa(
             query.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
             value.transpose(0, 1).unsqueeze(0), scale=dim**-0.5,
         )
@@ -327,6 +328,9 @@ def _window_softmax(q, k, v, layout, scale, requested, transformer_options, cach
         video_start=layout.video_start,
         video_end=layout.video_end,
         tokens_per_frame=layout.tokens_per_frame,
+        key=k,
+        value=v,
+        scale=scale,
     )
     if backend == "reference":
         return (
@@ -479,7 +483,7 @@ def make_vdn_forward(attn: Any, state: VDNState, block_index: int):
 
             with state.diagnostics.scope("attention.rope_norm", x.device):
                 query, key = _normalise_and_rope(attn, q_raw, k_raw, rope_freqs)
-            exact_dense = state.attention_backend == "reference"
+            exact_dense = state.attention_backend != "compat"
             with state.diagnostics.scope("attention.softmax", x.device):
                 if layout.full_cover:
                     softmax_out = _dense_softmax(

@@ -145,8 +145,11 @@ Saganaki number is the first one to beat with `profile=auto`.
 On native Windows flash-attn-4 cannot be installed (no `nvidia-cutlass-dsl` wheel), so
 the sm_120 candidates there are grouped, Flex through `triton-windows` and FA2.
 
-Explicit experiments that need a measured win *and* a passed quality gate before they
-move into `auto`: INT8/ConvRot or FP8 projection (`projection_precision`), merged
+Resident projection experiments need a measured win *and* a passed quality gate before
+they move into resident `auto`: INT8/ConvRot or FP8 (`projection_precision`). Hybrid/
+stream `auto` already follows INT8/FP8 bases to reduce storage and transfers; that
+projection is approximate and still needs broader decoded-video qualification. Other
+explicit experiments are merged
 adapters on quantized bases (`max_speed`), CUDA graphs (`compile_policy =
 reduce_overhead`), the two-stream branch (`branch_execution = parallel`), SageAttention
 on the local windows (`attention_backend = compat`).
@@ -167,3 +170,13 @@ on the local windows (`attention_backend = compat`).
 4. Record cold separately; warm once; five warm runs; median sampler seconds; peak VRAM.
 5. `python benchmarks/record_result.py measurement.json --seed <seed> --prompt-hash <hash> --quality-status pending`
    and update the table above.
+
+## 5. Version 0.3.2 FA2 memory probe
+
+On RTX 4090 with torch 2.12.0+cu130, the recorded 768p packed geometry
+`[37859,56,128]` was tested with synthetic normalized Q/K and strided V.
+One warm-up and five measured calls per version gave median 140.257→139.379 ms
+and peak extra allocation 5,587,474,432→5,044,312,064 bytes (518 MiB lower).
+Before/after output was bit-identical; both matched grouped within BF16 tolerance.
+This qualifies the FA2 allocation change, not full-video speed or FA4 hardware.
+See [raw measurements](../benchmarks/fa2_memory_20261010.json).

@@ -656,3 +656,28 @@ runtime and media checks. VDN's first run included calibration and cold loading;
 Larry reused warm assets. These times must not enter the five-run speed table.
 The host also has a separate local ComfyUI QuantizedTensor no-op unload fix; that
 core fix is not shipped by this package. Audio presence was checked, not audio quality.
+
+## 19. Version 0.3.2 clean-Core qualification
+
+The full CPU suite passes 193 tests against unmodified ComfyUI
+`0b5b009dd4496529b08efa9301f97e0a5fefa2f9`, with 20 reduced FP32 oracles executing
+OpenVDN `b8cb28fbfca0266d1c7742a9f25ab8b58191de97`. The oracles cover window/anchor
+semantics, delta rules, statistics/scans, short conv, full reduced linear/hybrid
+branches and paired video/audio timesteps at 8 and 50 steps. They do not cover
+CUDA/RoPE, quantized trained weights or full-video reference parity.
+
+The [default-auto recipe](../benchmarks/vdn_auto_768p.api.json) also completed on
+the RTX PRO 6000 using that clean Core, without the local `ops.py` fix. The
+1344×768, 124-frame, 24-fps video and AAC audio decoded correctly, with no identical
+adjacent video frames. Runtime selected resident BF16 projection and FA2 with no
+attention failures. Block fusion remained enabled without error, and all four
+`block.*` diagnostic stages recorded 400 calls, proving execution of the compiled
+block path across 50 blocks and eight forwards. This is not a kernel-fusion profiler.
+
+Sampled frames 0, 30, 61, 92 and 123 retained the runner, face, red jacket and detailed
+market without visible noise collapse. Motion blur and incomplete prompt adherence
+remain. The selected legacy e-grid reports `base_table_verified=false`; successful
+generation does not establish that table's identity across other H3 variants.
+See [runtime/media evidence](../benchmarks/generation_auto_032_20261010.json).
+Cold single-run timing remains excluded from the five-run speed table; audio content
+was not judged. Consumer-GPU and FA4 qualification are separate checks.

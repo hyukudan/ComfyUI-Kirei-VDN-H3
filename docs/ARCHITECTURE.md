@@ -466,7 +466,7 @@ packed geometry. Any change re-measures instead of trusting an old winner; store
 of an older schema are ignored. Only exact candidates that pass parity against the
 grouped oracle can win. The resolution reason (`explicit`, `calibrated`, `flex` guard,
 `autotuned`, `heuristic`) is rewritten on every call and reported.
-Automatic timing uses one warm-up and two steady calls per candidate to avoid choosing
+Automatic timing uses one warm-up and three steady calls per candidate to avoid choosing
 from a single sub-millisecond sample.
 
 ### GPU families

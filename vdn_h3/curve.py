@@ -61,6 +61,20 @@ def _egrid_candidates(path: str | None, checkpoint_root: str | None):
     yield from emit(custom_nodes / "ComfyUI-MiniMax-H3-Turbo" / _EGRID_NAME)
 
 
+def _table_digest(table):
+    table = table.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return hashlib.sha256(str(tuple(table.shape)).encode() + table.numpy().tobytes()).hexdigest()
+
+
+def _source_info(source, kind, verified):
+    return {
+        "kind": kind,
+        "path": str(source.resolve()),
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "base_table_verified": verified,
+    }
+
+
 def _load_affine_grid(checkpoint_root, table):
     from safetensors import safe_open
 
@@ -79,13 +93,19 @@ def _load_affine_grid(checkpoint_root, table):
         raise ValueError(f"AdaLN affine in {source} belongs to a different H3 curve table")
     declared_hash = metadata.get("adaln_table_sha256")
     if declared_hash is not None:
-        digest = hashlib.sha256(str(tuple(table.shape)).encode() + table.numpy().tobytes()).hexdigest()
+        digest = _table_digest(table)
         if declared_hash != digest:
             raise ValueError(f"AdaLN affine table hash in {source} does not match the loaded H3 base")
-    return (table @ basis + mean).contiguous()
+    return (table @ basis + mean).contiguous(), _source_info(
+        source, "affine", source_table is not None or declared_hash is not None,
+    )
 
 
 def load_egrid(path: str | None = None, *, checkpoint_root: str | None = None, table: torch.Tensor | None = None) -> torch.Tensor:
+    return _load_egrid(path, checkpoint_root=checkpoint_root, table=table)[0]
+
+
+def _load_egrid(path=None, *, checkpoint_root=None, table=None):
     candidates = list(_egrid_candidates(path, checkpoint_root))
     source = next(
         (candidate for candidate in candidates if candidate.is_file() and candidate.suffix.lower() == ".safetensors"),
@@ -102,15 +122,19 @@ def load_egrid(path: str | None = None, *, checkpoint_root: str | None = None, t
             "or a matching checkpoint-local adaln_affine.safetensors. "
             f"Searched: {searched}"
         )
-    from safetensors.torch import load_file
+    from safetensors import safe_open
 
-    state = load_file(str(source), device="cpu")
-    if set(state) != {"silu_t_emb_grid"}:
-        raise ValueError(f"unexpected e-grid inventory in {source}: {sorted(state)}")
-    grid = state["silu_t_emb_grid"].detach().to(torch.float32).contiguous()
+    with safe_open(str(source), framework="pt", device="cpu") as handle:
+        if set(handle.keys()) != {"silu_t_emb_grid"}:
+            raise ValueError(f"unexpected e-grid inventory in {source}: {sorted(handle.keys())}")
+        grid = handle.get_tensor("silu_t_emb_grid").detach().to(torch.float32).contiguous()
+        declared_hash = (handle.metadata() or {}).get("adaln_table_sha256")
+    verified = table is not None and declared_hash is not None
+    if verified and _table_digest(table) != declared_hash:
+        raise ValueError(f"e-grid table hash in {source} does not match the loaded H3 base")
     if grid.ndim != 2 or grid.shape[0] < 2:
         raise ValueError(f"invalid silu_t_emb_grid shape {tuple(grid.shape)}")
-    return grid
+    return grid, _source_info(source, "egrid", verified)
 
 
 def _compute_dtype(model_patcher):
@@ -155,6 +179,7 @@ class CurveAdapterState(nn.Module):
     ):
         super().__init__()
         self.device = torch.device("cpu")
+        self.source = None
         self.register_parameter("egrid", nn.Parameter(egrid.to(torch.float32), requires_grad=False))
         self._terms: dict[str, list[tuple[str, str, float]]] = defaultdict(list)
         self._patcher = None
@@ -278,11 +303,15 @@ def apply_curve_adapters(model_patcher, vdn_state, terms, *, egrid_path: str | N
         raise RuntimeError(
             "pruned H3 AdaLN structure was detected but the shared adaln_t_table is missing"
         )
+    egrid, source = _load_egrid(
+        egrid_path, checkpoint_root=getattr(vdn_state, "checkpoint_root", None), table=dm.adaln_t_table,
+    )
     curve_state = CurveAdapterState(
-        load_egrid(egrid_path, checkpoint_root=getattr(vdn_state, "checkpoint_root", None), table=dm.adaln_t_table),
+        egrid,
         terms,
         storage_dtype=_compute_dtype(model_patcher),
     )
+    curve_state.source = source
     if curve_state.egrid.shape[1] != terms[0][0].down.shape[1]:
         raise RuntimeError(
             f"e-grid width {curve_state.egrid.shape[1]} does not match adapter input width {terms[0][0].down.shape[1]}"

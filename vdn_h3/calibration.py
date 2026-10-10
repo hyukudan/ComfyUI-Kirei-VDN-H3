@@ -16,7 +16,7 @@ from typing import Any
 import torch
 
 
-CALIBRATION_VERSION = 3
+CALIBRATION_VERSION = 4
 CALIBRATABLE_BACKENDS = ("grouped", "flex", "flash2", "decomposed")
 
 

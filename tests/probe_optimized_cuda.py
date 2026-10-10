@@ -178,6 +178,7 @@ def probe_attention(device, quick=False):
     auto_resolved = window.resolve_attention_backend(
         "auto", q, frames, bounds, "both", cache,
         video_start=video_start, video_end=video_end, tokens_per_frame=per_frame,
+        key=k, value=v, scale=scale,
     )
     result = {
         "shape": list(q.shape),

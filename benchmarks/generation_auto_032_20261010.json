@@ -1,0 +1,83 @@
+{
+  "date": "2026-10-10",
+  "node_version": "0.3.2",
+  "core_sha": "0b5b009dd4496529b08efa9301f97e0a5fefa2f9",
+  "core_tracked_changes": false,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "purpose": "single-run default-auto smoke and sampled visual review; not five-run speed qualification",
+  "seed": 20261010,
+  "runtime": {
+    "profile": "auto",
+    "branch_mode": "resident",
+    "branch_execution": "serial",
+    "projection": {
+      "precision": "bf16"
+    },
+    "block_fusion": true,
+    "block_fusion_error": null,
+    "attention_last": "flash2",
+    "attention_failures": {},
+    "adapters": {
+      "active": [
+        "default",
+        "turbo"
+      ],
+      "lora_mode": "bypass",
+      "reports": [
+        "default@1:bypass=208,merge=0,curve=0",
+        "turbo@1:bypass=312,merge=0,curve=51"
+      ],
+      "strengths": {
+        "default": 1.0,
+        "turbo": 1.0
+      }
+    }
+  },
+  "curve_source": {
+    "base_table_verified": false,
+    "kind": "egrid",
+    "sha256": "30eb3c2cc7fb6b470d9717ff840d359313ac27cd64b705e32da1baa10f72d6a8"
+  },
+  "compiled_block_stages": {
+    "block.post_attn": {
+      "count": 400,
+      "max_ms": 591.6361083984375,
+      "mean_ms": 3.5932330490648745,
+      "total_ms": 1437.2932196259499
+    },
+    "block.post_mlp": {
+      "count": 400,
+      "max_ms": 0.8197759985923767,
+      "mean_ms": 0.8128563994169236,
+      "total_ms": 325.1425597667694
+    },
+    "block.pre_attn": {
+      "count": 400,
+      "max_ms": 6923.484375,
+      "mean_ms": 20.80369929999113,
+      "total_ms": 8321.479719996452
+    },
+    "block.pre_mlp": {
+      "count": 400,
+      "max_ms": 0.8064640164375305,
+      "mean_ms": 0.5170948798209429,
+      "total_ms": 206.83795192837715
+    }
+  },
+  "media": {
+    "frames": 124,
+    "fps": 24.0,
+    "width": 1344.0,
+    "height": 768.0,
+    "exact_duplicate_adjacent_frames": 0,
+    "median_adjacent_frame_mae": 34.780765533447266
+  },
+  "end_to_end_cold_seconds": 166.227,
+  "limits": [
+    "One seed, sampled frames 0/30/61/92/123; no universal quality claim",
+    "Audio presence validated, audio content not judged",
+    "Legacy egrid identity remains unverified against base table",
+    "Compile path counts do not replace a kernel profiler",
+    "No end-to-end trained checkpoint parity against OpenVDN"
+  ]
+}

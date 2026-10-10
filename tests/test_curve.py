@@ -35,6 +35,39 @@ def test_egrid_remains_preferred_over_affine_companion(tmp_path, monkeypatch):
     torch.testing.assert_close(load_egrid(checkpoint_root=str(tmp_path), table=torch.zeros(2, 2)), expected)
 
 
+def test_egrid_reports_source_and_validates_declared_base_identity(tmp_path):
+    import hashlib
+
+    path = tmp_path / 'h3_silu_temb_grid.safetensors'
+    table = torch.zeros(2, 2)
+    grid = torch.ones(2, 3)
+    save_file({'silu_t_emb_grid': grid}, str(path))
+    actual, source = curve._load_egrid(str(path), table=table)
+    torch.testing.assert_close(actual, grid)
+    assert source == {
+        'kind': 'egrid', 'path': str(path.resolve()),
+        'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'base_table_verified': False,
+    }
+    save_file({'silu_t_emb_grid': grid}, str(path), metadata={'adaln_table_sha256': curve._table_digest(table)})
+    _, source = curve._load_egrid(str(path), table=table)
+    assert source['base_table_verified'] is True
+    with pytest.raises(ValueError, match='e-grid table hash'):
+        load_egrid(str(path), table=table + 1)
+
+
+@pytest.mark.parametrize('verified', [False, True])
+def test_affine_source_reports_actual_identity_verification(tmp_path, monkeypatch, verified):
+    monkeypatch.setattr(curve, '_egrid_candidates', lambda *args: iter(()))
+    table = torch.zeros(2, 2)
+    tensors = {'adaln_basis': torch.ones(2, 3), 'adaln_mean': torch.zeros(3)}
+    if verified:
+        tensors['adaln_t_table'] = table
+    save_file(tensors, str(tmp_path / 'adaln_affine.safetensors'))
+    _, source = curve._load_egrid(checkpoint_root=str(tmp_path), table=table)
+    assert source['kind'] == 'affine'
+    assert source['base_table_verified'] is verified
+
+
 @pytest.mark.parametrize('metadata,basis', [({'adaln_table_sha256': 'wrong'}, torch.ones(2, 3)), ({}, torch.full((2, 3), float('nan')))])
 def test_affine_companion_rejects_wrong_identity_or_invalid_values(tmp_path, monkeypatch, metadata, basis):
     monkeypatch.setattr(curve, '_egrid_candidates', lambda *args: iter(()))

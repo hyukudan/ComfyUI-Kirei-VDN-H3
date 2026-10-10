@@ -150,18 +150,20 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
     """Drop-in ComfyUI ``DiTBlock.forward`` with shared compiled pointwise kernels."""
     original_forward = block.forward
 
-    def fallback(x, t_emb, mod_segments, rope_freqs, transformer_options):
+    def fallback(x, t_emb, mod_segments, rope_freqs, transformer_options, attention):
         return original_forward(
             x,
             t_emb,
             mod_segments,
             rope_freqs,
             transformer_options=transformer_options or {},
+            attention=attention,
         )
 
-    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options=None):
+    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options=None, attention=None):
         if (
-            not getattr(state, "block_fusion", False)
+            attention is not None
+            or not getattr(state, "block_fusion", False)
             or not getattr(state, "inference", False)
             or torch.is_grad_enabled()
             or not x.is_cuda
@@ -169,7 +171,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
             or not _weight_ready(block.norm1, x)
             or not _weight_ready(block.norm2, x)
         ):
-            return fallback(x, t_emb, mod_segments, rope_freqs, transformer_options)
+            return fallback(x, t_emb, mod_segments, rope_freqs, transformer_options, attention)
 
         original_x = x
         cache = getattr(state, "block_pointwise_cache", None)
@@ -230,7 +232,7 @@ def make_fast_block_forward(block: Any, state: Any, block_index: int):
         except _BlockFusionUnavailable as exc:
             state.block_fusion = False
             state.block_fusion_error = str(exc)
-            return fallback(original_x, t_emb, mod_segments, rope_freqs, transformer_options)
+            return fallback(original_x, t_emb, mod_segments, rope_freqs, transformer_options, attention)
 
     forward._vdn_h3_fast_block = True
     forward._vdn_h3_block_index = int(block_index)

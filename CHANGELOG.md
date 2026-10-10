@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.2 (2026-10-10)
+
+- Linear adapter post-hooks coexist with ComfyUI bypass LoRAs without replacing
+  their forwards; native injection/ejection and shared-clone regressions cover both orders.
+- Attention calibration uses distinct runtime Q/K/V and three measured calls;
+  cache schema 4 discards old calibration results.
+- Compiled blocks accept the native `attention` override and delegate it to the
+  original block. Short full-cover attention stays exact outside explicit `compat`.
+- FA2/FA4 decomposition avoids redundant full K/V copies and releases gathered
+  buffers earlier. The FA2 RTX 4090 probe saves 518 MiB with identical output.
+- Runtime Report identifies the AdaLN source and whether its base table was verified.
+- Twenty reduced FP32 source oracles compare window, branch, hybrid and paired
+  timestep behavior with pinned OpenVDN. CI adds pinned ComfyUI/OpenVDN validation
+  alongside the rolling compatibility job; 193 tests pass on clean pinned Core.
+
 ## 0.3.1 (2026-10-10)
 
 Quality-first runtime for single-GPU workstations, with the fixes found by the
@@ -57,7 +72,8 @@ September 2026 audit against OpenVDN and current ComfyUI.
 - Calibration store v3: signatures include the node version, torch/CUDA/cuDNN/driver,
   Triton, flash-attn 2 / flash-attn-4 versions and the installed backend inventory, so a
   node update or a newly installed backend re-measures; v2 files are ignored. Automatic
-  automatic calibration averages two steady calls instead of trusting one sub-millisecond sample.
+  automatic calibration averages two steady calls instead of trusting one sub-millisecond sample
+  (three calls from 0.3.2).
 - Dispatch reason rewritten on every resolution (`explicit`, `calibrated`, `flex` guard,
   `autotuned`, `heuristic`); it no longer survives a calibration hit.
 

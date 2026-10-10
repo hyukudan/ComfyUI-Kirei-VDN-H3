@@ -1,5 +1,6 @@
 import weakref
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -142,6 +143,30 @@ def test_full_cover_without_gate_matches_dense_teacher(monkeypatch):
     with publish_layout(layout(2, full=True)):
         result = make_vdn_forward(attn, state, 0)(x)
     torch.testing.assert_close(result, teacher)
+
+
+@pytest.mark.parametrize('backend', ['auto', 'grouped', 'reference', 'flex', 'flash2', 'decomposed', 'compat'])
+def test_full_cover_preserves_exact_attention_policy(monkeypatch, backend):
+    attn = TinyAttention()
+    x = torch.randn(3, 4)
+    teacher = attn(x)
+    state = VDNState('tiny', {'enable_softmax_gate': False}, [Branch(False)], 2, 2,
+                     attention_backend=backend)
+    calls = []
+    original = hybrid._dense_softmax
+    options = {'optimized_attention_override': object()}
+
+    def dense(query, key, value, transformer_options, *, exact=False):
+        assert transformer_options is options
+        calls.append(exact)
+        return original(query, key, value, None, exact=True)
+
+    monkeypatch.setattr(hybrid, '_dense_softmax', dense)
+    with publish_layout(layout(2, full=True)):
+        result = make_vdn_forward(attn, state, 0)(x, transformer_options=options)
+    torch.testing.assert_close(result, teacher)
+    assert calls == [backend != 'compat']
+    assert state.last_attention_backend == ('dense' if backend == 'compat' else 'dense_exact')
 
 
 def test_linear_delta_changes_only_target_video_rows():

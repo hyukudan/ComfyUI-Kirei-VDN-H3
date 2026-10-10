@@ -239,7 +239,7 @@ def test_calibration_signature_tracks_node_version_and_backend_inventory(monkeyp
     geometry = dict(groups=1, video_start=2, video_end=14, tokens_per_frame=4)
     before = calibration_signature(q, 3, bounds, "both", **geometry)
     parsed = json.loads(before)
-    assert parsed["version"] == CALIBRATION_VERSION == 3
+    assert parsed["version"] == CALIBRATION_VERSION
     assert parsed["env"]["node"] == __version__
     flash2_was_available = "flash2" in parsed["env"]["backends"]
     calibration.runtime_environment.cache_clear()

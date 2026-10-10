@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from collections.abc import Sequence
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -518,6 +517,9 @@ def _autotune_if_needed(
     video_start,
     video_end,
     tokens_per_frame,
+    key,
+    value,
+    scale,
 ):
     if (
         cache is None
@@ -526,6 +528,8 @@ def _autotune_if_needed(
         or video_start is None
         or video_end is None
         or tokens_per_frame is None
+        or key is None
+        or value is None
     ):
         return None
     available = 1
@@ -545,16 +549,14 @@ def _autotune_if_needed(
     try:
         from .autotune import runtime_autotune_attention
 
-        # Runtime is shape-driven. Reusing the real Q tensor for Q/K/V avoids allocating
-        # three synthetic inputs while preserving the exact backend geometry.
         return runtime_autotune_attention(
             query,
-            query,
-            query,
+            key,
+            value,
             layout,
-            query.shape[-1] ** -0.5,
+            query.shape[-1] ** -0.5 if scale is None else scale,
             cache,
-            runs=2,
+            runs=3,
         )
     except Exception as exc:
         cache.last_autotune_error = str(exc)
@@ -587,6 +589,9 @@ def resolve_attention_backend(
     video_start: int | None = None,
     video_end: int | None = None,
     tokens_per_frame: int | None = None,
+    key: torch.Tensor | None = None,
+    value: torch.Tensor | None = None,
+    scale: float | None = None,
 ) -> str:
     if requested not in ATTENTION_BACKENDS:
         raise ValueError(f"unsupported attention backend {requested!r}")
@@ -648,6 +653,9 @@ def resolve_attention_backend(
             video_start,
             video_end,
             tokens_per_frame,
+            key,
+            value,
+            scale,
         )
         if tuned and _backend_available(tuned, cache):
             cache.last_calibration_hit = tuned
@@ -793,16 +801,10 @@ def _dense_decomposed_rows(query, key, value, plan, scale, out):
     if not len(plan.dense_q):
         return
     qd = query[plan.dense_q]
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-        context = sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
-    except Exception:
-        context = nullcontext()
-    with context:
-        od = F.scaled_dot_product_attention(
-            qd.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
-            value.transpose(0, 1).unsqueeze(0), scale=scale,
-        )
+    od = _exact_sdpa(
+        qd.transpose(0, 1).unsqueeze(0), key.transpose(0, 1).unsqueeze(0),
+        value.transpose(0, 1).unsqueeze(0), scale=scale,
+    )
     out[plan.dense_q] = od[0].transpose(0, 1)
 
 
@@ -816,8 +818,6 @@ def _window_softmax_varlen(
         cache, query.shape[0], video_start, video_end, num_frames, tokens_per_frame,
         bounds, anchor_frames, query.device,
     )
-    key = key if key.is_contiguous() else key.contiguous()
-    value = value if value.is_contiguous() else value.contiguous()
     out = torch.empty_like(query)
     _dense_decomposed_rows(query, key, value, plan, scale, out)
     if plan.has_windows:
@@ -831,6 +831,7 @@ def _window_softmax_varlen(
         )
         if isinstance(ow, tuple):
             ow = ow[0]
+        del kw, vw
         out[plan.win_q] = ow
     return out
 

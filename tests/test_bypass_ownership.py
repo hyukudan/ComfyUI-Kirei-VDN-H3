@@ -16,14 +16,20 @@ class ControlledLinear(nn.Module):
         self.events = events
         self.fail_next_hook = False
 
-    def __setattr__(self, name, value):
-        if name == "forward" and "events" in self.__dict__:
-            kind = "base" if getattr(value, "__self__", None) is self else "hook"
-            self.events.append(f"{self.label}:{kind}")
-            if kind == "hook" and self.fail_next_hook:
-                self.fail_next_hook = False
-                raise RuntimeError(f"blocked hook assignment on {self.label}")
-        super().__setattr__(name, value)
+    def register_forward_hook(self, hook, **kwargs):
+        self.events.append(f"{self.label}:hook")
+        if self.fail_next_hook:
+            self.fail_next_hook = False
+            raise RuntimeError(f"blocked hook registration on {self.label}")
+        handle = super().register_forward_hook(hook, **kwargs)
+        original_remove = handle.remove
+
+        def remove():
+            self.events.append(f"{self.label}:base")
+            original_remove()
+
+        handle.remove = remove
+        return handle
 
     def forward(self, x):
         return x.clone()
@@ -120,8 +126,8 @@ def test_shared_clone_reinjection_has_one_owner_and_preserves_external_hooks(mon
     injection_a.eject(clone_a)
     assert target.forward is external_before
 
-    # A hook installed later by an unrelated extension is never overwritten. The
-    # VDN owner remains active until that extension removes its wrapper.
+    # A later forward replacement remains installed when our independent post-hook
+    # is removed, and no stale VDN wrapper remains in its call chain.
     injection_a.inject(clone_a)
     vdn_forward = target.forward
 
@@ -129,9 +135,10 @@ def test_shared_clone_reinjection_has_one_owner_and_preserves_external_hooks(mon
         return vdn_forward(x) + 20
 
     target.forward = external_after
-    with pytest.raises(RuntimeError, match="will not overwrite an unrelated"):
-        injection_a.eject(clone_a)
+    torch.testing.assert_close(target(x), torch.full_like(x, 33))
+    injection_a.eject(clone_a)
     assert target.forward is external_after
+    torch.testing.assert_close(target(x), torch.full_like(x, 31))
     target.forward = vdn_forward
     injection_a.eject(clone_a)
     assert target.forward is external_before
@@ -149,7 +156,7 @@ def test_failed_takeover_rolls_back_in_lifo_order_and_restores_owner(monkeypatch
 
     shared.events.clear()
     shared.diffusion_model.second.fail_next_hook = True
-    with pytest.raises(RuntimeError, match="blocked hook assignment"):
+    with pytest.raises(RuntimeError, match="blocked hook registration"):
         injection_b.inject(clone_b)
 
     assert shared.events == [

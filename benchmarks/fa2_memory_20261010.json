@@ -1,0 +1,97 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "torch": "2.12.0+cu130",
+  "shape": [
+    37859,
+    56,
+    128
+  ],
+  "q_stride": [
+    7168,
+    128,
+    1
+  ],
+  "k_stride": [
+    7168,
+    128,
+    1
+  ],
+  "v_stride": [
+    21504,
+    128,
+    1
+  ],
+  "parity": {
+    "before_vs_grouped": {
+      "max_abs": 0.000518798828125,
+      "mean_abs": 2.23275364987785e-05,
+      "allclose": true
+    },
+    "after_vs_grouped": {
+      "max_abs": 0.000518798828125,
+      "mean_abs": 2.23275364987785e-05,
+      "allclose": true
+    },
+    "after_vs_before": {
+      "max_abs": 0.0,
+      "mean_abs": 0.0,
+      "allclose": true
+    }
+  },
+  "samples": {
+    "before": [
+      {
+        "ms": 137.48223876953125,
+        "peak_extra_bytes": 5587474432
+      },
+      {
+        "ms": 147.1262664794922,
+        "peak_extra_bytes": 5587474432
+      },
+      {
+        "ms": 142.95143127441406,
+        "peak_extra_bytes": 5587474432
+      },
+      {
+        "ms": 140.221435546875,
+        "peak_extra_bytes": 5587474432
+      },
+      {
+        "ms": 140.2572784423828,
+        "peak_extra_bytes": 5587474432
+      }
+    ],
+    "after": [
+      {
+        "ms": 137.7392578125,
+        "peak_extra_bytes": 5044312064
+      },
+      {
+        "ms": 145.86778259277344,
+        "peak_extra_bytes": 5044312064
+      },
+      {
+        "ms": 137.56211853027344,
+        "peak_extra_bytes": 5044312064
+      },
+      {
+        "ms": 139.38380432128906,
+        "peak_extra_bytes": 5044312064
+      },
+      {
+        "ms": 139.37869262695312,
+        "peak_extra_bytes": 5044312064
+      }
+    ]
+  },
+  "medians": {
+    "before": {
+      "ms": 140.2572784423828,
+      "peak_extra_bytes": 5587474432
+    },
+    "after": {
+      "ms": 139.37869262695312,
+      "peak_extra_bytes": 5044312064
+    }
+  }
+}

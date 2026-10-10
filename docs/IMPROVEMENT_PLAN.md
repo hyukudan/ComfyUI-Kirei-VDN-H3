@@ -2,32 +2,33 @@
 
 Based on Claude CLI's read-only review of Kirei 0.3.1, VDN-H3-Plus and VELA,
 followed by source checks. Review hypotheses are not reproduced failures.
-Current evidence: 155 local tests, successful GitHub CPU/current-ComfyUI jobs,
-one 768p VDN video and Larry controls at strengths 1.0 and 0.65. This does not
-qualify every runtime policy or establish end-to-end OpenVDN parity.
+Sol verified the source hypotheses and implemented the confirmed fixes in 0.3.2.
+The full clean-Core suite passes 193 tests, including 20 reduced pinned OpenVDN
+source oracles. This does not qualify every runtime policy or establish end-to-end
+checkpoint/video parity.
 
 ## Priority 0: correctness and qualification
 
-| Work | Reason | Acceptance |
+| Work | Status in 0.3.2 | Acceptance evidence |
 |---|---|---|
-| Reproduce bypass coexistence with ComfyUI's real bypass LoRA hook in both injection orders | Kirei replaces `module.forward`; another replacement can prevent safe eject | Correct additive output and clean inject/eject; preserve clone A/B/A and stale-eject tests. Consider post-hooks only after reproduction |
-| Calibrate with real, distinct Q/K/V | Current automatic calibration reuses Q as all three inputs, weakening its parity check | A deliberately wrong anchor mask fails the parity gate; valid backends pass |
-| Add pinned OpenVDN source oracles | Existing tests compare against Kirei's own reference implementations | Window/anchor, branch, hybrid and timestep tests against a recorded upstream SHA |
-| Qualify default `auto` and a consumer GPU | Current video forced BF16 projection and compile off on a 96 GB card | Actual default compile/fusion run and 24 GB hybrid/stream run complete; record runtime and visual checks |
+| Native bypass coexistence in both injection orders | Fixed after reproducing both failures; independent linear post-hooks | Real Comfy hook two-cycle tests, shared A/B/A, stale eject and rollback |
+| Calibrate with real, distinct Q/K/V | Implemented; three timing runs, cache schema 4 | Deliberately wrong anchor mask passes old QQQ check and fails distinct-input check |
+| Pinned OpenVDN source oracles | Implemented; source SHA and clean checkout checked | Twenty reduced FP32 window/anchor, branch, hybrid and paired timestep tests |
+| Default `auto` and consumer GPU qualification | Separate generation validation | Require completed runs and runtime/visual evidence; CPU tests do not qualify these routes |
 
 ## Priority 1: compatibility and exact memory improvements
 
-- The compiled block forward lacks native `attention=None`. Reproduce a
-  `blocks_replace` call and preserve the native fallback when an override is supplied.
-- Review FA2/FA4 K/V copies and gather lifetimes. Remove a copy only after CUDA
-  parity and five-run peak-memory/timing checks; grouped savings do not prove FA2 savings.
-- Report the selected AdaLN source (full grid or affine companion), with identity
-  verification status. Existing full grids are not bound to the loaded base table.
+- Implemented native `attention=None` compatibility; supplied overrides fall back
+  to the original block. A regression executes the `blocks_replace` argument form.
+- Removed redundant FA2/FA4 K/V copies and shortened gather lifetimes. FA2 on the
+  recorded synthetic 768p layout: five warm medians 140.257→139.379 ms, peak
+  518 MiB lower, bit-identical output. FA4 hardware validation remains pending.
+- Implemented `curve_source` reporting: type, path, file SHA256 and table identity
+  status. Legacy unbound grids explicitly report unverified.
 - Review fc2 bypass activation lifetime; require unchanged output and measured peak
   reduction before reordering work around the native fused operation.
-- Make short full-cover attention honor the documented exact policy, or explicitly
-  retain and document Comfy attention overrides.
-- Add a pinned-ComfyUI integration job alongside the rolling compatibility job.
+- Implemented exact short full-cover dispatch outside explicit `compat`.
+- Added pinned-ComfyUI/OpenVDN CI alongside rolling compatibility.
 
 ## Priority 2: measured optimization
 

@@ -23,7 +23,7 @@ whole clip, and the Stage-B / Stage-DMD adapters.
 
 | | |
 |---|---|
-| **Faithful** | Window semantics, recurrence, gates, adapter placement and the AdaLN activation follow the OpenVDN design. Tests use Kirei's own reference oracles; automated parity against OpenVDN source is pending. |
+| **Faithful** | Window semantics, recurrence, gates, adapter placement and AdaLN follow the OpenVDN design. Twenty reduced FP32 tests also execute pinned OpenVDN source; full checkpoint/video parity remains unqualified. |
 | **Built for one GPU** | Resident branch weights, calibrated exact attention per geometry, fused pointwise kernels, Triton temporal conv, model-owned compile caches, hybrid/streamed storage and exact tiling for 24 GB cards. |
 | **Honest** | Every speed number lives in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) with its hardware, recipe and date. The benchmark nodes refuse a measurement whose recipe does not match. |
 
@@ -157,8 +157,8 @@ also scoped away from ComfyUI's allocation-graph compiler before the model call,
 user's compiler setting restored after success or failure. This does not disable Kirei's
 separate `torch.compile` policy. Grouped attention releases completed global output and
 selected window K/V before its next allocation. The materialized branch readout is
-released after projection and before softmax; FA2/FA4 buffer lifetimes are a separate
-optimization candidate.
+released after projection and before softmax. FA2/FA4 decomposition avoids redundant
+full K/V copies and releases gathered buffers before scatter.
 
 On full AdaLN bases, the modulation is activated from the fp32 time embedding, as
 OpenVDN's patched diffusers does; ComfyUI otherwise rounds it to BF16 first. The
@@ -303,11 +303,11 @@ with bit-identical BF16 attention output in three geometries. These are attentio
 measurements, not full-video speed or quality claims. See
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and limits.
 
-Plus already has tests against OpenVDN source and post-hook bypass coexistence tests;
-these are useful next steps for Kirei. Our forward-replacement hooks are not yet
-qualified with ComfyUI bypass-mode LoRAs on the same modules. Very short full-cover
-clips also use ComfyUI's attention override path. See the
-[improvement plan](docs/IMPROVEMENT_PLAN.md) for validation gaps and priorities.
+The follow-up adopted reduced pinned OpenVDN source oracles and independent linear
+adapter post-hooks, with tests against ComfyUI's real bypass LoRA hook in both orders.
+Short full-cover clips now use exact SDPA outside explicit `compat`. A separate FA2
+probe saved 518 MiB with bit-identical output on the recorded 768p geometry. See the
+[improvement plan](docs/IMPROVEMENT_PLAN.md) for implemented items and remaining gaps.
 
 ---
 
@@ -368,7 +368,7 @@ instead of falling back to eager attention.
 
 ## Status
 
-0.3.1 is published on `main`; update this installation with `git pull`.
+0.3.2 is available on `main`; update this installation with `git pull`.
 The October 10 smoke test generated a complete 1344×768 video (124 frames, 24 fps,
 with audio) using Stage-DMD, the pruned INT8 FL2VA base and both adapters at 1.0.
 Sampled frames retained a recognizable runner, red jacket and detailed market scene;
@@ -380,7 +380,8 @@ probes and a release-scale end-to-end validation. The measured hardware table is
 being filled with five-run warm medians and reviewed quality results. Candidates that
 need a measured win **and** a passed quality gate before they enter `auto`: copy-free
 grouped attention, SageAttention on the local windows, NVFP4 projection, CUDA graphs on
-the branch, and a parity test against the OpenVDN reference implementation.
+the branch. Reduced FP32 source-oracle parity now runs in CI; CUDA/RoPE, quantized
+weights and end-to-end video parity against OpenVDN remain unqualified.
 
 ## Credits and license
 

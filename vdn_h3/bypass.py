@@ -218,40 +218,25 @@ class _BypassHook:
     def __init__(self, module: nn.Module, adapter: CompositeQKVBypassAdapter):
         self.module = module
         self.adapter = adapter
-        self.original_forward = None
-        # Bound-method identity is not stable across attribute reads. Keep the exact
-        # callable assigned to the module so eject can distinguish our hook from an
-        # unrelated hook installed after it.
-        self.installed_forward = self._forward
+        self.handle = None
 
-    def _forward(self, x, *args, **kwargs):
-        base_out = self.original_forward(x, *args, **kwargs)
+    def _post_forward(self, module, args, kwargs, base_out):
         if not isinstance(base_out, torch.Tensor):
             raise RuntimeError("VDN-H3 LoRA bypass expected a tensor linear output")
+        x = args[0] if args else kwargs["x"] if "x" in kwargs else kwargs["input"]
         return self.adapter.apply(x, base_out)
 
     def inject(self):
-        if self.original_forward is not None:
-            if self.module.forward is self.installed_forward:
-                return False
-            raise RuntimeError(
-                "VDN-H3 bypass hook lost ownership of module.forward while active"
-            )
-        original_forward = self.module.forward
-        self.module.forward = self.installed_forward
-        self.original_forward = original_forward
+        if self.handle is not None:
+            return False
+        self.handle = self.module.register_forward_hook(self._post_forward, with_kwargs=True)
         return True
 
     def eject(self):
-        if self.original_forward is None:
+        if self.handle is None:
             return False
-        if self.module.forward is not self.installed_forward:
-            raise RuntimeError(
-                "VDN-H3 bypass will not overwrite an unrelated module.forward hook"
-            )
-        original_forward = self.original_forward
-        self.module.forward = original_forward
-        self.original_forward = None
+        self.handle.remove()
+        self.handle = None
         return True
 
 
@@ -399,6 +384,30 @@ def fc2_base_output(fc2: nn.Module, hidden: torch.Tensor, activation: torch.Tens
 
 class _MlpBypassHook(_BypassHook):
     """Exact ``mlp.fc2`` adapter term evaluated in activation space on the parent MLP."""
+
+    def __init__(self, module: nn.Module, adapter: CompositeQKVBypassAdapter):
+        super().__init__(module, adapter)
+        self.original_forward = None
+        self.installed_forward = self._forward
+
+    def inject(self):
+        if self.original_forward is not None:
+            if self.module.forward is self.installed_forward:
+                return False
+            raise RuntimeError("VDN-H3 bypass hook lost ownership of module.forward while active")
+        original_forward = self.module.forward
+        self.module.forward = self.installed_forward
+        self.original_forward = original_forward
+        return True
+
+    def eject(self):
+        if self.original_forward is None:
+            return False
+        if self.module.forward is not self.installed_forward:
+            raise RuntimeError("VDN-H3 bypass will not overwrite an unrelated module.forward hook")
+        self.module.forward = self.original_forward
+        self.original_forward = None
+        return True
 
     def _forward(self, x, *args, **kwargs):
         module = self.module

@@ -14,6 +14,8 @@
   AdaLN affine companion format, curve-table identity checks and attention buffer
   lifetimes. The local fallback reconstructs the embedding grid and retains Kirei's
   existing adapter execution; it does not copy Plus's affine projection runtime.
+  The reduced pinned OpenVDN source-oracle tests are adapted from Plus and retain
+  their Apache-2.0 attribution in `tests/test_official_oracle.py`.
 - Speach1sdef178/ComfyUI-VELA-H3 — Apache-2.0 research reference for grouped-window
   batching and selective exact/approximate attention. No VELA approximation policy,
   environment overrides or retained research runtime is included in Kirei.

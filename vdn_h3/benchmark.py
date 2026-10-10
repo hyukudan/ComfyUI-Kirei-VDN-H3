@@ -360,6 +360,7 @@ def runtime_snapshot(model_patcher: Any) -> dict:
         "projection": projection,
         "lora_factors": _module_inventory(getattr(state, "lora_runtime", None)),
         "curve_factors": _module_inventory(getattr(state, "curve_adapter", None)),
+        "curve_source": getattr(getattr(state, "curve_adapter", None), "source", None),
         "diagnostics_enabled": bool(state.diagnostics.enabled),
         "diagnostics": diagnostics,
         "cuda": cuda,

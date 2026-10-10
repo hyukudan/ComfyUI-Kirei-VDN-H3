@@ -25,14 +25,17 @@ checkpoint/video parity.
   518 MiB lower, bit-identical output. FA4 hardware validation remains pending.
 - Implemented `curve_source` reporting: type, path, file SHA256 and table identity
   status. Legacy unbound grids explicitly report unverified.
-- Review fc2 bypass activation lifetime; require unchanged output and measured peak
-  reduction before reordering work around the native fused operation.
+- Tested and rejected the fc2 bypass reorder: bit-identical output on both GPUs,
+  but no peak-memory saving or consistent time improvement across three row counts.
 - Implemented exact short full-cover dispatch outside explicit `compat`.
 - Added pinned-ComfyUI/OpenVDN CI alongside rolling compatibility.
 
 ## Priority 2: measured optimization
 
-- Evaluate deferred `cholesky_ex` error handling without weakening numerical checks.
+- Deferred Cholesky validation now has a measured component benefit: 7.81% lower
+  factor-workload wall time on RTX 4090, preserving bit-identical output and errors.
+  Validation remains before the owning forward returns; this is not a full-video
+  speed claim. See PERFORMANCE for the protocol and separate prototype result.
 - Quality-gate the hybrid/stream quantized projection decision; do not describe it
   as exact merely because attention and adapter placement are exact.
 - Fill the performance table with warm five-run medians and reviewed video/audio,

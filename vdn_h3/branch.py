@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -20,6 +21,54 @@ from .kernels import LinearKernelCache, activate
 
 
 TEXT_STATE_SCALE = 0.5
+_CHOLESKY_CHECKS: ContextVar[Any] = ContextVar("kirei_vdn_cholesky_checks", default=None)
+
+
+class _CholeskyChecks:
+    def __init__(self):
+        self.statuses = []
+        self.factor_calls = 0
+
+    def validate(self):
+        if not self.statuses:
+            return
+        info = torch.cat([status.reshape(-1) for status in self.statuses])
+        if torch.any(info != 0).item():
+            failed = (info != 0).nonzero()[0].item()
+            for index, status in enumerate(self.statuses):
+                if failed < status.numel():
+                    minor = status.reshape(-1)[failed].item()
+                    raise torch.linalg.LinAlgError(
+                        f"VDN-H3 Cholesky factor {index}, batch {failed}: "
+                        f"leading minor of order {minor} is not positive-definite"
+                    )
+                failed -= status.numel()
+
+
+@contextmanager
+def cholesky_runtime_scope(diagnostics):
+    checks = _CholeskyChecks()
+    token = _CHOLESKY_CHECKS.set(checks)
+    try:
+        yield checks
+        if checks.statuses:
+            with diagnostics.scope("linear.cholesky_check", checks.statuses[0].device):
+                checks.validate()
+    finally:
+        checks.statuses.clear()
+        _CHOLESKY_CHECKS.reset(token)
+
+
+def _checked_cholesky(matrix):
+    if not matrix.is_cuda or torch.is_grad_enabled() or torch.compiler.is_compiling():
+        return torch.linalg.cholesky(matrix)
+    checks = _CHOLESKY_CHECKS.get()
+    if checks is None or torch.cuda.is_current_stream_capturing():
+        return torch.linalg.cholesky(matrix)
+    factor, info = torch.linalg.cholesky_ex(matrix, check_errors=False)
+    checks.statuses.append(info)
+    checks.factor_calls += 1
+    return factor
 
 
 class GatherIndexCache:
@@ -103,7 +152,7 @@ class VdnDelta:
             raise ValueError("alpha must have shape A.shape[:-1]")
         a32, b32 = a_raw.float(), b_raw.float()
         identity = torch.eye(a32.shape[-1], device=a32.device, dtype=torch.float32).expand_as(a32)
-        chol = torch.linalg.cholesky(a32 + identity)
+        chol = _checked_cholesky(a32 + identity)
         inv_chol = torch.linalg.solve_triangular(chol, identity, upper=False, left=True)
         inverse = inv_chol.transpose(-1, -2) @ inv_chol
         transition = alpha.float().unsqueeze(-1) * inverse

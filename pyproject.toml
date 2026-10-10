@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-kirei-vdn-h3"
-version = "0.3.2"
+version = "0.3.3"
 description = "VideoDeltaNet (VDN-H3) for native ComfyUI MiniMax-H3: exact math, optimized single-GPU runtime"
 requires-python = ">=3.10"
 dependencies = []

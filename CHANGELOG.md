@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3 (2026-10-10)
+
+- CUDA inference collects Cholesky statuses within the owning model forward and
+  validates them before returning. CPU, autograd, standalone, compiled and captured
+  calls retain native immediate checking; cancellation clears pending statuses.
+- Runtime Report exposes deferred factor/validated forward counts. The production
+  factor microbenchmark improved 7.81% on RTX 4090 with bit-identical output and
+  0.44 MiB additional peak memory; this is not a full-video speed claim.
+- The fc2 activation reorder was tested on PRO 6000 and RTX 4090 and rejected:
+  identical output, unchanged peak allocation and no consistent timing benefit.
+- Full clean-Core suite: 204 tests, including 20 pinned OpenVDN source oracles.
+
 ## 0.3.2 (2026-10-10)
 
 - Linear adapter post-hooks coexist with ComfyUI bypass LoRAs without replacing

@@ -194,7 +194,8 @@ def test_linear_branch_end_to_end_and_anchor_zeroing_is_differentiable():
     assert not module._backends
 
 
-def test_source_has_no_tensor_scalar_sync_item_call():
+def test_only_forward_boundary_validation_can_read_tensor_scalars():
     import inspect
 
-    assert ".item(" not in inspect.getsource(branch)
+    source = inspect.getsource(branch).replace(inspect.getsource(branch._CholeskyChecks), "")
+    assert ".item(" not in source

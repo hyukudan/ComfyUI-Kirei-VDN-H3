@@ -1,0 +1,233 @@
+{
+  "repo_sha": "e81831c7431ca636921fa63bc8156208758e0825",
+  "torch": "2.12.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "scope": "synthetic SPD delta-factor microbenchmark, not complete scan/model/render",
+  "shapes": {
+    "text_A_B": [
+      1,
+      56,
+      128,
+      128
+    ],
+    "video_A_B": [
+      37,
+      56,
+      128,
+      128
+    ]
+  },
+  "workload": {
+    "nfe": 8,
+    "blocks": 50,
+    "factors_per_block": 2,
+    "calls": 800
+  },
+  "validation": "native error per factor vs cholesky_ex info checked once at each successful forward exit",
+  "runs": {
+    "native": [
+      {
+        "cuda_ms": 1974.1112060546875,
+        "wall_ms": 1974.546100012958,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_host_checks": 0,
+        "max_retained_info_bytes": 0
+      },
+      {
+        "cuda_ms": 2036.2916259765625,
+        "wall_ms": 2036.33729997091,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_host_checks": 0,
+        "max_retained_info_bytes": 0
+      },
+      {
+        "cuda_ms": 2010.85546875,
+        "wall_ms": 2010.9164000023156,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_host_checks": 0,
+        "max_retained_info_bytes": 0
+      },
+      {
+        "cuda_ms": 1990.5914306640625,
+        "wall_ms": 1990.6559000373818,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_host_checks": 0,
+        "max_retained_info_bytes": 0
+      },
+      {
+        "cuda_ms": 2008.2144775390625,
+        "wall_ms": 2008.2820000243373,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_host_checks": 0,
+        "max_retained_info_bytes": 0
+      }
+    ],
+    "deferred": [
+      {
+        "cuda_ms": 1837.706298828125,
+        "wall_ms": 1837.7451000269502,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_host_checks": 8,
+        "max_retained_info_bytes": 425600
+      },
+      {
+        "cuda_ms": 1871.9754638671875,
+        "wall_ms": 1872.0487999962643,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_host_checks": 8,
+        "max_retained_info_bytes": 425600
+      },
+      {
+        "cuda_ms": 1846.29248046875,
+        "wall_ms": 1846.4095999952406,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_host_checks": 8,
+        "max_retained_info_bytes": 425600
+      },
+      {
+        "cuda_ms": 1863.6318359375,
+        "wall_ms": 1863.7887999648228,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_host_checks": 8,
+        "max_retained_info_bytes": 425600
+      },
+      {
+        "cuda_ms": 1862.424560546875,
+        "wall_ms": 1862.505000026431,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_host_checks": 8,
+        "max_retained_info_bytes": 425600
+      }
+    ]
+  },
+  "errors": {
+    "cpu": {
+      "negative": {
+        "native_error": "linalg.cholesky: (Batch element 1): The factorization could not be completed because the input is not positive-definite (the leading minor of order 1 is not positive-definite).",
+        "deferred_error": "deferred Cholesky: block=17,text, batch=1, leading minor=1 is not positive-definite",
+        "inside_returned": true,
+        "scope_cleared": true
+      },
+      "singular": {
+        "native_error": "linalg.cholesky: (Batch element 1): The factorization could not be completed because the input is not positive-definite (the leading minor of order 1 is not positive-definite).",
+        "deferred_error": "deferred Cholesky: block=17,text, batch=1, leading minor=1 is not positive-definite",
+        "inside_returned": true,
+        "scope_cleared": true
+      },
+      "empty_scope": {
+        "checks": 0
+      },
+      "executor_error": {
+        "original_error_preserved": true,
+        "scope_cleared": true
+      }
+    },
+    "cuda": {
+      "negative": {
+        "native_error": "linalg.cholesky: (Batch element 1): The factorization could not be completed because the input is not positive-definite (the leading minor of order 1 is not positive-definite).",
+        "deferred_error": "deferred Cholesky: block=17,text, batch=1, leading minor=1 is not positive-definite",
+        "inside_returned": true,
+        "scope_cleared": true
+      },
+      "singular": {
+        "native_error": "linalg.cholesky: (Batch element 1): The factorization could not be completed because the input is not positive-definite (the leading minor of order 1 is not positive-definite).",
+        "deferred_error": "deferred Cholesky: block=17,text, batch=1, leading minor=1 is not positive-definite",
+        "inside_returned": true,
+        "scope_cleared": true
+      },
+      "empty_scope": {
+        "checks": 0
+      },
+      "executor_error": {
+        "original_error_preserved": true,
+        "scope_cleared": true
+      }
+    }
+  },
+  "parity": [
+    {
+      "target": "text",
+      "bit_equal": true,
+      "max_abs": 0.0
+    },
+    {
+      "target": "video",
+      "bit_equal": true,
+      "max_abs": 0.0
+    }
+  ],
+  "medians": {
+    "native": {
+      "cuda_ms": 2008.2144775390625,
+      "wall_ms": 2008.2820000243373,
+      "peak_allocated_bytes": 971218944,
+      "peak_delta_bytes": 681639936,
+      "deferred_host_checks": 0,
+      "max_retained_info_bytes": 0
+    },
+    "deferred": {
+      "cuda_ms": 1862.424560546875,
+      "wall_ms": 1862.505000026431,
+      "peak_allocated_bytes": 971679744,
+      "peak_delta_bytes": 682100736,
+      "deferred_host_checks": 8,
+      "max_retained_info_bytes": 425600
+    }
+  },
+  "cpu_profiler_one_forward": {
+    "native": {
+      "aten::linalg_cholesky": {
+        "count": 100,
+        "self_cpu_us": 931.5000000007385
+      },
+      "aten::linalg_cholesky_ex": {
+        "count": 100,
+        "self_cpu_us": 5840.999999999776
+      },
+      "aten::_linalg_check_errors": {
+        "count": 100,
+        "self_cpu_us": 1188.1999999995915
+      },
+      "aten::item": {
+        "count": 100,
+        "self_cpu_us": 387.8000000001757
+      },
+      "aten::_local_scalar_dense": {
+        "count": 100,
+        "self_cpu_us": 1392.0000000001419
+      },
+      "cudaStreamSynchronize": {
+        "count": 100,
+        "self_cpu_us": 248429.89999999985
+      }
+    },
+    "deferred": {
+      "aten::linalg_cholesky_ex": {
+        "count": 100,
+        "self_cpu_us": 7304.900000000326
+      },
+      "aten::item": {
+        "count": 1,
+        "self_cpu_us": 12.200000000011642
+      },
+      "aten::_local_scalar_dense": {
+        "count": 1,
+        "self_cpu_us": 45.10000000000582
+      },
+      "cudaStreamSynchronize": {
+        "count": 1,
+        "self_cpu_us": 51006.90000000002
+      }
+    }
+  }
+}

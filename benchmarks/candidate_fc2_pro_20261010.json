@@ -1,0 +1,242 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "torch": "2.12.0+cu130",
+  "core_sha": "0b5b009dd4496529b08efa9301f97e0a5fefa2f9",
+  "weights": "actual FL2VA pruned INT8/ConvRot block0 fc2 + Stage-DMD turbo factors",
+  "fc2_shape": [
+    5376,
+    14336
+  ],
+  "rank": 64,
+  "scope": "activation + native fused fc2 + exact bypass; excludes fc1 and full model",
+  "cases": [
+    {
+      "rows": 8660,
+      "parity": {
+        "bit_identical": true,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "samples": {
+        "current": [
+          {
+            "cuda_ms": 3.250688076019287,
+            "wall_ms": 3.293899993877858,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.2872960567474365,
+            "wall_ms": 3.3337000058963895,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.2708160877227783,
+            "wall_ms": 3.3084999886341393,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.286367893218994,
+            "wall_ms": 3.326800011564046,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.2735679149627686,
+            "wall_ms": 3.3106000046245754,
+            "peak_extra_bytes": 496599040
+          }
+        ],
+        "reordered": [
+          {
+            "cuda_ms": 3.203295946121216,
+            "wall_ms": 3.281500015873462,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.233599901199341,
+            "wall_ms": 3.3097999985329807,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.2253119945526123,
+            "wall_ms": 3.268200031016022,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.2495040893554688,
+            "wall_ms": 3.2979000243358314,
+            "peak_extra_bytes": 496599040
+          },
+          {
+            "cuda_ms": 3.233247995376587,
+            "wall_ms": 3.2688999781385064,
+            "peak_extra_bytes": 496599040
+          }
+        ]
+      },
+      "medians": {
+        "current": {
+          "cuda_ms": 3.2735679149627686,
+          "wall_ms": 3.3106000046245754,
+          "peak_extra_bytes": 496599040
+        },
+        "reordered": {
+          "cuda_ms": 3.233247995376587,
+          "wall_ms": 3.281500015873462,
+          "peak_extra_bytes": 496599040
+        }
+      }
+    },
+    {
+      "rows": 20363,
+      "parity": {
+        "bit_identical": true,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "samples": {
+        "current": [
+          {
+            "cuda_ms": 7.704224109649658,
+            "wall_ms": 7.848499983083457,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.6984639167785645,
+            "wall_ms": 7.745200011413544,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.716544151306152,
+            "wall_ms": 7.768200011923909,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.814688205718994,
+            "wall_ms": 7.903299992904067,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.895423889160156,
+            "wall_ms": 7.986599986907095,
+            "peak_extra_bytes": 1167695872
+          }
+        ],
+        "reordered": [
+          {
+            "cuda_ms": 7.658592224121094,
+            "wall_ms": 7.712499995250255,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.676191806793213,
+            "wall_ms": 7.727199990767986,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.673376083374023,
+            "wall_ms": 7.7393000246956944,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.699391841888428,
+            "wall_ms": 7.768400013446808,
+            "peak_extra_bytes": 1167695872
+          },
+          {
+            "cuda_ms": 7.969151973724365,
+            "wall_ms": 8.243200019933283,
+            "peak_extra_bytes": 1167695872
+          }
+        ]
+      },
+      "medians": {
+        "current": {
+          "cuda_ms": 7.716544151306152,
+          "wall_ms": 7.848499983083457,
+          "peak_extra_bytes": 1167695872
+        },
+        "reordered": {
+          "cuda_ms": 7.676191806793213,
+          "wall_ms": 7.7393000246956944,
+          "peak_extra_bytes": 1167695872
+        }
+      }
+    },
+    {
+      "rows": 37859,
+      "parity": {
+        "bit_identical": true,
+        "max_abs": 0.0,
+        "finite": true
+      },
+      "samples": {
+        "current": [
+          {
+            "cuda_ms": 14.301216125488281,
+            "wall_ms": 14.37300001271069,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 14.836447715759277,
+            "wall_ms": 14.906099997460842,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 14.955327987670898,
+            "wall_ms": 15.031600021757185,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 15.35763168334961,
+            "wall_ms": 15.459900023415685,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 15.375519752502441,
+            "wall_ms": 15.477500041015446,
+            "peak_extra_bytes": 2170986496
+          }
+        ],
+        "reordered": [
+          {
+            "cuda_ms": 14.37014389038086,
+            "wall_ms": 14.432600000873208,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 14.585503578186035,
+            "wall_ms": 14.649299962911755,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 15.031167984008789,
+            "wall_ms": 15.115200018044561,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 15.102368354797363,
+            "wall_ms": 15.193099970929325,
+            "peak_extra_bytes": 2170986496
+          },
+          {
+            "cuda_ms": 15.412447929382324,
+            "wall_ms": 15.497899963520467,
+            "peak_extra_bytes": 2170986496
+          }
+        ]
+      },
+      "medians": {
+        "current": {
+          "cuda_ms": 14.955327987670898,
+          "wall_ms": 15.031600021757185,
+          "peak_extra_bytes": 2170986496
+        },
+        "reordered": {
+          "cuda_ms": 15.031167984008789,
+          "wall_ms": 15.115200018044561,
+          "peak_extra_bytes": 2170986496
+        }
+      }
+    }
+  ]
+}

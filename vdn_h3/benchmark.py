@@ -332,6 +332,10 @@ def runtime_snapshot(model_patcher: Any) -> dict:
         "adaln_fp32": bool(getattr(state, "adaln_fp32", False)),
         "profile": getattr(state, "profile", None),
         "forwards": int(state.forwards),
+        "cholesky_checks": {
+            "deferred_factors": int(getattr(state, "cholesky_deferred_factors", 0)),
+            "validated_forwards": int(getattr(state, "cholesky_validated_forwards", 0)),
+        },
         "base_precision": getattr(state, "base_precision", "bf16"),
         "branch_mode": state.weight_mode,
         "branch_execution": getattr(state, "branch_execution", "serial"),

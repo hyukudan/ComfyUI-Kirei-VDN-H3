@@ -231,7 +231,11 @@ def test_auto_branch_mode_separates_24_and_96_gib(monkeypatch):
 
 def test_runtime_snapshot_and_node_are_machine_readable():
     model = _Patcher()
+    state = model.object_patches["diffusion_model._vdn_h3_state"]
+    state.cholesky_deferred_factors = 300
+    state.cholesky_validated_forwards = 3
     snapshot = runtime_snapshot(model)
+    assert snapshot["cholesky_checks"] == {"deferred_factors": 300, "validated_forwards": 3}
     assert snapshot["checkpoint"] == "fixture"
     assert snapshot["branch_gib"] == 4.0
     assert snapshot["branch_storage"]["h2d_bytes"] == 123

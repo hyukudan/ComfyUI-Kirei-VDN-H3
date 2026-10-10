@@ -692,3 +692,23 @@ successful scene does not establish quality equivalence. This validates the sele
 stream route, not every hybrid configuration or long/reference-heavy clip. See
 [consumer evidence](../benchmarks/generation_auto_4090_032_20261010.json).
 FA4 and five-median full-video qualification remain pending.
+
+## 20. Version 0.3.3 Cholesky validation
+
+The full clean-Core suite now passes 204 tests, including the same 20 pinned-source
+oracles. New scope regressions cover native fallbacks, bit equality, negative/singular
+middle factors, nested scopes, cancellation cleanup and validation before model return.
+The CUDA production-path factor probe also checks a bad middle factor and cleanup.
+
+A default-auto 1344×768, 124-frame, 24-fps generation completed on clean Core
+`0b5b009d` and RTX PRO 6000. Runtime Report records `cholesky_checks.deferred_factors=800`
+and `validated_forwards=8`; diagnostics records eight `linear.cholesky_check` stages.
+Block fusion stayed enabled without error and attention failures remained empty.
+H.264/AAC media decoded successfully, with no identical adjacent video frames.
+
+All 124 decoded H.264 frames were bit-identical to the 0.3.2 clean-PRO run with the
+same seed and recipe (maximum pixel difference zero). This is a one-clip decoded-pixel
+regression check, not raw-latent/audio equality, universal quality or trained OpenVDN
+parity. Kernel/file cache warmth differed, so the single-run duration is not a
+qualified speed comparison. See [recorded evidence](../benchmarks/generation_auto_033_20261010.json)
+and the separate component timing protocol in PERFORMANCE.

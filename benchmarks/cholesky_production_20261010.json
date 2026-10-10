@@ -1,0 +1,193 @@
+{
+  "repo_sha": "e81831c7431ca636921fa63bc8156208758e0825",
+  "dirty_production_diff": " tests/test_runtime_policy.py |  4 ++++\n vdn_h3/benchmark.py          |  4 ++++\n vdn_h3/branch.py             | 51 +++++++++++++++++++++++++++++++++++++++++++-\n vdn_h3/hybrid.py             |  9 +++++++-\n 4 files changed, 66 insertions(+), 2 deletions(-)\n",
+  "torch": "2.12.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "scope": "actual production VdnDelta factor_apply, real guards and scope, diagnostics disabled; synthetic SPD",
+  "shapes": {
+    "text_A_B": [
+      1,
+      56,
+      128,
+      128
+    ],
+    "video_A_B": [
+      37,
+      56,
+      128,
+      128
+    ]
+  },
+  "workload": {
+    "nfe": 8,
+    "blocks": 50,
+    "factor_calls": 800
+  },
+  "runs": {
+    "native": [
+      {
+        "wall_ms": 2115.9064000239596,
+        "cuda_ms": 2115.778564453125,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_factors": 0,
+        "validated_forwards": 0
+      },
+      {
+        "wall_ms": 2302.33610002324,
+        "cuda_ms": 2302.17724609375,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_factors": 0,
+        "validated_forwards": 0
+      },
+      {
+        "wall_ms": 2202.4834000039846,
+        "cuda_ms": 2202.322998046875,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_factors": 0,
+        "validated_forwards": 0
+      },
+      {
+        "wall_ms": 2161.121000011917,
+        "cuda_ms": 2161.030029296875,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_factors": 0,
+        "validated_forwards": 0
+      },
+      {
+        "wall_ms": 2055.8278000098653,
+        "cuda_ms": 2055.64111328125,
+        "peak_allocated_bytes": 971218944,
+        "peak_delta_bytes": 681639936,
+        "deferred_factors": 0,
+        "validated_forwards": 0
+      }
+    ],
+    "deferred": [
+      {
+        "wall_ms": 1992.3128999653272,
+        "cuda_ms": 1992.1458740234375,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_factors": 800,
+        "validated_forwards": 8
+      },
+      {
+        "wall_ms": 1962.1189999743365,
+        "cuda_ms": 1961.9942626953125,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_factors": 800,
+        "validated_forwards": 8
+      },
+      {
+        "wall_ms": 2062.989700003527,
+        "cuda_ms": 2062.917724609375,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_factors": 800,
+        "validated_forwards": 8
+      },
+      {
+        "wall_ms": 2089.8848000215366,
+        "cuda_ms": 2089.808837890625,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_factors": 800,
+        "validated_forwards": 8
+      },
+      {
+        "wall_ms": 1908.6631999816746,
+        "cuda_ms": 1908.599853515625,
+        "peak_allocated_bytes": 971679744,
+        "peak_delta_bytes": 682100736,
+        "deferred_factors": 800,
+        "validated_forwards": 8
+      }
+    ]
+  },
+  "cuda_middle_error": {
+    "completed_before_error": 3,
+    "error": "VDN-H3 Cholesky factor 1, batch 1: leading minor of order 1 is not positive-definite",
+    "scope_cleared": true
+  },
+  "parity": [
+    {
+      "target": "text",
+      "bit_equal": true,
+      "max_abs": 0.0
+    },
+    {
+      "target": "video",
+      "bit_equal": true,
+      "max_abs": 0.0
+    }
+  ],
+  "medians": {
+    "native": {
+      "wall_ms": 2161.121000011917,
+      "cuda_ms": 2161.030029296875,
+      "peak_allocated_bytes": 971218944,
+      "peak_delta_bytes": 681639936,
+      "deferred_factors": 0,
+      "validated_forwards": 0
+    },
+    "deferred": {
+      "wall_ms": 1992.3128999653272,
+      "cuda_ms": 1992.1458740234375,
+      "peak_allocated_bytes": 971679744,
+      "peak_delta_bytes": 682100736,
+      "deferred_factors": 800,
+      "validated_forwards": 8
+    }
+  },
+  "cpu_profiler_one_forward": {
+    "native": {
+      "aten::linalg_cholesky": {
+        "count": 100,
+        "self_cpu_us": 732.5999999997839
+      },
+      "aten::linalg_cholesky_ex": {
+        "count": 100,
+        "self_cpu_us": 5569.8999999998205
+      },
+      "aten::_linalg_check_errors": {
+        "count": 100,
+        "self_cpu_us": 757.4999999997517
+      },
+      "aten::item": {
+        "count": 100,
+        "self_cpu_us": 377.40000000011423
+      },
+      "aten::_local_scalar_dense": {
+        "count": 100,
+        "self_cpu_us": 1347.6999999999243
+      },
+      "cudaStreamSynchronize": {
+        "count": 100,
+        "self_cpu_us": 169975.80000000005
+      }
+    },
+    "deferred": {
+      "aten::linalg_cholesky_ex": {
+        "count": 100,
+        "self_cpu_us": 6097.100000000332
+      },
+      "aten::item": {
+        "count": 1,
+        "self_cpu_us": 11.599999999976717
+      },
+      "aten::_local_scalar_dense": {
+        "count": 1,
+        "self_cpu_us": 38.5
+      },
+      "cudaStreamSynchronize": {
+        "count": 1,
+        "self_cpu_us": 48972.0
+      }
+    }
+  }
+}

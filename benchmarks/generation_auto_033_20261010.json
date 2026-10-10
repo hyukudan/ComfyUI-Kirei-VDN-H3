@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-10",
+  "node_version": "0.3.3",
+  "core_sha": "0b5b009dd4496529b08efa9301f97e0a5fefa2f9",
+  "core_tracked_changes": false,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "purpose": "Cholesky forward-boundary validation and decoded pixel regression, not speed qualification",
+  "runtime": {
+    "profile": "auto",
+    "branch_mode": "resident",
+    "projection": {
+      "precision": "bf16"
+    },
+    "block_fusion": true,
+    "block_fusion_error": null,
+    "attention_last": "flash2",
+    "attention_failures": {},
+    "cholesky_checks": {
+      "deferred_factors": 800,
+      "validated_forwards": 8
+    }
+  },
+  "cholesky_diagnostic": {
+    "count": 8,
+    "max_ms": 0.21503999829292297,
+    "mean_ms": 0.17954800091683865,
+    "total_ms": 1.4363840073347092
+  },
+  "media": {
+    "decoded_frames": 124,
+    "fps": 24.0,
+    "width": 1344.0,
+    "height": 768.0,
+    "exact_duplicate_adjacent_frames": 0,
+    "decoded_comparison_to_032": {
+      "equal_frames": 124,
+      "max_absolute_pixel_difference": 0,
+      "mean_absolute_pixel_difference": 0.0
+    },
+    "limits": "Decoded lossy H264 pixels only; not trained OpenVDN parity, raw latent parity, audio-content review or general quality qualification."
+  },
+  "end_to_end_single_run_seconds": 124.133,
+  "limits": [
+    "One seeded clip, not general quality or trained OpenVDN parity",
+    "Decoded lossy H264 pixel equality does not establish raw latent or audio equality",
+    "No five-median full-video speed claim; prior kernel/file cache warmth differs"
+  ]
+}

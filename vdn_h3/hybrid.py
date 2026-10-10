@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from .diagnostics import DiagnosticsRecorder
+from .branch import cholesky_runtime_scope
 from .layout import current_layout, layout_from_payload, publish_layout
 from .runtime import SharedBranchRuntime
 from .weights import FP8_STREAMED_PROJECTION_KEY, ManagedBranchWeights, STREAMED_PROJECTION_KEY
@@ -96,6 +97,8 @@ class VDNState:
         self.curve_adapter = None
         self.lora_runtime = None
         self.forwards = 0
+        self.cholesky_deferred_factors = 0
+        self.cholesky_validated_forwards = 0
         self.last_attention_backend = None
         self.last_layout = None
         self.branch_execution = "serial"
@@ -228,7 +231,11 @@ def make_layout_wrapper(state: VDNState):
         sample = x[0] if isinstance(x, (tuple, list)) and x else x
         device = getattr(sample, "device", None)
         with publish_layout(layout), curve_scope, state.diagnostics.scope("forward.total", device):
-            return executor(*args, **kwargs)
+            with cholesky_runtime_scope(state.diagnostics) as checks:
+                result = executor(*args, **kwargs)
+        state.cholesky_deferred_factors += checks.factor_calls
+        state.cholesky_validated_forwards += int(checks.factor_calls > 0)
+        return result
 
     wrapper._vdn_h3_layout_wrapper = True
     return wrapper

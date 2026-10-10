@@ -180,3 +180,26 @@ and peak extra allocation 5,587,474,432→5,044,312,064 bytes (518 MiB lower).
 Before/after output was bit-identical; both matched grouped within BF16 tolerance.
 This qualifies the FA2 allocation change, not full-video speed or FA4 hardware.
 See [raw measurements](../benchmarks/fa2_memory_20261010.json).
+
+## 6. Tested candidates: fc2 and Cholesky
+
+The fc2 reorder was measured with actual block-0 pruned INT8/ConvRot weights and
+Stage-DMD rank-64 factors, synthetic BF16 activations and native fused ComfyUI fc2.
+Three row counts were tested on PRO 6000 and RTX 4090, with five warm measured calls
+per variant. Outputs were bit-identical, but peak extra allocation was unchanged
+in all six cases. At 37,859 rows, CUDA medians were 14.955→15.031 ms (PRO) and
+22.425→22.607 ms (4090). Smaller differences changed sign. The reorder was rejected:
+the earlier two-temporary SwiGLU peak remains. See [PRO data](../benchmarks/candidate_fc2_pro_20261010.json)
+and [4090 data](../benchmarks/candidate_fc2_4090_20261010.json).
+
+Cholesky was tested with the complete production delta-factor expression, real
+guards and deferred validation on RTX 4090. Each measured run performed eight
+forward scopes × 50 blocks × text/video factors: 800 calls with FP32 shapes
+`[1,56,128,128]` and `[37,56,128,128]`. Synthetic SPD inputs were reused; scans,
+attention and the full render were excluded. Five alternating warm medians gave
+CPU wall 2161.121→1992.313 ms (7.81% lower for this factor workload), bit-identical
+text/video outputs and 0.44 MiB extra peak allocation. Profiling one forward
+confirmed 100→1 host synchronizations while retaining error validation.
+See [production-path measurements](../benchmarks/cholesky_production_20261010.json).
+The earlier [standalone prototype](../benchmarks/candidate_cholesky_20261010.json)
+measured 7.26%; these are separate runs. Neither percentage is a full-video speedup.

@@ -2,8 +2,8 @@
 
 # Kirei VDN-H3
 
-**VideoDeltaNet for native ComfyUI MiniMax-H3.**
-OpenVDN semantics · exact attention dispatch · optimized single-GPU runtime.
+**VideoDeltaNet (VDN-H3) for the native MiniMax-H3 video model in ComfyUI.**
+Exact local attention plus OpenVDN's recurrent branch, tuned for a single GPU.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-custom%20node-7c3aed.svg)](https://github.com/comfyanonymous/ComfyUI)
@@ -15,107 +15,148 @@ OpenVDN semantics · exact attention dispatch · optimized single-GPU runtime.
 
 </div>
 
-Kirei patches the MiniMax-H3 model that ComfyUI has already loaded. The native loader,
-conditioning, audio/video packing, VAEs, quantized checkpoints and model lifecycle stay
-untouched. On top of them Kirei adds what OpenVDN released: an exact local attention
-window, the recurrent **Video Delta Attention** branch that carries context across the
-whole clip, and the Stage-B / Stage-DMD adapters.
+Kirei VDN-H3 is a ComfyUI custom node that turns the MiniMax-H3 model loaded by
+ComfyUI's own loader into the VDN-H3 architecture released by
+[OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3). In each of the 50 transformer
+blocks, dense attention over the whole clip is replaced by two gated paths whose outputs
+are summed:
 
-| | |
-|---|---|
-| **Faithful** | Window semantics, recurrence, gates, adapter placement and AdaLN follow the OpenVDN design. Twenty reduced FP32 tests also execute pinned OpenVDN source; full checkpoint/video parity remains unqualified. |
-| **Built for one GPU** | Resident branch weights, calibrated exact attention per geometry, fused pointwise kernels, Triton temporal conv, model-owned compile caches, hybrid/streamed storage and exact tiling for 24 GB cards. |
-| **Honest** | Every speed number lives in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) with its hardware, recipe and date. The benchmark nodes refuse a measurement whose recipe does not match. |
+- an exact **local softmax window**: the frame's 5-frame latent chunk, one chunk on each
+  side, two anchor frames and every global row such as text;
+- the recurrent **Video Delta Attention** branch, which carries context from the rest of
+  the clip at linear cost.
+
+The node loads the released VDN branch weights and the Stage-DMD (8-step) or Stage-B
+(50-step) adapters. ComfyUI keeps everything else: checkpoint and quantized loaders,
+text encoder, conditioning, audio/video packing, VAEs, sampling and model memory
+management. No ComfyUI file is modified.
 
 > Model weights are not included. Follow the licenses of MiniMax-H3 and of the VDN-H3
 > checkpoint you use.
+
+**Status.** Version 0.3.3 is available from the GitHub `main` branch. It is not yet
+published in the Comfy Registry; install and update it with git as shown below.
 
 ---
 
 ## Install
 
-**1. Clone the node.** No extra Python packages are required.
+### 1. Clone the node
 
 ```bash
 cd <ComfyUI>/custom_nodes
 git clone https://github.com/hyukudan/ComfyUI-Kirei-VDN-H3.git
 ```
 
-**2. Download a complete VDN stage** into `models/vdn`. Keep the OpenVDN directory
-intact: Kirei validates the stage specification, branch inventory, block/head geometry and
-adapter targets, and rejects an incomplete checkpoint instead of applying part of it.
+Restart ComfyUI. The package declares no Python dependencies of its own; update it later
+with `git pull`.
 
-```bash
-# released 8-step model
-hf download OpenVDN/vdn-minimax-h3 --include "stage-dmd-step-250/*" --local-dir <ComfyUI>/models/vdn
-# optional 50-step fidelity reference
-hf download OpenVDN/vdn-minimax-h3 --include "stage-b-step-2000/*"  --local-dir <ComfyUI>/models/vdn
-```
+**Requirements**
 
-Pruned/curve-form H3 bases also need `h3_silu_temb_grid.safetensors` to apply the
-Stage-DMD AdaLN factors. Put one copy directly in `models/vdn` (preferred), or inside
-the selected stage directory. Existing installations of `ComfyUI-MiniMax-H3-Turbo`
-may already contain the same file; Kirei accepts that sibling location only as a legacy
-fallback.
+- A current ComfyUI with native MiniMax-H3 support.
+- A CUDA build of PyTorch with Triton (`triton-windows` on native Windows). Triton runs
+  the temporal kernel, FlexAttention and the compiled fusions.
+- For INT8/ConvRot bases: comfy-kitchen and a PyTorch **cu130+** build. Older builds run
+  comfy-kitchen's slow fallback.
 
-If no embedding grid is installed, Kirei also accepts a matching
-`<VDN stage>/adaln_affine.safetensors` companion with `adaln_basis` and `adaln_mean`.
-The small [published companions](https://huggingface.co/multimodalart/MiniMax-H3-Pruned)
-use `transformer/adaln_affine.safetensors` for FL2VA/T2VA and
-`transformer_ref/adaln_affine.safetensors` for Ref2VA. Install only the one matching
-your H3 base. A supplied curve table or `adaln_table_sha256` is verified against the
-loaded base; published files without either are treated as an explicit stage-local
-companion. The original embedding grid remains preferred when both are present.
-This adds portability, not a claim that affine reconstruction improves image quality.
+**Optional attention backends.** Installed backends join the attention calibration;
+none is assumed to win.
 
-**3. Have the native MiniMax-H3 models** from
-[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3):
+- flash-attn 2 (`flash2`): Ampere or newer, sm_120 included when a wheel exists for your
+  torch/CUDA.
+- flash-attn-4 (`decomposed`): optional on Linux/WSL2 when its dependencies match
+  your environment. Its CUTLASS DSL binary dependencies currently support Linux;
+  see [NVIDIA's compatibility requirements](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html#compatibility-requirements).
+  FA4 has not been qualified on hardware for this package.
+
+### 2. MiniMax-H3 models
+
+From [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3), loaded with
+ComfyUI's standard loader nodes:
 
 | Model | File | Folder |
 |---|---|---|
-| Diffusion model | `minimax_h3_fl2va_int8_convrot.safetensors` (needs a torch **cu130+** build for the fast INT8 kernels) or the `fp8_scaled` variant | `models/diffusion_models` |
+| Diffusion model, tested | [`minimax_h3_fl2va_pruned_int8_convrot.safetensors`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors) | `models/diffusion_models` |
 | Text encoder | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `models/text_encoders` |
 | Video VAE | `minimax_h3_video_vae_fp16.safetensors` | `models/vae` |
 | Audio VAE | `minimax_h3_audio_vae_fp32.safetensors` | `models/vae` |
 
-A BF16 base works too if you have the VRAM for it; `auto` then folds the adapters into the
-weights exactly and leaves no low-rank GEMMs in the hot path.
+A BF16 base also works if it fits in VRAM. The repository also provides the full
+`minimax_h3_fl2va_int8_convrot.safetensors` and pruned
+`minimax_h3_fl2va_pruned_fp8_scaled.safetensors` variants. The tested pruned INT8
+base listed above needs step 4.
 
-**Requirements.** A current ComfyUI with native MiniMax-H3 support, a CUDA build of
-PyTorch, Triton (temporal kernel, FlexAttention, compiled fusions). Optional:
-comfy-kitchen for INT8/NVFP4 bases; flash-attn 2 for the varlen decomposition (Ampere
-and newer, sm_120 included when a wheel exists for your torch); **flash-attn-4**, the
-CuTe DSL package (`pip install flash-attn-4`, or `"flash-attn-4[cu13]"` on CUDA 13),
-which brings the tcgen05 kernel on B200, the wgmma kernel on Hopper and an mma.sync
-kernel on sm_120 / Ada / Ampere. flash-attn-4 depends on `nvidia-cutlass-dsl`, which has
-no Windows wheel: it cannot be installed on native Windows (do not force it with
-`--no-deps`); use WSL2 or a Linux ComfyUI to try it. Flex on Windows needs
-`triton-windows`.
+### 3. A VDN stage
+
+Download a complete OpenVDN stage directory into `models/vdn`; the `vdn_checkpoint`
+dropdown lists the directories found there. Keep the directory intact: Kirei checks the
+stage specification, branch inventory, block/head geometry and adapter targets, and
+rejects an incomplete checkpoint instead of applying part of it.
+
+```bash
+# Stage-DMD: the released 8-step generator
+hf download OpenVDN/vdn-minimax-h3 --include "stage-dmd-step-250/*" --local-dir <ComfyUI>/models/vdn
+# Stage-B: optional 50-step fidelity reference, used for diagnosis
+hf download OpenVDN/vdn-minimax-h3 --include "stage-b-step-2000/*"  --local-dir <ComfyUI>/models/vdn
+```
+
+### 4. AdaLN data for pruned bases
+
+Pruned (curve-form) H3 bases store AdaLN as a small curve, and the Stage-DMD AdaLN
+adapter terms need extra data to be applied to them. Full bases skip this step.
+
+- **Preferred:** `h3_silu_temb_grid.safetensors`, one copy directly in `models/vdn` or
+  inside the selected stage directory. An existing `ComfyUI-MiniMax-H3-Turbo`
+  installation may already contain it; Kirei accepts that sibling location only as a
+  legacy fallback.
+- **Alternative,** used only when no grid is installed: a
+  `<stage>/adaln_affine.safetensors` companion with `adaln_basis` and `adaln_mean`. The
+  small [published companions](https://huggingface.co/multimodalart/MiniMax-H3-Pruned)
+  ship `transformer/adaln_affine.safetensors` for FL2VA/T2VA and
+  `transformer_ref/adaln_affine.safetensors` for Ref2VA; install only the one matching
+  your base. A supplied curve table or `adaln_table_sha256` is verified against the
+  loaded base. This is a portability option, not a quality improvement.
+
+For the tested FL2VA pruned base, download the
+[FL2VA affine file](https://huggingface.co/multimodalart/MiniMax-H3-Pruned/blob/main/transformer/adaln_affine.safetensors)
+and place it at `models/vdn/stage-dmd-step-250/adaln_affine.safetensors` when using
+Stage-DMD without an existing grid.
+
+The Runtime Report's `curve_source` names the file in use, its SHA-256 and whether its
+table identity was verified. A legacy grid carries no table identity and reports
+`base_table_verified = false`.
 
 ---
 
-## Use
+## Minimal workflow
 
-Insert **Kirei Apply VDN-H3** right after the diffusion model loader, before the
-MiniMax-H3 model-sampling node and the sampler.
+Insert **Kirei Apply VDN-H3** between the diffusion model loader and the MiniMax-H3
+model-sampling node. Text encoding, latents, VAE decoding and saving are the usual
+MiniMax-H3 nodes.
 
 ```text
 Load Diffusion Model ─▶ Kirei Apply VDN-H3 ─▶ MiniMax-H3 model sampling (video 12 / audio 3) ─▶ KSampler
 ```
 
-Four settings matter. Everything else has a tooltip and a safe default.
+Four inputs matter. Everything else has a tooltip and a safe default.
 
 | Input | Value | Why |
 |---|---|---|
 | `vdn_checkpoint` | `stage-dmd-step-250` | the released 8-step generator |
-| `profile` | `auto` | quality-first policy, see below |
+| `profile` | `auto` | quality-first runtime policy, see below |
 | `apply_turbo_adapter` | `true` | Stage-DMD needs **both** adapters at 1.0 |
 | `strength` | `1.0` | the released recipe; the per-adapter strengths inherit it |
 
+The complete 1344×768 default-`auto` graph used for validation is available in API
+format: [`benchmarks/vdn_auto_768p.api.json`](benchmarks/vdn_auto_768p.api.json).
+Use the native `CLIPLoader` with `type = minimax`. The Apply node already loads
+the released VDN adapters; do not add a separate H3/Larry turbo LoRA to this recipe.
+
 ### Sampling recipe
 
-The trajectory is part of the model. Use it exactly; `res_multistep`, extra steps or CFG
-produce hard, patterned or oversharpened output even when the checkpoint is correct.
+The sampling trajectory is part of the released model. `res_multistep`, extra steps or
+CFG above 1 produce hard, patterned or oversharpened output even when the checkpoint is
+correct.
 
 | | Stage-DMD (`stage-dmd-step-250`) | Stage-B (`stage-b-step-2000`) |
 |---|---|---|
@@ -126,55 +167,66 @@ produce hard, patterned or oversharpened output even when the checkpoint is corr
 | Adapters | default 1.0 + turbo 1.0 | default 1.0, turbo **off** |
 | Profile | `auto` | `reference` (numerical oracle) |
 
-Use Stage-B first when a result looks wrong: if 50 steps are already off, the problem is
-in the architecture, window semantics or AdaLN handling, not in the distillation adapter.
+If a Stage-DMD result looks wrong, render the same prompt with Stage-B. If 50 steps are
+already off, check the setup (checkpoint, AdaLN data, window handling) before blaming the
+distillation adapter.
 
 ---
 
-## What `auto` decides
+## What `auto` chooses
 
-`auto` is quality-first: its attention and adapter paths stay exact, and its resident
-projection stays BF16. On hybrid/stream INT8 or FP8 bases it may quantize the VDN
-projection to reduce storage and transfers. That choice is approximate; the Runtime
-Report shows the selected `projection.precision`.
+`auto` is quality-first: local attention and adapters stay exact, and the VDN projection
+stays BF16 whenever the branch is resident.
 
 | Situation | Adapters | VDN projection | Branch storage | Local attention |
 |---|---|---|---|---|
-| BF16 base | merged (one fp32 delta, one rounding: exact) | BF16 | resident | calibrated exact winner |
-| INT8 / FP8 / NVFP4 / MXFP8 base | exact activation-space bypass, `mlp.fc2` included | BF16 | resident | calibrated exact winner |
-| Not enough headroom (total VRAM minus the base model) | bypass | may follow an INT8/FP8 base | hybrid or stream; 5-frame exact tiles on cards ≤ 32 GB | calibrated exact winner |
-| Reference/keyframe rows make grouped attention copy too much | as above | as above | as above | calibrated exact winner when the peak fits; Flex without calibration on peak-memory risk |
+| BF16 base | merged (one fp32 delta, one rounding) | BF16 | resident | calibrated exact winner |
+| INT8 / FP8 / NVFP4 / MXFP8 base | activation-space bypass, `mlp.fc2` included | BF16 | resident | calibrated exact winner |
+| Not enough headroom (total VRAM minus the base model) | bypass | may follow an INT8/FP8 base (approximate) | hybrid or stream; exact 5-frame tiles on cards ≤ 32 GB | calibrated exact winner |
+| Reference/keyframe rows would make grouped attention copy too much | as above | as above | as above | calibrated winner when the peak fits; Flex without calibration on peak-memory risk |
 
-Two rules behind the table. Merging an adapter into a quantized weight requantizes it and
-rounds part of the update away, which is the softening people see with merged LoRAs on
-INT8/FP8 bases, so `auto` never does it. And a quantized backbone does not mean the new
-VDN projection should be quantized: on the workstation measurements INT8 did not beat
-BF16, so resident quantized projections stay explicit experiments.
+### What is exact and what is not
 
-Kirei keeps long clips predictable by batching the temporary frame-statistics workspace
-instead of scaling that preparation allocation with the full sequence. Its model call is
-also scoped away from ComfyUI's allocation-graph compiler before the model call, with the
-user's compiler setting restored after success or failure. This does not disable Kirei's
-separate `torch.compile` policy. Grouped attention releases completed global output and
-selected window K/V before its next allocation. The materialized branch readout is
-released after projection and before softmax. FA2/FA4 decomposition avoids redundant
-full K/V copies and releases gathered buffers before scatter.
-
-On full AdaLN bases, the modulation is activated from the fp32 time embedding, as
-OpenVDN's patched diffusers does; ComfyUI otherwise rounds it to BF16 first. The
-`adaln_fp32` patch is on by default. Curve-form pruned bases already evaluate their
-AdaLN curve in fp32 without that SiLU patch, so their Runtime Report shows
-`adaln_fp32 = false` and non-zero `curve_factors`.
+- **Local attention.** The windows run only on exact backends: grouped SDPA (through
+  ComfyUI's exact SDPA dispatch), FlexAttention, or the FA2/FA4 varlen decompositions. A
+  candidate can win calibration only after matching the grouped oracle. ComfyUI's global
+  SageAttention or quantized-attention overrides do not reach the windows unless you
+  select `attention_backend = compat`, which may use approximate kernels.
+- **Adapters.** On BF16 bases they are merged with one fp32 delta and a single rounding.
+  On quantized bases they run as an activation-space bypass, so quantized weights are
+  never requantized and the update is not rounded away; merging would cause the
+  softening seen with merged LoRAs on INT8/FP8 bases. Bypass does not make a quantized
+  base equal to the BF16 model.
+- **Backbone vs. VDN projection.** Backbone quantization comes from the H3 checkpoint you
+  load. The VDN `to_out_linear` projection is a separate choice: BF16 when resident, and
+  possibly INT8/FP8 when `auto` streams the branch over an INT8/FP8 base to reduce
+  transfers. That is approximate and reported as `projection.precision`. Resident
+  INT8/FP8 projections stay explicit experiments: INT8 did not beat BF16 on the recorded
+  workstation runs.
+- **Memory scheduling.** Hybrid/stream storage and N-frame tiling change where weights
+  live and how activations are materialised, not the window or recurrence equations.
+- **AdaLN.** On full bases the modulation is activated from the fp32 time embedding, as
+  in OpenVDN's patched diffusers (`adaln_fp32`, on by default); ComfyUI would otherwise
+  round it to BF16 first. Curve-form bases already evaluate their curve in fp32, so they
+  report `adaln_fp32 = false` with non-zero `curve_factors`.
+- **Cholesky checks.** In CUDA inference, the SPD status of the per-frame Cholesky
+  factors is collected during each model forward and checked once before the forward
+  returns, instead of synchronising after every factor. A failed factorization still
+  raises before its result leaves the forward. CPU, autograd, standalone, compiled and
+  captured calls keep immediate checking.
 
 ### Profiles
 
 | Profile | Use it for | What changes |
 |---|---|---|
-| `auto` | everything | the table above |
-| `max_speed` | an explicit speed experiment | resident branch, adapters **merged** (requantized on quantized bases), quantized projection, CUDA graphs. Only faster if the benchmark and the quality gate say so. |
-| `low_vram` | 24 GB cards | hybrid storage, 5-frame exact tiling, bypass adapters |
+| `auto` | everything | the tables above |
+| `low_vram` | forcing the 24 GB layout | hybrid storage, exact 5-frame tiles, bypass adapters |
 | `reference` | the numerical oracle | eager branch, grouped SDPA, BF16, no compile |
-| `balanced`, `compat_reference`, `experimental_fp8`, `workstation_fp8` | experiments | manual placement, Comfy's attention override on the windows, FP8 projection, two-stream branch |
+| `max_speed` | experiment only | resident branch, adapters **merged** (requantized on quantized bases), quantized projection, CUDA graphs; not qualified as faster or same quality |
+| `balanced` | legacy conservative preset | automatic placement, BF16 projection, exact attention |
+| `compat_reference` | compatibility comparison | eager streamed branch, BF16 projection, Comfy attention overrides |
+| `experimental_fp8` | experiment only | automatic placement with FP8 VDN projection |
+| `workstation_fp8` | experiment only | resident FP8 projection, merged adapters, automatic parallel-branch candidate |
 
 A profile name is not a benchmark result.
 
@@ -186,7 +238,7 @@ A profile name is not a benchmark result.
 | `default_adapter_strength`, `turbo_adapter_strength` | -1 … 2 | per-adapter strength; -1 inherits `strength` |
 | `lora_mode` | auto, bypass, merge | auto merges on BF16 bases and bypasses on quantized ones; merging into a quantized base requantizes the weight |
 | `branch_mode` | auto, resident, hybrid, stream | where the VDN branch lives; auto budgets total VRAM minus the base model |
-| `attention_backend` | auto, grouped, flex, flash2, decomposed, reference, compat | exact local-window kernel; auto calibrates once per geometry and persists; compat goes through ComfyUI's attention override and is approximate |
+| `attention_backend` | auto, grouped, flex, flash2, decomposed, reference, compat | auto calibrates exact kernels once per geometry/environment; compat delegates to ComfyUI and may be approximate |
 | `projection_precision` | auto, bf16, int8, fp8 | precision of the VDN `to_out_linear` GEMM; int8 / fp8 are quality-gated experiments |
 | `kernel_backend` | auto, triton, conv1d, eager | temporal-conv and activation kernels of the linear branch |
 | `compile_policy` | auto, off, shared, reduce_overhead, max_autotune | torch.compile policy for the fused bodies; reduce_overhead is CUDA graphs |
@@ -203,51 +255,50 @@ Use `reference` instead of rebuilding the numerical oracle from these switches.
 
 ---
 
-## Your GPU
+## Settings by GPU
 
-**RTX PRO 6000 Blackwell / RTX 50xx (sm_120).** This family is not a B200: it has no
-tcgen05 tensor-core path and 99 KB of shared memory, so the FA4 kernel OpenVDN measured
-does not apply. flash-attn-4 does ship an sm_120 kernel, its SM80-class mma.sync design,
-and `auto` treats it as one more exact candidate: the calibration benchmarks grouped
-SDPA, Flex-Triton and the FA4 decomposition once per geometry, checks parity and
-persists the winner in `models/vdn/vdn_h3_calibration.json`. Nothing is assumed to win
-here until it does; the Runtime Report shows the generation as `fa4_kernel`. NVFP4 and
-MXFP8 bases are recognised. The fast INT8 path of the ConvRot checkpoint needs a torch
-cu130+ build; older builds run comfy-kitchen's slow fallback. ComfyUI's global
-SageAttention switch does not touch the exact VDN windows unless you select
-`attention_backend = compat`.
+Keep `profile = auto` on every card; these notes say what it will pick and what to check.
+The attention calibration runs once per geometry and software environment, verifies
+parity and stores the winner in `models/vdn/vdn_h3_calibration.json`.
 
-**Native Windows.** flash-attn-4 is not installable (no `nvidia-cutlass-dsl` wheel), so
-the candidates are grouped SDPA, Flex through `triton-windows` and FA2 (`flash2`) when a
-wheel for your torch/CUDA is installed. Flex validates H3's fused Q/K/V layouts and only
-materialises an operand when safe indexing requires it; smaller layouts keep the zero-copy
-path. The Runtime Report shows `fa4_available = false` next to `fa4_kernel`, the
-generation the card would run.
+**RTX PRO 6000 Blackwell / RTX 50xx (sm_120).** With an INT8 or FP8 base and enough
+VRAM, `auto` keeps the branch resident with a BF16 projection and bypass adapters. This
+family is not a B200: it has no tcgen05 path and 99 KB of shared memory, so OpenVDN's
+B200 FA4 numbers do not apply. flash-attn-4's sm_120 kernel (mma.sync) is one more
+calibration candidate next to grouped SDPA, Flex and FA2; FA4 has not yet been validated
+on hardware for this package. The Runtime Report names the generation as `fa4_kernel`.
 
-If the same machine also runs other PyTorch Inductor/Triton workloads, give ComfyUI its
-own compile caches in the launcher. Replace `<ComfyUI>` with the installation path:
+**RTX 4090 and other 24 GB cards.** When the branch does not fit next to the base, `auto`
+uses hybrid or streamed branch storage with exact 5-frame tiles; over an INT8/FP8 base
+the streamed projection follows the base precision (approximate). Block fusion is off
+while streaming, as expected. `low_vram` forces hybrid storage and tiling.
+
+**H100 / H200 / B200.** With flash-attn-4 installed, its decomposition joins the
+available exact calibration candidates. The heuristic prefers FA4 when applicable,
+but the calibrated winner takes precedence. No results on
+these GPUs are recorded for this package.
+
+**Native Windows.** The tested setup has no FA4 backend; CUTLASS DSL's current binary
+dependencies are Linux-only. The available candidates are grouped
+SDPA, Flex through `triton-windows`, and FA2 when a wheel for your torch/CUDA is
+installed. The Runtime Report shows `fa4_available = false` next to `fa4_kernel`.
+
+**Machines shared with other PyTorch/Triton workloads.** Give ComfyUI its own compile
+caches in the launcher so unrelated runtimes cannot reuse each other's artifacts:
 
 ```bat
 set "TORCHINDUCTOR_CACHE_DIR=<ComfyUI>\user\.cache\torchinductor-comfyui"
 set "TRITON_CACHE_DIR=<ComfyUI>\user\.cache\triton-comfyui"
 ```
 
-Cache isolation prevents artifacts from unrelated Python runtimes being reused and makes
-compilation reproducible.
-
-**24 GB cards.** `auto` moves to hybrid or streamed branch storage and exact 5-frame tiles
-when the budget requires it; `low_vram` forces that layout.
-
-**H100 / H200 / B200.** The FA4 decomposition (wgmma / tcgen05 kernels) is tried first
-when flash-attn-4 is installed; otherwise the same grouped/Flex calibration applies.
-
 ---
 
 ## When VDN pays off
 
 VDN replaces dense attention over the whole clip with a local window plus a linear
-branch. The saving grows with the sequence; on short low-resolution clips the branch and
-the extra projection cost as much as the attention they replace.
+branch. The saving grows with sequence length; on short low-resolution clips the branch
+and its extra projection cost about as much as the attention they replace. The table is
+a FLOP model, not a measured speed-up.
 
 | Geometry | Dense ÷ VDN FLOPs per block |
 |---|---:|
@@ -257,17 +308,43 @@ the extra projection cost as much as the attention they replace.
 | 1280×736 · 145 f | 1.38× |
 | 1344×768 · 345 f | 2.53× (OpenVDN measured 2.65× on a B200) |
 
-The FLOP model puts the linear branch at 6–8 % of block computation; this is not its
-share of runtime. One 768p run with compile off measured about 20 % of warm block time.
-The model, the measured table and the protocol are in
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). If VDN is slower than the base at a geometry
-where the model says it should win, it is a profiler result, not a property of VDN:
-check cold vs warm, the attention backend, the projection precision and the branch
-placement in the Runtime Report.
+The FLOP model puts the linear branch at 6–8 % of block computation; that is not its
+share of runtime (one 768p run with compile off measured about 20 % of warm block time).
+At 608×352 with 121 and 241 frames, the recorded RTX PRO 6000 runs of VDN were slower
+than dense H3 with a turbo LoRA. If VDN is slower at a geometry where the model predicts
+a win, compare warm runs and check the attention backend, projection precision and branch
+placement in the Runtime Report. Measurements and protocol:
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ---
 
-## Quality checklist
+## Supported formats and limits
+
+| | Supported | Notes |
+|---|---|---|
+| H3 base precision | BF16, FP8 scaled, INT8/ConvRot, NVFP4, MXFP8; W4A4/W4A8 layouts are recognised | default `auto` uses bypass on quantized bases; families without a matching VDN projection keep it in BF16 |
+| H3 AdaLN form | full bases; pruned curve-form bases with the e-grid or an affine companion | see install step 4 |
+| VDN checkpoints | complete OpenVDN Stage-DMD and Stage-B directories (BF16) | pre-quantized full-branch files are not supported; INT8/FP8 projection is a runtime option |
+| Local attention | grouped SDPA, Flex, FA2, FA4 decomposition (exact); `compat` (Comfy overrides) | see [Settings by GPU](#settings-by-gpu) |
+| Sequence packing | ComfyUI's native uniform H3 packing | [VDN-H3-Plus](https://github.com/xmarre/ComfyUI-VDN-H3-Plus) mixed-grid / Flow-Aligned Regenerate workflows are not compatible |
+
+- One GPU per patched model. MultiGPU shallow clones are rejected; a distributed port
+  would need real sharding.
+- One Apply node per MODEL. Applying VDN twice, or after another attention patch, is
+  rejected; apply VDN first.
+- Released geometry only: the checkpoint's `linear_head_dim` must equal H3's attention
+  head dimension (128).
+- H3 aligns the requested frame count to its temporal grid; that is expected.
+- Kirei scopes ComfyUI's allocation-graph compiler off for its model call and restores
+  your setting afterwards, also on errors. Its own `compile_policy` is separate.
+- Not shipped: [VELA](https://github.com/Speach1sdef178/ComfyUI-VELA-H3)'s selective
+  Sage / attention islands, approximate QKV policies, anchor-column pruning and retained
+  scratch caches. An exact analogue of VELA's three-window batching was slower and used
+  more temporary memory on RTX 4090, so it is not enabled.
+
+---
+
+## Diagnostics
 
 Connect **Kirei VDN-H3 Runtime Report** after the apply node (and its `after` input to
 the sampler output for a post-render report) and confirm:
@@ -275,50 +352,25 @@ the sampler output for a post-render report) and confirm:
 1. `euler` / `simple` / 8 steps / denoise 1.0 / CFG 1.0, shifts 12 / 3;
 2. `adapters.active = [default, turbo]`, both strengths 1.0;
 3. `adapters.lora_mode = bypass` on a quantized base; full AdaLN bases report
-   `adaln_fp32 = true`, while curve-form bases report non-zero `curve_factors`;
-4. `projection = bf16` before any INT8/FP8 experiment;
+   `adaln_fp32 = true`, curve-form bases report non-zero `curve_factors`;
+4. `projection.precision = bf16` before any INT8/FP8 experiment;
 5. `attention_calibration` names an exact backend (grouped, flex, flash2, decomposed);
-6. Stage-B / 50 with `reference` separates architecture problems from distillation ones.
+6. Stage-B / 50 steps with `reference` separates setup problems from distillation ones.
 
-H3 aligns the requested frame count to its temporal grid. That is not a quality failure.
+Other useful fields: `attention_failures` and `block_fusion_error` show latched
+fallbacks; `attention_calibration.dispatch_reason` explains the backend choice;
+`cholesky_checks` counts deferred factors and validated forwards. With
+`diagnostics = on` the report adds per-stage CUDA timings (including
+`linear.cholesky_check`) and memory.
 
----
-
-## Comparison with VDN-H3-Plus and VELA
-
-The October 2026 review compared current source, not just repository versions.
-
-| Feature | Kirei decision |
-|---|---|
-| [VDN-H3-Plus](https://github.com/xmarre/ComfyUI-VDN-H3-Plus) compact AdaLN affine companion | Supported as a fallback when the full embedding grid is absent; table identities are checked when supplied. |
-| Pre-RoPE linear complement and compiler guard | Already present locally; buffer lifetimes and failure restoration now have regression tests. |
-| VDN-H3-Plus mixed-grid / Flow-Aligned Regenerate interfaces | Not implemented. Kirei consumes native uniform H3 packing; do not assume external progressive-grid workflows are compatible. |
-| Pre-quantized full VDN branch files | Not supported. Use the original OpenVDN BF16 stage; Kirei's INT8/FP8 projection options are separate runtime experiments. |
-| [VELA](https://github.com/Speach1sdef178/ComfyUI-VELA-H3) three-window batching | An exact analogue was slower and allocated more temporary memory on the tested RTX 4090 geometries; not enabled. |
-| VELA selective Sage / exact attention islands | Not ported. Local-window dispatch uses exact backends; `compat` allows Comfy attention overrides but does not reproduce VELA's trajectory policy. |
-| VELA anchor-column pruning and retained research caches | Not enabled; these change the trained operator or resource lifetime and need separate decoded-video validation. |
-
-The RTX 4090 grouped-attention buffer-lifetime probe reduced temporary peak allocations by **105–386 MiB**
-with bit-identical BF16 attention output in three geometries. These are attention-only
-measurements, not full-video speed or quality claims. See
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for the measurements and limits.
-
-The follow-up adopted reduced pinned OpenVDN source oracles and independent linear
-adapter post-hooks, with tests against ComfyUI's real bypass LoRA hook in both orders.
-Short full-cover clips now use exact SDPA outside explicit `compat`. A separate FA2
-probe saved 518 MiB with bit-identical output on the recorded 768p geometry. See the
-[improvement plan](docs/IMPROVEMENT_PLAN.md) for implemented items and remaining gaps.
-
----
-
-## Troubleshooting
+### Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Hard, patterned or oversharpened frames | `res_multistep`, 4 steps on the 8-step checkpoint, or CFG > 1 | use the recipe above |
 | Soft output on an INT8/FP8 base | adapters merged (`max_speed` or `lora_mode = merge`) | `auto` or `lora_mode = bypass` |
-| Out of memory on the first run with reference images | grouped attention copies every global row into every window | update the node and check `attention_calibration.dispatch_reason`; current `auto` selects Flex before an unsafe peak-memory calibration, while `low_vram` also reduces model residency |
-| Old attention winner after updating the node, torch or a backend | none: the calibration signature includes the node version, torch/CUDA/driver, Triton, flash-attn versions and the installed backends | a changed environment recalibrates by itself; delete `models/vdn/vdn_h3_calibration.json` to force it |
+| Out of memory on the first run with reference images | grouped attention copies every global row into every window | check `attention_calibration.dispatch_reason`; `auto` selects Flex before an unsafe peak-memory calibration, and `low_vram` also reduces branch residency |
+| Worried about a stale attention winner after an update | the calibration signature includes the node version, torch/CUDA/driver, Triton, flash-attn versions and installed backends | a changed environment recalibrates by itself; delete `models/vdn/vdn_h3_calibration.json` to force it |
 | INT8 base is slow | torch build older than cu130: comfy-kitchen falls back | install a cu130+ build or use the `fp8_scaled` base |
 | Dropdown shows the placeholder instead of a checkpoint | the stage directory is not under `models/vdn` | move it there and refresh the node list |
 | "VDN-H3 is already applied to this MODEL" | one model was patched twice | keep a single Apply node per model |
@@ -337,23 +389,75 @@ probe saved 518 MiB with bit-identical output on the recorded 768p geometry. See
 | Kirei Benchmark Scenario / Sampling / Start / End | `…/benchmark` | recipe-locked benchmark protocol, see [`benchmarks/README.md`](benchmarks/README.md) |
 | Kirei Apply VDN-H3 (Legacy) | `…/legacy` | compatibility with old saved workflows |
 
-Lifecycle rules: the branch weights are ComfyUI additional models and follow its
-offload and memory accounting; applying VDN twice to one MODEL is rejected, and so is a
-collision with another attention patch (apply VDN first); **Kirei Release VDN-H3
-Weights** frees the caches explicitly; the legacy node id keeps old workflows loading.
+The branch, adapter and curve weights are registered as ComfyUI additional models and
+follow its offload and memory accounting. **Kirei Release VDN-H3 Weights** frees the
+caches explicitly; the legacy node id keeps old saved workflows loading.
 
 ---
 
-## Documentation
+## Validation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): how the block, the branch, the attention dispatch, the adapters and the memory policy are implemented.
-- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): FLOP model, measured results, what `auto` does per card, protocol.
-- [`docs/VALIDATION.md`](docs/VALIDATION.md): recipes, quality gates and the acceptance checklist.
-- [`benchmarks/README.md`](benchmarks/README.md): scenarios, recorder and comparison tooling.
+What has been checked, and what has not. Details are in
+[`docs/VALIDATION.md`](docs/VALIDATION.md) and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+- **CPU tests.** The full suite (204 tests in 0.3.3) passes against unmodified ComfyUI
+  `0b5b009d`. It includes 20 reduced FP32 oracles that execute pinned OpenVDN source
+  (`b8cb28fb`): window/anchor semantics, delta rules, statistics and scans, short
+  convolution, reduced linear/hybrid branches and paired video/audio timesteps at 8 and
+  50 steps. These oracles do not cover CUDA kernels, RoPE, quantized trained weights or
+  full-video parity with OpenVDN. The dependency-light CI subset is 173 of those tests.
+  Regression tests also cover coexistence with ComfyUI's
+  native bypass LoRAs in both orders, the native `attention` override on compiled blocks,
+  AdaLN source reporting, exact short full-cover attention and the deferred Cholesky
+  scope (failed factors, nesting, cancellation, validation before return).
+- **CI.** Three GitHub Actions jobs: a dependency-light CPU subset, the full suite on
+  pinned ComfyUI with the OpenVDN oracles, and the full suite on current ComfyUI. All
+  three passed for the 0.3.3 implementation ([run](https://github.com/hyukudan/ComfyUI-Kirei-VDN-H3/actions/runs/38086524726)).
+- **Generation, recorded with 0.3.2.** On clean pinned ComfyUI, the default-`auto`
+  recipe rendered 1344×768, 124 frames at 24 fps with AAC audio, without errors, on:
+  - RTX PRO 6000 Blackwell 96 GB: resident branch, BF16 projection, FA2, compiled block
+    path (each of the four block stages ran 400 times);
+  - RTX 4090 24 GB: streamed branch, 5-frame tiles, INT8/ConvRot projection, FA2.
+
+  One prompt and seed. Five sampled frames per clip showed a recognizable runner and
+  market without noise collapse, with motion blur and incomplete prompt adherence. The
+  INT8 clip differs in face, clothing and composition, so it is not a quality-equivalence
+  result. Audio presence was checked, not its content, and these single runs are not
+  speed measurements.
+- **Generation regression, 0.3.3.** The same recipe and seed on the RTX PRO 6000 ran
+  with deferred Cholesky checks (800 factors validated over 8 forwards), block fusion
+  on and no attention failures. All 124 decoded H.264 frames were bit-identical to the
+  0.3.2 clip. This is a one-clip decoded-pixel check, not raw-latent or audio equality,
+  general quality or parity with OpenVDN's trained video.
+- **Component measurements** (not full-render speed):
+  - deferred Cholesky checks (0.3.3): 7.81 % less wall time for the production factor
+    workload on RTX 4090 (800 factor calls per run, synthetic SPD inputs, five warm
+    medians), bit-identical output, +0.44 MiB peak;
+  - FA2 decomposition (0.3.2): 518 MiB lower peak allocation at a 768p geometry,
+    bit-identical output;
+  - grouped-attention buffer lifetimes: 105–386 MiB lower temporary peak at three
+    geometries on RTX 4090, bit-identical output;
+  - rejected: an `mlp.fc2` activation reorder (identical output, unchanged peak, no
+    consistent timing benefit on PRO 6000 and RTX 4090).
+- **Pending:** five-run warm medians for full renders, reviewed video/audio quality, FA4
+  on hardware, hybrid storage, long or reference-heavy clips, and end-to-end parity with
+  OpenVDN. Remaining work is tracked in the [improvement plan](docs/IMPROVEMENT_PLAN.md).
+
+---
+
+## Documentation and tests
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the block, branch, attention dispatch, adapters and memory policy.
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): FLOP model, measured results, per-card policy and protocol.
+- [`docs/VALIDATION.md`](docs/VALIDATION.md): recipes, quality gates and recorded qualification runs.
+- [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md): implemented, rejected and pending work.
+- [`benchmarks/README.md`](benchmarks/README.md): benchmark scenarios, recorder and comparison tooling.
 - [`CHANGELOG.md`](CHANGELOG.md).
 
-Tests run on CPU without a GPU or ComfyUI: `python -m pytest -q`. The GPU probes run
-with the Python that runs ComfyUI, from any directory:
+From a git checkout, the tests run on CPU without a GPU: `python -m pytest -q`. The
+source oracles are skipped unless `OPENVDN_ROOT` points to an OpenVDN checkout at the
+pinned commit; [`.github/workflows/ci.yml`](.github/workflows/ci.yml) shows the complete
+setup. The CUDA probes run with the Python that runs ComfyUI, from any directory:
 
 ```bash
 python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_optimized_cuda.py --device cuda:0 --json probe-core.json
@@ -361,32 +465,9 @@ python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_domestic_cuda.py 
 python <ComfyUI>/custom_nodes/ComfyUI-Kirei-VDN-H3/tests/probe_flex_cuda.py
 ```
 
-The core probe uses q/k/v with the strides of the real fused projection, runs the real
+The core probe uses Q/K/V with the strides of the real fused projection, runs the real
 calibration into a scratch store and times grouped, Flex, FA2 and FA4. The Flex probe
-pushes twelve packed lengths through one dynamic compiled call to prove it stays compiled
-instead of falling back to eager attention.
-
-## Status
-
-0.3.2 is available on `main`; update this installation with `git pull`.
-The 0.3.1 smoke test generated a complete 1344×768 video (124 frames, 24 fps,
-with audio) using Stage-DMD, the pruned INT8 FL2VA base and both adapters at 1.0.
-Sampled frames retained a recognizable runner, red jacket and detailed market scene;
-fast limbs remain motion-blurred, and the requested cart vault was not clearly shown.
-This is one-scene validation, not a general quality or speed claim. See the
-[recipe and evidence](docs/VALIDATION.md#18-version-031-generation-smoke-test).
-The runtime is covered by the CPU suite, CUDA backend probes and recorded end-to-end
-smoke tests. The measured hardware table is still
-being filled with five-run warm medians and reviewed quality results. Candidates that
-need a measured win **and** a passed quality gate before they enter `auto`: copy-free
-grouped attention, SageAttention on the local windows, NVFP4 projection, CUDA graphs on
-the branch. Reduced FP32 source-oracle parity now runs in CI; CUDA/RoPE, quantized
-weights and end-to-end video parity against OpenVDN remain unqualified.
-
-Version 0.3.2 also completed 768p default-`auto` generations on clean pinned ComfyUI:
-resident/BF16 with the compiled block path on RTX PRO 6000, and stream/INT8 with
-5-frame tiles on RTX 4090 24 GB. The full suite passes 193 tests, including 20 source
-oracles. See [qualification details](docs/VALIDATION.md#19-version-032-clean-core-qualification).
+pushes twelve packed lengths through one dynamic compiled call and must print `PASS`.
 
 ## Credits and license
 

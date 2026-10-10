@@ -140,9 +140,10 @@ Saganaki number is the first one to beat with `profile=auto`.
 | RTX PRO 6000 / RTX 50xx, INT8 / FP8 / NVFP4 base | resident | bypass (exact, fc2 included) | BF16 | grouped, Flex-Triton, FA4 (sm_120 kernel) |
 | H100 / H200 (sm_90) | resident | as above | BF16 | grouped, Flex, FA4 decomposition (wgmma) if flash-attn-4 is installed |
 | B200 (sm_100) | resident | as above | BF16 | FA4 decomposition first |
-| RTX 4090 24 GB | hybrid + 5-frame tiles | bypass | follows an INT8/FP8 base | grouped, Flex |
+| RTX 4090 24 GB | hybrid or stream + 5-frame tiles | bypass | follows an INT8/FP8 base | grouped, Flex, FA2 when available |
 
-On native Windows flash-attn-4 cannot be installed (no `nvidia-cutlass-dsl` wheel), so
+On the qualified native Windows setup FA4 is unavailable: CUTLASS DSL binary
+dependencies currently support Linux, so
 the sm_120 candidates there are grouped, Flex through `triton-windows` and FA2.
 
 Resident projection experiments need a measured win *and* a passed quality gate before

@@ -357,7 +357,8 @@ instead of falling back to eager attention.
 
 ## Status
 
-0.3.0 is unreleased. The runtime is complete and covered by the CPU suite, CUDA backend
+0.3.1 is available from this repository; it has not been published to the Comfy registry.
+The runtime is covered by the CPU suite, CUDA backend
 probes and a release-scale end-to-end validation. The measured hardware table is still
 being filled with five-run warm medians and reviewed quality results. Candidates that
 need a measured win **and** a passed quality gate before they enter `auto`: copy-free

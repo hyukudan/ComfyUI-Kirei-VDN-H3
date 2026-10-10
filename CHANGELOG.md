@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.1 (2026-10-10)
 
 Quality-first runtime for single-GPU workstations, with the fixes found by the
 September 2026 audit against OpenVDN and current ComfyUI.
